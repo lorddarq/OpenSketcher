@@ -1,0 +1,10 @@
+[package]
+name = "opensketcher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A cross-platform desktop 3D modeling application"
+publish = false
+
+[dependencies]
+eframe = { version = "=0.34.3", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
