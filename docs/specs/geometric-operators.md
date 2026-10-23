@@ -173,7 +173,7 @@ This delivery does not complete general termination: angled/curved trims, differ
 ### Evaluated face extrusion baseline
 
 - [x] Outward extrusion of surviving planar source faces after chamfer/bevel, including exact circular cap boundaries; repeated extrusions preserve the existing treatment, logical cap/wall selection, save/load, undo/redo and retained BRep export.
-- [ ] Through-cutting from treated faces and extrusion of arbitrary transition, curved, component-deformed or Boolean-result faces. Blind inward sweeps of fully treated planar cap perimeters are now supported.
+- [ ] Extrusion of arbitrary transition, curved, component-deformed or Boolean-result faces. Signed source-cap extrusion, including through-cutting, is now supported.
 
 Face mode defaults to **Extrude face** for planar caps. **Offset source** remains separate: it changes the primitive and rebuilds its treatment. Extrude face sweeps the evaluated trimmed boundary without repositioning the existing treatment. Distance edits apply automatically; unsupported/invalid operations preserve the committed model.
 
@@ -185,5 +185,8 @@ Face mode defaults to **Extrude face** for planar caps. **Offset source** remain
 ### Signed treated-cap sweep
 
 - [x] Negative face extrusion forms a blind recess from a fully chamfered/beveled cap, retaining the existing treatment and an exact shared BRep. Signed displacement and removed volume are checked on box/cylinder top/bottom caps under rotation and nonuniform scale. Undo/redo, save/load and four export paths cover the signed history.
-- [x] Consecutive cap reversal retracts existing sweep geometry; full retraction restores the original boundary. Outward-only legacy topology is preserved. Reject opposite-wall/treatment collision and overlapping opposite recesses atomically.
-- [ ] General intersecting/multiple-axis inward face sweeps and through-exit operations on treated geometry. Current guard preserves the solid until general trimming can resolve these cases.
+- [x] Consecutive cap reversal retracts existing sweep geometry; full retraction restores the original boundary. Outward-only legacy topology is preserved. Negative travel through the opposite wall produces a subtractive opening, with no emerging body. Opposing pockets may meet to form a through-hole.
+- [x] Exact planar-exit through-cuts from treated caps, including coincident entry/exit rims; preserve surviving treatment surfaces and clamp removal to existing material while retaining authored overrun. Other intersections route through the solid subtractor.
+- [ ] General arbitrary evaluated-face sweep references and robust complex curved-exit trimming remain part of the broader face-editing/Boolean requirements.
+
+Negative face extrusion follows the push/pull mental model: one action subtracts material while inside the solid and opens the solid after passing through it. No tool switch or emerging generator body is required. This differs intentionally from the explicit Generator + borer profile mode, whose separate-body behavior remains configurable.

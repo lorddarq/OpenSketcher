@@ -476,7 +476,11 @@ impl OpenSketcher {
                                                         == Ok(edit.face)
                                                 }
                                             });
-                                            self.selection = vec![(body.id, self.selected_element)];
+                                            self.selected = self.selected_element.map(|_| body.id);
+                                            self.selection = self
+                                                .selected_element
+                                                .map(|face| vec![(body.id, Some(face))])
+                                                .unwrap_or_default();
                                             self.pivot = None;
                                             self.refresh();
                                         }
@@ -525,7 +529,9 @@ impl OpenSketcher {
         self.set_picks(picks);
     }
     fn offset_face_properties(&mut self, ui: &mut egui::Ui) {
-        if self.selection_mode != SelectionMode::Face || self.selection.len() != 1 {
+        if self.selection_mode != SelectionMode::Face
+            || (self.selection.len() != 1 && self.face_offset.is_none())
+        {
             return;
         }
         if self.face_offset.is_none() {
@@ -611,7 +617,7 @@ impl OpenSketcher {
                 )
             })
             .inner;
-        ui.weak(if edit.extrude {"+ extends the trimmed face; − forms a recess in a treated face. Existing bevel/chamfer stays in place."} else if edit.face == components::OffsetTarget::CylinderWall {"+ grows radius · − shrinks radius. Axis and cap positions stay fixed."} else {"From the selected position: + outward, − inward. Edits the source shape; the opposite face stays fixed."});
+        ui.weak(if edit.extrude {"+ adds material; − subtracts it. Passing the far wall opens a through-cut; no body emerges."} else if edit.face == components::OffsetTarget::CylinderWall {"+ grows radius · − shrinks radius. Axis and cap positions stay fixed."} else {"From the selected position: + outward, − inward. Edits the source shape; the opposite face stays fixed."});
         if edit.distance != before {
             let changed = if edit.extrude {
                 let mut body = edit.source.clone();

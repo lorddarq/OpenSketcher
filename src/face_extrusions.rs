@@ -60,7 +60,9 @@ pub fn target(b: &Body, g: &Geometry, face: usize) -> Result<FaceTarget, String>
             .sum::<f64>();
         if b.extrusion > 0.
             && role.supported(b)
-            && !points.is_empty()
+            && points
+                .chunks_exact(3)
+                .any(|t| (t[1] - t[0]).cross(t[2] - t[0]).dot(n) > 1e-12)
             && points.iter().all(|p| (p.to_vec().dot(n) - d).abs() < 1e-6)
         {
             return Ok(role);
@@ -98,56 +100,6 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
         if previous * operation.distance < 0. {
             return Err("Reversing a cap after editing another face requires undoing the intervening face operation first.".into());
         }
-        if operation.distance < 0. {
-            if !b
-                .edge_treatments
-                .iter()
-                .any(|m| m.face == operation.face && m.edge.is_none())
-            {
-                return Err("Inward face extrusion currently requires a fully chamfered or beveled face perimeter; use Offset source to retract an untreated face.".into());
-            }
-            if operations
-                .iter()
-                .any(|e| e.face != operation.face && e.face != operation.face.opposite())
-            {
-                return Err("Intersecting face sweeps on different axes require a general trim/cut operation.".into());
-            }
-            let normal = operation.face.plane(b).0;
-            let thickness = if normal.z.abs() > 0.5 {
-                b.extrusion
-            } else if normal.x.abs() > 0.5 {
-                b.width
-            } else {
-                b.depth
-            };
-            let opposite = operation.face.opposite();
-            let opposite_setback = b
-                .edge_treatments
-                .iter()
-                .map(|m| {
-                    let (a, c) = m.setbacks();
-                    if m.face == opposite {
-                        c
-                    } else if m.edge == Some(opposite) {
-                        a
-                    } else {
-                        0.
-                    }
-                })
-                .fold(0., f64::max);
-            let opposite_recess = prior
-                .face_extrusions
-                .iter()
-                .filter(|e| e.face == opposite)
-                .map(|e| e.distance)
-                .sum::<f64>()
-                .min(0.);
-            if -operation.distance
-                >= thickness + previous + opposite_recess - opposite_setback - 0.01
-            {
-                return Err("Inward face extrusion would reach the opposite wall or its treatment. Leave at least 0.01 local units; use a Borer operation for a through-cut.".into());
-            }
-        }
         let shell = g
             .shell
             .as_ref()
@@ -166,6 +118,83 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
             builder::try_attach_plane(&selected.extract_boundaries())
                 .map_err(|e| format!("Cannot join the selected planar face: {e}"))?
         };
+        if operation.distance < 0. {
+            let (normal, _) = operation.face.plane(b);
+            let thickness = if normal.z.abs() > 0.5 {
+                b.extrusion
+            } else if normal.x.abs() > 0.5 {
+                b.width
+            } else {
+                b.depth
+            };
+            let opposite = operation.face.opposite();
+            let exit = thickness
+                + previous
+                + prior
+                    .face_extrusions
+                    .iter()
+                    .filter(|e| e.face == opposite)
+                    .map(|e| e.distance)
+                    .sum::<f64>();
+            // An untreated primitive's complete face removes a full cross-section.
+            // Reuse source offset for a blind cut; a through-cut consumes the body.
+            if b.edge_treatments.is_empty() && prior.face_extrusions.is_empty() {
+                if -operation.distance >= exit - 1e-7 {
+                    *g = Geometry::default();
+                } else {
+                    let mut source = b.clone();
+                    source.face_extrusions.clear();
+                    source.component_edits.clear();
+                    let distance = operation.distance
+                        * crate::regions::transform(b)
+                            .transform_vector(normal)
+                            .magnitude();
+                    let source =
+                        crate::components::offset_source_face(&source, operation.face, distance)?;
+                    *g = crate::model::build(&source, None)?;
+                }
+                prior.face_extrusions.push(operation.clone());
+                continue;
+            }
+            if -operation.distance >= exit - 1e-7 {
+                if let Some(result) =
+                    through_cut(&prior, g, &raw, &face, &indices, operation.face, exit)?
+                {
+                    *g = result;
+                } else {
+                    *g = subtract_sweep(b, g, &face, normal, operation.distance, true)?;
+                }
+                prior.face_extrusions.push(operation.clone());
+                continue;
+            }
+            let opposite_setback = b
+                .edge_treatments
+                .iter()
+                .map(|m| {
+                    let (a, c) = m.setbacks();
+                    if m.face == opposite {
+                        c
+                    } else if m.edge == Some(opposite) {
+                        a
+                    } else {
+                        0.
+                    }
+                })
+                .fold(0., f64::max);
+            let perimeter = b
+                .edge_treatments
+                .iter()
+                .any(|m| m.face == operation.face && m.edge.is_none());
+            let different_axis = operations
+                .iter()
+                .any(|e| e.face != operation.face && e.face != opposite);
+            if !perimeter || different_axis || -operation.distance >= exit - opposite_setback - 1e-7
+            {
+                *g = subtract_sweep(b, g, &face, normal, operation.distance, false)?;
+                prior.face_extrusions.push(operation.clone());
+                continue;
+            }
+        }
         let vector = crate::regions::transform(b)
             .transform_vector(operation.face.plane(b).0 * operation.distance);
         let sweep: Solid = builder::tsweep(&face, vector);
@@ -226,6 +255,153 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
         prior.face_extrusions.push(operation.clone());
     }
     Ok(())
+}
+
+/// Direct shared-boundary through-cut for a profile contained by the exit cap.
+/// Complex intersections fall back to the existing solid subtractor.
+fn through_cut(
+    b: &Body,
+    g: &Geometry,
+    raw: &Geometry,
+    entry: &truck_modeling::Face,
+    entry_indices: &[usize],
+    role: FaceTarget,
+    distance: f64,
+) -> Result<Option<Geometry>, String> {
+    let shell = g.shell.as_ref().ok_or("Missing solid boundary.")?;
+    let exit_indices: Vec<_> = (0..raw.face_count)
+        .filter(|f| target(b, raw, *f) == Ok(role.opposite()))
+        .collect();
+    if exit_indices.is_empty() {
+        return Ok(None);
+    }
+    let exit_shell: truck_modeling::Shell =
+        exit_indices.iter().map(|i| shell[*i].clone()).collect();
+    let exit = if exit_indices.len() == 1 {
+        exit_shell[0].clone()
+    } else {
+        builder::try_attach_plane(&exit_shell.extract_boundaries()).map_err(|e| e.to_string())?
+    };
+    let vector = crate::regions::transform(b).transform_vector(role.plane(b).0 * -distance);
+    let mut profile = crate::model::tessellate(&std::iter::once(entry.clone()).collect())?;
+    crate::components::map_geometry(
+        &mut profile,
+        truck_modeling::Matrix4::from_translation(vector),
+    );
+    // When entry and exit rims coincide, connect to the original exit edges
+    // directly. This avoids zero-area caps and keeps exact circular boundaries.
+    let entry_wires = entry.boundaries();
+    let exit_wires = exit.boundaries();
+    let mut matched = None;
+    if entry_wires.len() == 1
+        && exit_wires.len() == 1
+        && entry_wires[0].len() == exit_wires[0].len()
+    {
+        let source = &entry_wires[0];
+        let mut edges: Vec<_> = exit_wires[0].inverse().into_iter().collect();
+        for _ in 0..edges.len() {
+            if source.iter().zip(&edges).all(|(a, c)| {
+                (a.front().point() + vector - c.front().point()).magnitude() < 1e-6
+                    && (a.back().point() + vector - c.back().point()).magnitude() < 1e-6
+            }) {
+                matched = Some(edges.clone().into_iter().collect::<truck_modeling::Wire>());
+                break;
+            }
+            edges.rotate_left(1);
+        }
+    }
+    if matched.is_none() && !crate::booleans::face_coverage(&profile, raw, &exit_indices)?.0 {
+        return Ok(None);
+    }
+    let mut roles = if g.surface_roles.len() == shell.len() {
+        g.surface_roles.clone()
+    } else if g.triangle_faces.len() == shell.len() {
+        g.triangle_faces.clone()
+    } else {
+        return Err("Missing evaluated surface mapping.".into());
+    };
+    let side_role = roles.iter().copied().max().unwrap_or(0) + 1;
+    let exit_role = roles[exit_indices[0]];
+    let mut joined = shell.clone();
+    let mut removed = entry_indices.to_vec();
+    removed.extend(&exit_indices);
+    removed.sort_unstable();
+    removed.dedup();
+    for i in removed.iter().rev() {
+        joined.remove(*i);
+        roles.remove(*i);
+    }
+    let walls: truck_modeling::Shell = if let Some(wire) = matched {
+        builder::try_wire_homotopy(&entry_wires[0], &wire).map_err(|e| e.to_string())?
+    } else {
+        let sweep: Solid = builder::tsweep(entry, vector);
+        let boundary = &sweep.boundaries()[0];
+        boundary[1..boundary.len() - 1].iter().cloned().collect()
+    };
+    for wall in walls {
+        joined.push(wall);
+        roles.push(if b.shape == crate::model::Shape::Circle {
+            side_role
+        } else {
+            side_role + roles.len()
+        });
+    }
+    if !joined.extract_boundaries().is_empty() {
+        let wires: Vec<_> = joined
+            .extract_boundaries()
+            .iter()
+            .map(|w| w.inverse())
+            .collect();
+        joined.push(
+            builder::try_attach_plane(&wires)
+                .map_err(|e| format!("Cannot close the subtractor exit: {e}"))?,
+        );
+        roles.push(exit_role);
+    }
+    Solid::try_new(vec![joined.clone()])
+        .map_err(|e| format!("Invalid through-cut boundary: {e}"))?;
+    let mut result = crate::model::tessellate(&joined)?;
+    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    result.is_solid = true;
+    result.circles = g.circles.clone();
+    let inverse = crate::regions::transform(b)
+        .invert()
+        .ok_or("Invalid placement.")?;
+    let (normal, mut plane) = role.plane(b);
+    plane += b
+        .face_extrusions
+        .iter()
+        .filter(|e| e.face == role)
+        .map(|e| e.distance)
+        .sum::<f64>();
+    for ring in &g.circles {
+        if (inverse.transform_point(ring.center).to_vec().dot(normal) - plane).abs() < 1e-6 {
+            let mut exit = ring.clone();
+            exit.center += vector;
+            result.circles.push(exit);
+        }
+    }
+    Ok(Some(result))
+}
+fn subtract_sweep(
+    b: &Body,
+    g: &Geometry,
+    face: &truck_modeling::Face,
+    normal: truck_modeling::Vector3,
+    distance: f64,
+    through: bool,
+) -> Result<Geometry, String> {
+    let axis = crate::regions::transform(b).transform_vector(normal);
+    let margin = 1e-4;
+    let start = builder::transformed(
+        &face.inverse(),
+        truck_modeling::Matrix4::from_translation(axis.normalize() * margin),
+    );
+    let sweep: Solid = builder::tsweep(
+        &start,
+        axis * distance - axis.normalize() * margin * (if through { 2. } else { 1. }),
+    );
+    crate::operators::difference(g, &sweep.boundaries()[0])
 }
 
 #[cfg(test)]
@@ -326,7 +502,7 @@ mod tests {
                         model.redo();
                         assert_eq!(model.bodies[0].face_extrusions.len(), 3);
                         let mut invalid = model.bodies[0].clone();
-                        invalid.face_extrusions[0].distance = -10.;
+                        invalid.face_extrusions[0].distance = -101.;
                         assert!(model.edit(invalid).is_err());
                         assert_eq!(model.bodies[0].face_extrusions.len(), 3);
                         let saved = serde_json::to_vec(&b).unwrap();
@@ -410,19 +586,93 @@ mod tests {
                 distance: -2.,
             },
         ];
-        assert!(evaluate(&b).err().unwrap().contains("opposite wall"));
+        assert!(evaluate(&b).unwrap().is_solid);
         b.face_extrusions = vec![Extrusion {
             face: FaceTarget::Top,
             distance: -4.,
         }];
-        assert!(evaluate(&b).err().unwrap().contains("opposite wall"));
+        assert!(evaluate(&b).unwrap().is_solid);
         b.edge_treatments.clear();
         b.face_extrusions[0].distance = -1.;
-        assert!(
-            evaluate(&b)
-                .err()
-                .unwrap()
-                .contains("fully chamfered or beveled")
-        );
+        assert!(evaluate(&b).unwrap().is_solid);
+        b.face_extrusions[0].distance = -5.;
+        assert!(evaluate(&b).unwrap().triangles.is_empty());
+        for shape in [Shape::Circle, Shape::Rectangle] {
+            for kind in [Kind::Chamfer, Kind::Bevel] {
+                for face in [FaceTarget::Top, FaceTarget::Bottom] {
+                    let mut b = Body::new(shape);
+                    b.id = 1;
+                    b.width = 4.;
+                    b.depth = 4.;
+                    b.extrusion = 4.;
+                    b.position = [3., -2., 1.];
+                    b.rotation = [15., 25., 35.];
+                    b.scale = [1.5, 0.75, 2.];
+                    b.edge_treatments.push(Modifier::new(kind, face, &b));
+                    let original = evaluate(&b).unwrap();
+                    let volume = |g: &Geometry| {
+                        g.triangles
+                            .iter()
+                            .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                            .sum::<f64>()
+                    };
+                    let area = original
+                        .triangles
+                        .iter()
+                        .zip(&original.triangle_faces)
+                        .filter(|(_, f)| target(&b, &original, **f) == Ok(face))
+                        .map(|(t, _)| (t[1] - t[0]).cross(t[2] - t[0]).magnitude() / 2.)
+                        .sum::<f64>();
+                    for distance in [-4., -5., -10.] {
+                        b.face_extrusions = vec![Extrusion { face, distance }];
+                        let cut = evaluate(&b).unwrap();
+                        assert!(cut.is_solid);
+                        Solid::try_new(vec![cut.shell.clone().unwrap()]).unwrap();
+                        assert!(
+                            (volume(&original) - volume(&cut) - area * 8.).abs() < 0.1,
+                            "Through-cut volume must stop at the solid, regardless of overrun"
+                        );
+                        assert!(
+                            !(0..cut.face_count).any(|f| target(&b, &cut, f) == Ok(face)),
+                            "A through-cut has no pocket floor or emerging extrusion cap"
+                        );
+                        if shape == Shape::Circle
+                            && kind == Kind::Chamfer
+                            && face == FaceTarget::Top
+                            && distance == -5.
+                        {
+                            let dir = tempfile::tempdir().unwrap();
+                            let path = dir.path().join("through-cut.osk");
+                            let mut project = crate::project::Project::new(
+                                vec![b.clone()],
+                                crate::viewport::Camera::default(),
+                                true,
+                                None,
+                            );
+                            // The through-cut consumed its picked cap. Face mode
+                            // saves with no selection, rather than a stale slot.
+                            project.selection_mode = crate::selection::SelectionMode::Face;
+                            project.save(&path).unwrap();
+                            assert_eq!(
+                                crate::project::Project::load(&path).unwrap().bodies,
+                                vec![b.clone()]
+                            );
+                            for format in [
+                                crate::export::Format::Stl,
+                                crate::export::Format::Glb,
+                                crate::export::Format::Step,
+                                crate::export::Format::Dxf,
+                            ] {
+                                assert!(
+                                    !crate::export::encode(&[b.clone()], format)
+                                        .unwrap()
+                                        .is_empty()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

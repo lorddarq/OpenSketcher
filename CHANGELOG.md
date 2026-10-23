@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add signed extrusion of fully treated planar caps: negative travel forms an exact blind recess, reversal retracts consecutive sweeps, and collision guards protect the opposite wall. Retain outward-only history topology; persist negative travel in `.osk` v13.
+- Add signed cap extrusion: negative travel subtracts material, including an opening after passing the far wall. Preserve exact shared boundaries for contained planar exits, retract consecutive sweeps on reversal, and retain outward-only history topology. Persist authored overrun in `.osk` v13.
 
 - Fix edge/face/point gizmo edits on bored and Boolean solids by replaying new component edits on the evaluated boundary. Preserve legacy replay, atomic multiselection/history and `.osk` v12 persistence.
 

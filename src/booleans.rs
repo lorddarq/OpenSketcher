@@ -299,6 +299,13 @@ pub(crate) fn profile_coverage(
             * travel)
         .into();
     let mesh = crate::model::build(&moved, None)?;
+    face_coverage(&mesh, g, faces)
+}
+pub(crate) fn face_coverage(
+    mesh: &Geometry,
+    g: &Geometry,
+    faces: &[usize],
+) -> Result<(bool, bool), String> {
     let triangles: Vec<_> = g
         .triangles
         .iter()
@@ -317,7 +324,7 @@ pub(crate) fn profile_coverage(
         topology: [mesh.topology.clone(), target.topology.clone()],
         keep_tools: false,
     };
-    if self::faces(&operation, &[&mesh, &target])?
+    if self::faces(&operation, &[mesh, &target])?
         .triangles
         .is_empty()
     {
@@ -326,7 +333,7 @@ pub(crate) fn profile_coverage(
     operation.kind = Kind::Intersect;
     Ok((
         false,
-        !self::faces(&operation, &[&mesh, &target])?
+        !self::faces(&operation, &[mesh, &target])?
             .triangles
             .is_empty(),
     ))
