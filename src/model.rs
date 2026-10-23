@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use truck_meshalgo::tessellation::MeshableShape;
-use truck_modeling::{Point3, Rad, Shell, Solid, Transform, Vector3, Wire, builder};
+use truck_modeling::{
+    EuclideanSpace, InnerSpace, Point3, Rad, Shell, Solid, Transform, Vector3, Wire, builder,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +33,8 @@ pub struct Body {
     pub extrusion: f64,
     #[serde(default)]
     pub cuts_profiles: bool,
+    #[serde(default)]
+    pub construction: bool,
     pub position: [f64; 3],
     pub rotation: [f64; 3],
     pub scale: [f64; 3],
@@ -40,6 +44,10 @@ pub struct Body {
     pub component_edits: Vec<crate::components::ComponentEdit>,
     #[serde(default, alias = "modifiers")]
     pub edge_treatments: Vec<crate::edge_treatments::Modifier>,
+    #[serde(default)]
+    pub taper: Option<crate::drafting::Draft>,
+    #[serde(default)]
+    pub hollow: Option<crate::shelling::Hollow>,
     #[serde(default)]
     pub bore: Option<crate::operators::Bore>,
     #[serde(default)]
@@ -54,12 +62,15 @@ impl Body {
             depth: 2.,
             extrusion: 0.,
             cuts_profiles: false,
+            construction: false,
             position: [0.; 3],
             rotation: [0.; 3],
             scale: [1.; 3],
             face_extrusions: Vec::new(),
             component_edits: Vec::new(),
             edge_treatments: Vec::new(),
+            taper: None,
+            hollow: None,
             bore: None,
             boolean: None,
         }
@@ -91,6 +102,11 @@ impl Body {
             .boolean
             .as_ref()
             .map_or(self.shape.label(), |op| op.kind.label());
+        let name = if self.construction {
+            "Construction plane"
+        } else {
+            name
+        };
         if self.id == 0 {
             format!("New {name}")
         } else {
@@ -102,6 +118,11 @@ impl Body {
     }
     pub fn validate(&self) -> Result<(), String> {
         (|| {
+            if self.construction && (self.shape!=Shape::Rectangle || self.extrusion!=0. || self.cuts_profiles
+                || self.boolean.is_some() || self.bore.is_some() || self.hollow.is_some() || self.taper.is_some()
+                || !self.component_edits.is_empty() || !self.edge_treatments.is_empty() || !self.face_extrusions.is_empty()) {
+                return Err("Construction planes are rectangular references; move/rotate the whole reference instead of applying geometry operations.".into());
+            }
             if let Some(operation) = &self.boolean {
                 operation
                     .validate(self)
@@ -117,6 +138,8 @@ impl Body {
                     )
                 })?;
             }
+            crate::drafting::validate(self)?;
+            crate::shelling::validate(self)?;
             crate::face_extrusions::validate(self)?;
             crate::components::validate(&self.component_edits)?;
             crate::edge_treatments::validate(self)?;
@@ -174,6 +197,151 @@ pub struct Geometry {
     pub is_solid: bool,
 }
 
+impl Geometry {
+    /// Conservative analytic support interval; no viewport samples determine a cut depth.
+    pub(crate) fn projection_range(&self, axis: Vector3) -> Result<[f64; 2], String> {
+        use truck_modeling::{Curve, Surface};
+        fn range(values: impl Iterator<Item = f64>) -> Result<[f64; 2], String> {
+            let mut bounds = [f64::INFINITY, f64::NEG_INFINITY];
+            for value in values {
+                if !value.is_finite() {
+                    return Err("Cannot bound nonfinite geometry.".into());
+                }
+                bounds = [bounds[0].min(value), bounds[1].max(value)];
+            }
+            if bounds.iter().any(|v| !v.is_finite()) {
+                Err("Cannot bound nonfinite or empty geometry.".into())
+            } else {
+                Ok(bounds)
+            }
+        }
+        fn rational(
+            points: impl Iterator<Item = truck_modeling::Vector4>,
+            axis: Vector3,
+        ) -> Result<[f64; 2], String> {
+            let mut values = Vec::new();
+            for p in points {
+                if !p.w.is_finite() || p.w <= 0. {
+                    return Err("Through-all bounds require positive rational weights.".into());
+                }
+                values.push((p.truncate() / p.w).dot(axis));
+            }
+            range(values.into_iter())
+        }
+        fn surface(surface: &Surface, axis: Vector3) -> Result<Option<[f64; 2]>, String> {
+            match surface {
+                Surface::Plane(_) => Ok(None),
+                Surface::BSplineSurface(s) => range(
+                    s.control_points()
+                        .iter()
+                        .flatten()
+                        .map(|p| p.to_vec().dot(axis)),
+                )
+                .map(Some),
+                Surface::NurbsSurface(s) => {
+                    rational(s.control_points().iter().flatten().copied(), axis).map(Some)
+                }
+                Surface::RevolutedCurve(rev) => {
+                    let source = rev.entity();
+                    if matches!(source.entity_curve(), Curve::IntersectionCurve(_)) {
+                        return Err(
+                            "Cannot bound an intersection-generated revolution for Through all."
+                                .into(),
+                        );
+                    }
+                    let generator = source.entity_curve().clone().lift_up();
+                    let transform = *rev.transform();
+                    let normal = source.axis().normalize();
+                    let projected = Vector3::new(
+                        axis.dot(transform.x.truncate()),
+                        axis.dot(transform.y.truncate()),
+                        axis.dot(transform.z.truncate()),
+                    );
+                    let radial_projection =
+                        (projected - normal * projected.dot(normal)).magnitude();
+                    let mut values = Vec::new();
+                    for p in generator.control_points() {
+                        if !p.w.is_finite() || p.w <= 0. {
+                            return Err(
+                                "Through-all bounds require positive rational weights.".into()
+                            );
+                        }
+                        let point = Point3::from_vec(p.truncate() / p.w);
+                        let axial =
+                            source.origin() + normal * (point - source.origin()).dot(normal);
+                        let center = transform.transform_point(axial).to_vec().dot(axis);
+                        let radius = (point - axial).magnitude() * radial_projection;
+                        values.extend([center - radius, center + radius]);
+                    }
+                    range(values.into_iter()).map(Some)
+                }
+            }
+        }
+        fn curve(curve: &Curve, ends: [Point3; 2], axis: Vector3) -> Result<[f64; 2], String> {
+            match curve {
+                Curve::Line(_) => range(ends.into_iter().map(|p| p.to_vec().dot(axis))),
+                Curve::BSplineCurve(c) => {
+                    range(c.control_points().iter().map(|p| p.to_vec().dot(axis)))
+                }
+                Curve::NurbsCurve(c) => rational(c.control_points().iter().copied(), axis),
+                Curve::IntersectionCurve(c) => {
+                    match (surface(c.surface0(), axis)?, surface(c.surface1(), axis)?) {
+                        (Some(a), Some(b)) => Ok([a[0].max(b[0]), a[1].min(b[1])]),
+                        (Some(a), None) | (None, Some(a)) => Ok(a),
+                        (None, None) => {
+                            let (Surface::Plane(a), Surface::Plane(b)) =
+                                (c.surface0(), c.surface1())
+                            else {
+                                unreachable!()
+                            };
+                            if a.normal().cross(b.normal()).magnitude2() < 1e-16 {
+                                return Err(
+                                    "Cannot bound coincident-plane intersection curves.".into()
+                                );
+                            }
+                            range(ends.into_iter().map(|p| p.to_vec().dot(axis)))
+                        }
+                    }
+                }
+            }
+        }
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or("Through-all scope requires retained solid boundaries.")?;
+        let mut bounds = Vec::new();
+        for face in shell {
+            if let Some(b) = surface(&face.oriented_surface(), axis)? {
+                bounds.extend(b);
+            } else {
+                for edge in face.edge_iter() {
+                    bounds.extend(curve(
+                        &edge.oriented_curve(),
+                        [edge.front().point(), edge.back().point()],
+                        axis,
+                    )?);
+                }
+            }
+        }
+        range(bounds.into_iter())
+    }
+
+    pub(crate) fn surface_mapping(&self) -> Result<&[usize], String> {
+        let count = self
+            .shell
+            .as_ref()
+            .ok_or("Operation requires a retained kernel boundary.")?
+            .len();
+        if self.surface_roles.len() == count {
+            Ok(&self.surface_roles)
+        } else if self.triangle_faces.len() == count {
+            Ok(&self.triangle_faces)
+        } else {
+            Err("Missing evaluated surface mapping.".into())
+        }
+    }
+}
+
 pub fn evaluate(body: &Body) -> Result<Geometry, String> {
     body.validate()?;
     let mut geometry = build_checked(body, None)?;
@@ -227,10 +395,13 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
     for body in bodies {
         body.validate()?;
     }
-    for cutter in bodies
-        .iter()
-        .filter(|body| !body.component_edits.is_empty() || !body.edge_treatments.is_empty())
-    {
+    for cutter in bodies.iter().filter(|body| {
+        !body.component_edits.is_empty()
+            || !body.edge_treatments.is_empty()
+            || body.hollow.is_some()
+            || body.taper.is_some()
+            || !body.face_extrusions.is_empty()
+    }) {
         for target in bodies
             .iter()
             .filter(|body| body.id < cutter.id && body.shape != Shape::Line)
@@ -239,7 +410,7 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
                 .map_err(|e| cutter.error(format!("Partition against body {}: {e}", target.id)))?
                 .is_some()
             {
-                return Err(cutter.error(format!("Profile partition against body {} cannot replay component edits or edge treatments. Disable its cutting flag or use Volume transforms.",target.id)));
+                return Err(cutter.error(format!("Profile partition against body {} cannot replay solid/component operations. Disable its cutting flag or use an explicit Boolean operation.",target.id)));
             }
         }
     }
@@ -266,7 +437,7 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
 pub(crate) fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
     let intact_circle = b.shape == Shape::Circle && loops.is_none();
     let mut g = build_geometry(b, loops)?;
-    if intact_circle {
+    if intact_circle && b.taper.is_none() && b.hollow.is_none() {
         let transform = crate::regions::transform(b);
         let radius = b.width / 2.;
         let mut rings = vec![(radius, 0.)];
@@ -286,14 +457,20 @@ pub(crate) fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geome
                 rings.extend([(radius - radial, 0.), (radius, height)]);
             }
         }
-        g.circles = rings
-            .into_iter()
-            .map(|(r, z)| CircularEdge {
-                center: transform.transform_point(Point3::new(0., 0., z)),
-                u: transform.transform_vector(Vector3::unit_x() * r),
-                v: transform.transform_vector(Vector3::unit_y() * r),
-            })
-            .collect();
+        g.circles.extend(
+            rings
+                .into_iter()
+                .map(|(r, z)| CircularEdge {
+                    center: transform.transform_point(Point3::new(0., 0., z)),
+                    u: transform.transform_vector(Vector3::unit_x() * r),
+                    v: transform.transform_vector(Vector3::unit_y() * r),
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    if b.construction {
+        g.triangles.clear();
+        g.triangle_faces.clear();
     }
     crate::face_extrusions::apply(b, &mut g)?;
     crate::components::apply(b, &mut g)?;
@@ -301,6 +478,12 @@ pub(crate) fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geome
     Ok(g)
 }
 fn build_geometry(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
+    if b.taper.is_some() {
+        return crate::drafting::evaluate(b, loops.is_some());
+    }
+    if b.hollow.is_some() {
+        return crate::shelling::evaluate(b, loops.is_some());
+    }
     if !b.edge_treatments.is_empty() {
         return crate::edge_treatments::evaluate(b, loops.is_some());
     }

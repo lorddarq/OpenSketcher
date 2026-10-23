@@ -51,7 +51,7 @@ pub fn target(b: &Body, g: &Geometry, face: usize) -> Result<FaceTarget, String>
         FaceTarget::Front,
         FaceTarget::Back,
     ] {
-        let (n, mut d) = role.plane(b);
+        let (n, mut d) = role.evaluated_plane(b);
         d += b
             .face_extrusions
             .iter()
@@ -128,6 +128,10 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
                 b.depth
             };
             let opposite = operation.face.opposite();
+            let thickness = thickness + operation.face.evaluated_plane(b).1
+                - operation.face.plane(b).1
+                + opposite.evaluated_plane(b).1
+                - opposite.plane(b).1;
             let exit = thickness
                 + previous
                 + prior
@@ -136,9 +140,18 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
                     .filter(|e| e.face == opposite)
                     .map(|e| e.distance)
                     .sum::<f64>();
-            // An untreated primitive's complete face removes a full cross-section.
-            // Reuse source offset for a blind cut; a through-cut consumes the body.
-            if b.edge_treatments.is_empty() && prior.face_extrusions.is_empty() {
+            // Reuse source offset for a pristine cap or a shell opening whose
+            // fixed cavity floor is untouched. A full primitive cut consumes it.
+            if (b.hollow.is_none()
+                || b.hollow.as_ref().is_some_and(|shell| {
+                    !shell.closed
+                        && shell.opening == operation.face
+                        && -operation.distance < exit - shell.thickness - 1e-5
+                }))
+                && b.taper.is_none()
+                && b.edge_treatments.is_empty()
+                && prior.face_extrusions.is_empty()
+            {
                 if -operation.distance >= exit - 1e-7 {
                     *g = Geometry::default();
                 } else {
@@ -153,6 +166,32 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
                         crate::components::offset_source_face(&source, operation.face, distance)?;
                     *g = crate::model::build(&source, None)?;
                 }
+                prior.face_extrusions.push(operation.clone());
+                continue;
+            }
+            if b.hollow.is_some() {
+                if prior.face_extrusions.is_empty()
+                    && let Some(result) =
+                        crate::shelling::retract_back(b, operation.face, operation.distance)?.or(
+                            crate::shelling::retract_opening(
+                                b,
+                                operation.face,
+                                operation.distance,
+                            )?,
+                        )
+                {
+                    *g = result;
+                    prior.face_extrusions.push(operation.clone());
+                    continue;
+                }
+                *g = subtract_sweep(
+                    b,
+                    g,
+                    &face,
+                    normal,
+                    operation.distance,
+                    -operation.distance >= exit - 1e-7,
+                )?;
                 prior.face_extrusions.push(operation.clone());
                 continue;
             }
@@ -197,44 +236,17 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
         }
         let vector = crate::regions::transform(b)
             .transform_vector(operation.face.plane(b).0 * operation.distance);
-        let sweep: Solid = builder::tsweep(&face, vector);
-        let mut joined = shell.clone();
-        let mut roles = if g.surface_roles.len() == shell.len() {
-            g.surface_roles.clone()
-        } else if g.triangle_faces.len() == shell.len() {
-            g.triangle_faces.clone()
-        } else {
-            return Err("Missing evaluated surface mapping.".into());
-        };
-        let cap_role = roles[indices[0]];
-        for index in indices.iter().rev() {
-            joined.remove(*index);
-            roles.remove(*index);
-        }
-        let side_role = roles.iter().copied().max().unwrap_or(0).max(cap_role) + 1;
-        for patch in sweep.boundaries()[0].iter() {
-            if patch.id() == face.id() {
-                continue;
-            }
-            // The translated cap is last in Truck's translational face sweep.
-            let cap = patch.id() == sweep.boundaries()[0].last().unwrap().id();
-            joined.push(patch.clone());
-            roles.push(if cap {
-                cap_role
-            } else if b.shape == crate::model::Shape::Circle {
-                side_role
-            } else {
-                side_role + roles.len()
-            });
-        }
-        Solid::try_new(vec![joined.clone()])
-            .map_err(|e| format!("Face extrusion did not produce a closed solid: {e}"))?;
-        let mut result = crate::model::tessellate(&joined)?;
-        crate::edge_treatments::merge_surfaces(&mut result, &roles);
-        result.is_solid = true;
+        let mut result = extend_face(
+            g,
+            &face,
+            &indices,
+            vector,
+            b.shape == crate::model::Shape::Circle,
+            false,
+        )?;
         // Retain snap circles on the existing boundary and add the moved cap rim.
         result.circles = g.circles.clone();
-        let (normal, mut plane) = operation.face.plane(&prior);
+        let (normal, mut plane) = operation.face.evaluated_plane(&prior);
         plane += prior
             .face_extrusions
             .iter()
@@ -255,6 +267,288 @@ pub fn apply(b: &Body, g: &mut Geometry) -> Result<(), String> {
         prior.face_extrusions.push(operation.clone());
     }
     Ok(())
+}
+
+// Match retained affine circle metadata to a complete authored boundary wire.
+pub(crate) fn circle_on_wire(
+    circle: &crate::model::CircularEdge,
+    wire: &truck_modeling::Wire,
+) -> bool {
+    use truck_modeling::{BoundedCurve, ParametricCurve};
+    let u = circle.u;
+    let v = circle.v;
+    let normal = u.cross(v);
+    let determinant = u.magnitude2() * v.magnitude2() - u.dot(v).powi(2);
+    if determinant < 1e-20 {
+        return false;
+    }
+    wire.iter().all(|edge| {
+        let curve = edge.oriented_curve();
+        let (start, end) = curve.range_tuple();
+        [start, (start + end) / 2., end].into_iter().all(|t| {
+            let p = curve.subs(t) - circle.center;
+            let a = (p.dot(u) * v.magnitude2() - p.dot(v) * u.dot(v)) / determinant;
+            let b = (p.dot(v) * u.magnitude2() - p.dot(u) * u.dot(v)) / determinant;
+            (a * a + b * b - 1.).abs() < 1e-6 && p.dot(normal).abs() < 1e-7 * normal.magnitude()
+        })
+    })
+}
+
+fn tangent_groups(wire: &truck_modeling::Wire) -> Vec<usize> {
+    use truck_modeling::{BoundedCurve, ParametricCurve};
+    let mut groups = (0..wire.len()).collect::<Vec<_>>();
+    for i in 0..wire.len() {
+        let next = (i + 1) % wire.len();
+        let a = wire[i].oriented_curve();
+        let b = wire[next].oriented_curve();
+        let ta = a.der(a.range_tuple().1);
+        let tb = b.der(b.range_tuple().0);
+        if ta.magnitude2() > 1e-20
+            && tb.magnitude2() > 1e-20
+            && ta.normalize().dot(tb.normalize()) > 1. - 1e-8
+        {
+            let old = groups[next];
+            let new = groups[i];
+            for group in &mut groups {
+                if *group == old {
+                    *group = new;
+                }
+            }
+        }
+    }
+    groups
+}
+
+// Shared by semantic source-cap sweeps and ordered evaluated-face operations.
+fn extend_face(
+    g: &Geometry,
+    face: &truck_modeling::Face,
+    indices: &[usize],
+    vector: truck_modeling::Vector3,
+    circular_walls: bool,
+    tangent_walls: bool,
+) -> Result<Geometry, String> {
+    let sweep: Solid = builder::tsweep(face, vector);
+    let shell = g
+        .shell
+        .as_ref()
+        .ok_or("Face extrusion requires an exact boundary.")?;
+    let mut joined = shell.clone();
+    let mut roles = g.surface_mapping()?.to_vec();
+    let cap_role = roles[indices[0]];
+    for index in indices.iter().rev() {
+        joined.remove(*index);
+        roles.remove(*index);
+    }
+    let side_role = roles.iter().copied().max().unwrap_or(0).max(cap_role) + 1;
+    let mut tangent_roles = std::collections::HashMap::new();
+    if tangent_walls {
+        let mut offset = side_role;
+        for wire in face.boundaries() {
+            let groups = tangent_groups(&wire);
+            for (edge, group) in wire.iter().zip(groups) {
+                tangent_roles.insert(edge.id(), offset + group);
+            }
+            offset += wire.len();
+        }
+    }
+    for patch in sweep.boundaries()[0].iter() {
+        if patch.id() == face.id() {
+            continue;
+        }
+        // The translated cap is last in Truck's translational face sweep.
+        let cap = patch.id() == sweep.boundaries()[0].last().unwrap().id();
+        joined.push(patch.clone());
+        roles.push(if cap {
+            cap_role
+        } else if tangent_walls {
+            patch
+                .edge_iter()
+                .find_map(|edge| tangent_roles.get(&edge.id()).copied())
+                .ok_or("Swept wall lost its source curve.")?
+        } else if circular_walls {
+            let boundary = face
+                .boundaries()
+                .iter()
+                .position(|wire| {
+                    patch
+                        .edge_iter()
+                        .any(|edge| wire.iter().any(|source| source.id() == edge.id()))
+                })
+                .ok_or("Swept wall lost its source boundary.")?;
+            side_role + boundary
+        } else {
+            side_role + roles.len()
+        });
+    }
+    Solid::try_new(joined.connected_components())
+        .map_err(|e| format!("Face extrusion did not produce a closed solid: {e}"))?;
+    let mut result = crate::model::tessellate(&joined)?;
+    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    result.is_solid = true;
+    result.circles = g.circles.clone();
+    if tangent_walls {
+        for ring in &g.circles {
+            if face
+                .boundaries()
+                .iter()
+                .any(|wire| circle_on_wire(ring, wire))
+            {
+                let mut moved = ring.clone();
+                moved.center += vector;
+                result.circles.push(moved);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn evaluated_sweep(
+    g: &Geometry,
+    element: usize,
+    vector: truck_modeling::Vector3,
+    circular_walls: bool,
+    tangent_walls: bool,
+) -> Result<Geometry, String> {
+    if !g.is_solid {
+        return Err("Face extrusion requires a closed solid.".into());
+    }
+    let plane = crate::snapping::Plane::face(g, element)
+        .ok_or("Select a planar face; curved face sweeps require a separate operation.")?;
+    let shell = g
+        .shell
+        .as_ref()
+        .ok_or("This component deformation does not retain an exact boundary for extrusion.")?;
+    let indices = g
+        .surface_mapping()?
+        .iter()
+        .enumerate()
+        .filter(|(_, role)| **role == element)
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        return Err("The selected face no longer exists.".into());
+    }
+    let selected: truck_modeling::Shell = indices.iter().map(|i| shell[*i].clone()).collect();
+    let face = if indices.len() == 1 {
+        selected[0].clone()
+    } else {
+        builder::try_attach_plane(&selected.extract_boundaries()).map_err(|e| e.to_string())?
+    };
+    let distance = vector.dot(plane.normal);
+    if distance.abs() < 1e-8 {
+        return Err("Extrusion must leave the selected face plane.".into());
+    }
+    if distance < 0. {
+        // A full prismatic cap removes exactly a slab. Reuse exact plane
+        // retrimming, avoiding coincident Boolean faces and clamping overrun.
+        if let Ok(supports) = crate::components::planar_supports(g) {
+            let mut depth = None;
+            let prismatic = supports
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != element)
+                .all(|(_, (n, d))| {
+                    if (*n + plane.normal).magnitude() < 1e-7 {
+                        depth = Some(*d + plane.normal.dot(plane.origin.to_vec()));
+                        true
+                    } else {
+                        n.dot(vector).abs() < 1e-8
+                    }
+                });
+            if prismatic && let Some(depth) = depth {
+                return if -distance >= depth - 1e-7 {
+                    Ok(Geometry::default())
+                } else {
+                    crate::components::retrim_faces(
+                        g,
+                        &[element],
+                        truck_modeling::Matrix4::from_translation(vector),
+                    )
+                };
+            }
+        }
+        if tangent_walls && let Ok(supports) = crate::components::convex_supports(g) {
+            let profile = Geometry {
+                shell: Some(std::iter::once(face.clone()).collect()),
+                ..Default::default()
+            };
+            let strictly_inside = supports.iter().all(|(n, d)| {
+                profile
+                    .projection_range(*n)
+                    .is_ok_and(|bounds| bounds[1] + n.dot(vector) < *d - 1e-7)
+            });
+            if strictly_inside {
+                return extend_face(g, &face, &indices, vector, circular_walls, true);
+            }
+            // A complete planar prism exit can be removed without coincident
+            // CSG faces. Other intersections continue through the solid solver.
+            let axis = plane.normal;
+            let sides_clear = supports
+                .iter()
+                .filter(|(n, _)| n.dot(axis).abs() < 1. - 1e-7)
+                .all(|(n, d)| {
+                    n.dot(axis).abs() < 1e-7
+                        && profile
+                            .projection_range(*n)
+                            .is_ok_and(|bounds| bounds[1] < *d - 1e-7)
+                });
+            if sides_clear
+                && let Some((exit_role, depth)) = supports
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (n, _))| n.dot(axis) < -1. + 1e-7)
+                    .map(|(i, (_, d))| (i, *d + plane.origin.to_vec().dot(axis)))
+                    .filter(|(_, d)| *d > 1e-7)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                && -distance >= depth - 1e-7
+            {
+                let exits = g
+                    .surface_mapping()?
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, role)| **role == exit_role)
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>();
+                let selected: truck_modeling::Shell =
+                    exits.iter().map(|i| shell[*i].clone()).collect();
+                let exit = if selected.len() == 1 {
+                    selected[0].clone()
+                } else {
+                    builder::try_attach_plane(&selected.extract_boundaries())
+                        .map_err(|e| e.to_string())?
+                };
+                let raw = crate::model::tessellate(shell)?;
+                if let Some(result) = through_boundary(
+                    g,
+                    &raw,
+                    (&face, &indices),
+                    (&exit, &exits),
+                    -axis * depth,
+                    circular_walls,
+                    true,
+                )? {
+                    return Ok(result);
+                }
+            }
+        }
+        let margin = -vector.normalize() * 1e-4;
+        let start = builder::transformed(
+            &face.inverse(),
+            truck_modeling::Matrix4::from_translation(margin),
+        );
+        let tool: Solid = builder::tsweep(&start, vector - margin);
+        return crate::operators::difference(g, &tool.boundaries()[0]);
+    }
+    let mut result = extend_face(g, &face, &indices, vector, circular_walls, tangent_walls)?;
+    for ring in g.circles.iter().filter(|_| !tangent_walls) {
+        if (ring.center - plane.origin).dot(plane.normal).abs() < 1e-6 {
+            let mut moved = ring.clone();
+            moved.center += vector;
+            result.circles.push(moved);
+        }
+    }
+    Ok(result)
 }
 
 /// Direct shared-boundary through-cut for a profile contained by the exit cap.
@@ -283,6 +577,29 @@ fn through_cut(
         builder::try_attach_plane(&exit_shell.extract_boundaries()).map_err(|e| e.to_string())?
     };
     let vector = crate::regions::transform(b).transform_vector(role.plane(b).0 * -distance);
+    through_boundary(
+        g,
+        raw,
+        (entry, entry_indices),
+        (&exit, &exit_indices),
+        vector,
+        b.shape == crate::model::Shape::Circle,
+        false,
+    )
+}
+
+fn through_boundary(
+    g: &Geometry,
+    raw: &Geometry,
+    entry: (&truck_modeling::Face, &[usize]),
+    exit: (&truck_modeling::Face, &[usize]),
+    vector: truck_modeling::Vector3,
+    circular_walls: bool,
+    tangent_walls: bool,
+) -> Result<Option<Geometry>, String> {
+    let (entry, entry_indices) = entry;
+    let (exit, exit_indices) = exit;
+    let shell = g.shell.as_ref().ok_or("Missing solid boundary.")?;
     let mut profile = crate::model::tessellate(&std::iter::once(entry.clone()).collect())?;
     crate::components::map_geometry(
         &mut profile,
@@ -310,7 +627,7 @@ fn through_cut(
             edges.rotate_left(1);
         }
     }
-    if matched.is_none() && !crate::booleans::face_coverage(&profile, raw, &exit_indices)?.0 {
+    if matched.is_none() && !crate::booleans::face_coverage(&profile, raw, exit_indices)?.0 {
         return Ok(None);
     }
     let mut roles = if g.surface_roles.len() == shell.len() {
@@ -324,7 +641,7 @@ fn through_cut(
     let exit_role = roles[exit_indices[0]];
     let mut joined = shell.clone();
     let mut removed = entry_indices.to_vec();
-    removed.extend(&exit_indices);
+    removed.extend(exit_indices);
     removed.sort_unstable();
     removed.dedup();
     for i in removed.iter().rev() {
@@ -339,8 +656,28 @@ fn through_cut(
         boundary[1..boundary.len() - 1].iter().cloned().collect()
     };
     for wall in walls {
-        joined.push(wall);
-        roles.push(if b.shape == crate::model::Shape::Circle {
+        joined.push(wall.clone());
+        roles.push(if tangent_walls {
+            let mut offset = side_role;
+            let mut role = None;
+            for wire in entry.boundaries() {
+                let groups = tangent_groups(&wire);
+                for (edge, group) in wire.iter().zip(groups) {
+                    if wall
+                        .edge_iter()
+                        .any(|candidate| candidate.id() == edge.id())
+                    {
+                        role = Some(offset + group);
+                        break;
+                    }
+                }
+                if role.is_some() {
+                    break;
+                }
+                offset += wire.len();
+            }
+            role.ok_or("Cut wall lost its source curve.")?
+        } else if circular_walls {
             side_role
         } else {
             side_role + roles.len()
@@ -352,33 +689,38 @@ fn through_cut(
             .iter()
             .map(|w| w.inverse())
             .collect();
-        joined.push(
-            builder::try_attach_plane(&wires)
-                .map_err(|e| format!("Cannot close the subtractor exit: {e}"))?,
-        );
-        roles.push(exit_role);
+        if tangent_walls {
+            let next = roles.iter().copied().max().unwrap_or(0) + 1;
+            for (i, face) in crate::face_operations::planar_regions(wires)?
+                .into_iter()
+                .enumerate()
+            {
+                joined.push(face);
+                roles.push(if i == 0 { exit_role } else { next + i });
+            }
+        } else {
+            joined.push(
+                builder::try_attach_plane(&wires)
+                    .map_err(|e| format!("Cannot close the subtractor exit: {e}"))?,
+            );
+            roles.push(exit_role);
+        }
     }
-    Solid::try_new(vec![joined.clone()])
+    Solid::try_new(joined.connected_components())
         .map_err(|e| format!("Invalid through-cut boundary: {e}"))?;
     let mut result = crate::model::tessellate(&joined)?;
     crate::edge_treatments::merge_surfaces(&mut result, &roles);
     result.is_solid = true;
     result.circles = g.circles.clone();
-    let inverse = crate::regions::transform(b)
-        .invert()
-        .ok_or("Invalid placement.")?;
-    let (normal, mut plane) = role.plane(b);
-    plane += b
-        .face_extrusions
-        .iter()
-        .filter(|e| e.face == role)
-        .map(|e| e.distance)
-        .sum::<f64>();
+    let plane =
+        crate::snapping::Plane::face(raw, entry_indices[0]).ok_or("Missing planar cut entry.")?;
     for ring in &g.circles {
-        if (inverse.transform_point(ring.center).to_vec().dot(normal) - plane).abs() < 1e-6 {
-            let mut exit = ring.clone();
-            exit.center += vector;
-            result.circles.push(exit);
+        if (ring.center - plane.origin).dot(plane.normal).abs() < 1e-6
+            && (!tangent_walls || entry_wires.iter().any(|wire| circle_on_wire(ring, wire)))
+        {
+            let mut moved = ring.clone();
+            moved.center += vector;
+            result.circles.push(moved);
         }
     }
     Ok(Some(result))
@@ -674,5 +1016,154 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn convex_planar_inward_sweeps_trim_angled_exits_and_disconnected_results() {
+        use crate::components;
+        use truck_modeling::{Deg, Matrix4};
+        let volume = |g: &Geometry| {
+            g.triangles
+                .iter()
+                .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                .sum::<f64>()
+        };
+        let mut body = Body::new(Shape::Rectangle);
+        body.id = 1;
+        body.width = 4.;
+        body.depth = 3.;
+        body.extrusion = 5.;
+        body.scale = [1.5, 0.75, 1.2];
+        let source = evaluate(&body).unwrap();
+        let face = (0..source.face_count)
+            .find(|f| target(&body, &source, *f) == Ok(FaceTarget::Top))
+            .unwrap();
+        let center =
+            components::pivot(&source, crate::selection::SelectionMode::Face, Some(face)).unwrap();
+        let rotation = Matrix4::from_translation(center.to_vec())
+            * Matrix4::from_angle_x(Deg(15.))
+            * Matrix4::from_translation(-center.to_vec());
+        body = components::transformed(
+            &body,
+            &source,
+            crate::selection::SelectionMode::Face,
+            Some(face),
+            rotation,
+        )
+        .unwrap();
+        let g = evaluate(&body).unwrap();
+        let plane = crate::snapping::Plane::face(&g, face).unwrap();
+        let angle = 15_f64.to_radians();
+        let area = 13.5 / angle.cos();
+        for distance in [-0.4, -12.] {
+            let edited = components::sweep_face(&body, &g, face, distance).unwrap();
+            let result = evaluate(&edited).unwrap();
+            let margin = plane.normal * 1e-4;
+            let entry = builder::transformed(
+                &g.shell.as_ref().unwrap()[face].inverse(),
+                Matrix4::from_translation(margin),
+            );
+            let tool: Solid = builder::tsweep(&entry, plane.normal * distance - margin);
+            let direct = crate::edge_treatments::subtract_convex(
+                &g,
+                &tool.boundaries()[0],
+                g.surface_mapping().unwrap(),
+            )
+            .unwrap()
+            .expect("The exact planar path must handle this case");
+            let expected = if distance > -1. {
+                81. - area * (-distance) + 0.5 * 6. * angle.tan() * distance * distance
+            } else {
+                let left_height = 6. - 1.125 * angle.tan();
+                0.5 * 6. * left_height * left_height * angle.tan()
+            };
+            assert!(
+                (volume(&result) - expected).abs() < 1e-6,
+                "{distance}: {} vs {expected}",
+                volume(&result)
+            );
+            assert!((volume(&direct) - expected).abs() < 1e-6);
+            components::solid_parts(result.shell.as_ref().unwrap()).unwrap();
+            assert!(
+                result
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|f| matches!(f.oriented_surface(), truck_modeling::Surface::Plane(_)))
+            );
+            let mut mesh = result.clone();
+            components::weld_geometry(&mut mesh);
+            components::boundary_shell(&mesh, true).unwrap();
+            let mut model = crate::model::Model::from_bodies(vec![body.clone()]);
+            model.commit(edited.clone()).unwrap();
+            model.undo();
+            assert_eq!(model.bodies, vec![body.clone()]);
+            model.redo();
+            assert_eq!(model.bodies, vec![edited.clone()]);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("angled-cut.osk");
+            crate::project::Project::new(
+                vec![edited.clone()],
+                crate::viewport::Camera::default(),
+                true,
+                Some(1),
+            )
+            .save(&path)
+            .unwrap();
+            assert_eq!(
+                crate::project::Project::load(&path).unwrap().bodies,
+                vec![edited.clone()]
+            );
+            for format in crate::export::Format::ALL {
+                assert!(
+                    !crate::export::encode(std::slice::from_ref(&edited), format)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        let mut base = Body::new(Shape::Rectangle);
+        base.id = 1;
+        base.width = 4.;
+        base.depth = 3.;
+        base.extrusion = 5.;
+        let target = evaluate(&base).unwrap();
+        let mut tool = Body::new(Shape::Rectangle);
+        tool.width = 1.;
+        tool.depth = 8.;
+        tool.extrusion = 9.;
+        tool.position = [0., 0., -2.];
+        let tool = crate::model::primitive_shell(&tool).unwrap();
+        let split = crate::edge_treatments::subtract_convex(
+            &target,
+            &tool,
+            target.surface_mapping().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!((volume(&split) - 45.).abs() < 1e-6);
+        assert_eq!(
+            split.face_count, 12,
+            "Disconnected planar regions must remain separately selectable"
+        );
+        assert_eq!(
+            components::solid_parts(split.shell.as_ref().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut circle = Body::new(Shape::Circle);
+        circle.extrusion = 5.;
+        let curved = evaluate(&circle).unwrap();
+        assert!(
+            crate::edge_treatments::subtract_convex(
+                &curved,
+                &tool,
+                curved.surface_mapping().unwrap()
+            )
+            .unwrap()
+            .is_none(),
+            "Curved BReps must not be reduced to sampled planar polygons"
+        );
     }
 }

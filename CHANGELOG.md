@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Add finite straight-line Imprint for planar faces, including analytic circular trims, holes and finite concave-arm cuts. Retain shared neighboring surface trims, independent region editing, live inputs, Keep tools, undo, four exports and `.osk` v26 persistence.
+
+- Keep extrusion numeric drags active when live geometry changes rebuild the inspector; stabilize scalar and face-distance control identities.
+
+- Extend planar Imprint to holed and disconnected profile tools with whole-profile references, exact nested analytic loops, independent islands, reconciled linear crossings and closed ring-cut exits. Retain live history and four export paths in `.osk` v25.
+
+- Add explicit planar Imprint with exact contained curved boundaries, independent regions, existing-hole preservation and reconciled straight crossings. Group new swept walls by tangent continuity and reuse direct blind/through-cut boundaries on supported convex planar bodies; persist intent in `.osk` v24 while retaining legacy sweep behavior.
+
+- Add live planar Replace Face and construction-plane references, exact convex-planar/circular-prism cap reconstruction, mixed replacement/Boolean chains and `.osk` v23 persistence. Fix unequal-depth convex planar Intersect at coincident supports through shared exact clipping.
+
+- Add ordered Delete Face Open/Cap/convex-planar Heal and Cap openings, preserving exposed sheet edges and analytic cap wires, with multi-body transactions, undo, solid/sheet export validation and `.osk` v22 persistence.
+
+- Extend Up to next to angled planar stops, retaining finite profile coverage, coplanar face groups, nearer-surface obstruction checks, exact end caps and existing history/persistence/export paths.
+
+- Support angled planar Up to face termination with exact projected caps and contained blind pockets.
+
+- Add explicit multiple-body Through all scope, retained analytic depth bounds, atomic scoped cuts, preserved unchecked bodies and `.osk` v21 persistence. Reuse exact contained-hole construction for secondary targets and preserve circular entry/exit snapping metadata.
+
+- Add independently placed construction planes with orientation presets, numeric/gizmo placement, explicit drawing activation, reference-centered snapping, undo and `.osk` v20 persistence. Exclude reference geometry from exports and Boolean tools.
+
+- Reuse exact convex planar subtraction for ordered volume Subtract and attached profile bores as well as face sweeps. Preserve topology for disjoint/touching tools; cover ordered operands, enclosed CAD voids and boundary-crossing generator/borer output.
+
+- Construct convex planar inward cuts directly through angled exits, preserving exact travel, shared BRep edges and independent disconnected face regions. Avoid kernel solving for supported polyhedral cuts; retain fallback for curved/concave geometry.
+
+- Extrude evaluated planar faces after exact Move/Rotate and on Boolean results/planar transition bands, retaining operation order, shared boundaries, undo and `.osk` v19 history. Use exact slab removal for full prismatic inward caps, and handle seam vertices during subsequent planar edits.
+
+- Retrim convex planar faces exactly during Move/Rotate, preserving neighboring support planes, logical connectivity, analytic STEP surfaces and legacy deformation histories. Store exact replay intent in `.osk` v18.
+
+- Add closed source Shell cavities in both directions, editable closure and `.osk` v17 persistence. Preserve enclosed voids in STEP and accept properly oriented cavity boundaries during print-mesh reconciliation.
+
+- Add outward source Shell with a fixed cavity/opening, exact box/cylinder/semicylinder offsets, editable direction, actual outer support references and `.osk` v16 persistence.
+- Preserve the central back material when retracting an annular shell opening past its cavity floor; construct shell cap cuts directly instead of solving coincident Booleans.
+
+- Add exact source Draft for boxes, cylinders and semicylinders, with signed angle, neutral cap, conical surfaces/shared parabolic trims, undo/removal, four exports and `.osk` v15 persistence.
+- Resolve automatic extents against actual drafted/shelled footprints; preserve shell floors/side thickness during cap retraction and back-wall cuts without coplanar Boolean work.
+
+- Add editable inward Shell/thickness for source boxes, cylinders and semicylinders, with configurable cap opening, exact shared boundaries, logical curved faces, snapping metadata, undo/removal, four export paths and `.osk` v14 persistence.
+
 - Add signed cap extrusion: negative travel subtracts material, including an opening after passing the far wall. Preserve exact shared boundaries for contained planar exits, retract consecutive sweeps on reversal, and retain outward-only history topology. Persist authored overrun in `.osk` v13.
 
 - Fix edge/face/point gizmo edits on bored and Boolean solids by replaying new component edits on the evaluated boundary. Preserve legacy replay, atomic multiselection/history and `.osk` v12 persistence.

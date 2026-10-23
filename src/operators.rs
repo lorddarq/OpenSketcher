@@ -59,6 +59,8 @@ pub struct Bore {
     pub mode: BoreMode,
     #[serde(default)]
     pub extent: Extent,
+    #[serde(default)]
+    pub through_targets: Vec<u64>,
 }
 impl BoreMode {
     pub fn label(self) -> &'static str {
@@ -78,10 +80,24 @@ impl Bore {
             travel: 0.,
             mode: BoreMode::Generate,
             extent: Extent::Distance,
+            through_targets: Vec::new(),
         })
     }
     pub fn validate(&self, profile: &Body) -> Result<(), String> {
         let frame = Matrix4::from(self.reference_frame);
+        let mut targets = std::collections::HashSet::new();
+        if self.through_targets.len() > 64
+            || (!self.through_targets.is_empty() && self.extent != Extent::ThroughAll)
+            || self.through_targets.iter().any(|id| {
+                *id == 0
+                    || *id == self.target
+                    || (profile.id != 0 && *id >= profile.id)
+                    || !targets.insert(*id)
+            })
+        {
+            return Err("Through-all scope requires up to 64 distinct earlier target IDs, excluding the attached body, and the Through all extent.".into());
+        }
+
         if self.target == 0 || self.target >= profile.id && profile.id != 0 {
             return Err("A bore must reference an earlier target body.".into());
         }
@@ -136,7 +152,7 @@ pub fn support_frame(body: &Body, face: FaceTarget) -> Result<Matrix4, String> {
         );
     }
     let placement = crate::regions::transform(body);
-    let (n, d) = face.plane(body);
+    let (n, d) = face.evaluated_plane(body);
     let normal = placement.transform_vector(n).normalize();
     let u = placement
         .transform_vector(if n.z.abs() > 0.5 {
@@ -215,19 +231,254 @@ fn target_thickness(target: &Body, face: FaceTarget) -> f64 {
     } else {
         target.depth
     };
+    let local = local + face.evaluated_plane(target).1 - face.plane(target).1
+        + face.opposite().evaluated_plane(target).1
+        - face.opposite().plane(target).1;
     crate::regions::transform(target)
         .transform_vector(n * local)
         .magnitude()
 }
+fn limit_face(
+    target: u64,
+    face: FaceTarget,
+    bodies: &[Body],
+    scene: &[(u64, Geometry)],
+) -> Result<crate::snapping::Plane, String> {
+    let body = bodies
+        .iter()
+        .find(|b| b.id == target)
+        .ok_or_else(|| format!("Extent target body {target} no longer exists."))?;
+    let g = &scene
+        .iter()
+        .find(|g| g.0 == target)
+        .ok_or_else(|| format!("Extent target body {target} has no geometry."))?
+        .1;
+    if !(0..g.face_count).any(|f| crate::edge_treatments::target(body, g, f) == Ok(face)) {
+        return Err(format!(
+            "Extent target body {target} / {} no longer exists.",
+            face.label()
+        ));
+    }
+    let frame = support_frame(body, face)?;
+    Ok(crate::snapping::Plane {
+        origin: Point3::from_vec(frame.w.truncate()),
+        u: frame.x.truncate(),
+        v: frame.y.truncate(),
+        normal: frame.z.truncate(),
+    })
+}
+fn plane_depths(
+    profile: &Body,
+    plane: crate::snapping::Plane,
+    direction: f64,
+) -> Result<[f64; 2], String> {
+    let transform = crate::regions::transform(profile);
+    let axis = transform.transform_vector(Vector3::unit_z()).normalize();
+    let denominator = axis.dot(plane.normal);
+    if denominator.abs() < 1e-8 {
+        return Err("Sweep direction is parallel to the end plane.".into());
+    }
+    let center = Point3::from(profile.position).to_vec().dot(plane.normal);
+    let a = profile.width / 2. * transform.x.truncate().dot(plane.normal);
+    let b = if profile.shape == Shape::Rectangle {
+        profile.depth / 2.
+    } else {
+        profile.width / 2.
+    } * transform.y.truncate().dot(plane.normal);
+    let [low, high] = match profile.shape {
+        Shape::Rectangle => [-a.abs() - b.abs(), a.abs() + b.abs()],
+        Shape::Circle => [-a.hypot(b), a.hypot(b)],
+        Shape::Semicircle => {
+            let mut values = vec![a, -a];
+            let angle = b.atan2(a).rem_euclid(std::f64::consts::TAU);
+            for t in [
+                angle,
+                (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU),
+            ] {
+                if t <= std::f64::consts::PI {
+                    values.push(a * t.cos() + b * t.sin());
+                }
+            }
+            [
+                values.iter().copied().fold(f64::INFINITY, f64::min),
+                values.into_iter().fold(f64::NEG_INFINITY, f64::max),
+            ]
+        }
+        Shape::Line => return Err("Termination requires a closed profile.".into()),
+    };
+    let d = plane.origin.to_vec().dot(plane.normal);
+    let values = [
+        (d - center - low) / denominator * direction,
+        (d - center - high) / denominator * direction,
+    ];
+    let bounds = [values[0].min(values[1]), values[0].max(values[1])];
+    Ok(bounds)
+}
+pub(crate) fn plane_travel(
+    profile: &Body,
+    plane: crate::snapping::Plane,
+    direction: f64,
+) -> Result<[f64; 2], String> {
+    let bounds = plane_depths(profile, plane, direction)?;
+    if bounds.iter().any(|v| !v.is_finite()) || bounds[0] <= 1e-7 || bounds[1] > 10000. {
+        return Err("The whole profile must reach the end plane ahead in the chosen direction, within 10,000 mm.".into());
+    }
+    Ok(bounds)
+}
+
+pub(crate) fn terminated(
+    profile: &Body,
+    start: f64,
+    plane: crate::snapping::Plane,
+    direction: f64,
+) -> Result<Geometry, String> {
+    use truck_modeling::builder;
+    let placement = crate::regions::transform(profile);
+    let normal = placement.transform_vector(Vector3::unit_z()).normalize();
+    let project = plane
+        .projection_along(normal)
+        .ok_or("Sweep direction is parallel to the end plane.")?;
+    let mut entry = builder::transformed(&crate::model::profile_wire(profile), placement);
+    if direction < 0. {
+        entry = entry.inverse();
+    }
+    entry = builder::transformed(&entry, Matrix4::from_translation(normal * start));
+    let end = builder::transformed(&entry, project);
+    let mut shell = builder::try_wire_homotopy(&entry, &end)
+        .map_err(|e| format!("Cannot terminate the swept boundary: {e}"))?;
+    let side_count = shell.len();
+    for wire in shell.extract_boundaries() {
+        shell.push(builder::try_attach_plane(&[wire.inverse()]).map_err(|e| e.to_string())?);
+    }
+    Solid::try_new(shell.connected_components())
+        .map_err(|e| format!("Terminated sweep is not closed: {e}"))?;
+    let mut g = tessellate(&shell)?;
+    if profile.shape == Shape::Circle {
+        let roles = (0..g.face_count)
+            .map(|i| {
+                if i < side_count {
+                    0
+                } else {
+                    i - side_count + 1
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::edge_treatments::merge_surfaces(&mut g, &roles);
+        let center = Point3::from(profile.position) + normal * start;
+        let radius = profile.width / 2.;
+        let u = placement.transform_vector(Vector3::unit_x() * radius);
+        let v = placement.transform_vector(Vector3::unit_y() * radius);
+        g.circles.push(crate::model::CircularEdge { center, u, v });
+        g.circles.push(crate::model::CircularEdge {
+            center: project.transform_point(center),
+            u: project.transform_vector(u),
+            v: project.transform_vector(v),
+        });
+    }
+    g.is_solid = true;
+    Ok(g)
+}
+
+fn source_cap(target: &Body, face: FaceTarget) -> bool {
+    matches!(face, FaceTarget::Top | FaceTarget::Bottom)
+        && target.edge_treatments.is_empty()
+        && target.hollow.is_none()
+        && target.taper.is_none()
+        && target.face_extrusions.is_empty()
+}
+fn terminated_pocket(
+    target: &Body,
+    base: &Geometry,
+    profile: &Body,
+    face: FaceTarget,
+    plane: crate::snapping::Plane,
+) -> Result<Option<Geometry>, String> {
+    if !source_cap(target, face) || !profile_fits(target, profile)? {
+        return Ok(None);
+    }
+    let shell = base
+        .shell
+        .as_ref()
+        .ok_or("Pocket requires a retained boundary.")?;
+    let role = (0..base.face_count)
+        .find(|f| crate::edge_treatments::target(target, base, *f) == Ok(face))
+        .ok_or("Pocket support face no longer exists.")?;
+    let mut roles = base.surface_mapping()?.to_vec();
+    let indices = roles
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| **f == role)
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    if indices.len() != 1 {
+        return Ok(None);
+    }
+    let tool = terminated(profile, 0., plane, -1.)?;
+    let inner = tool.shell.as_ref().unwrap();
+    let normal = crate::regions::transform(profile)
+        .transform_vector(Vector3::unit_z())
+        .normalize();
+    let origin = Point3::from(profile.position);
+    let entry = inner
+        .iter()
+        .position(|f| {
+            f.edge_iter()
+                .all(|e| (e.front().point() - origin).dot(normal).abs() < 1e-7)
+        })
+        .ok_or("Terminated pocket entry is missing.")?;
+    let mut wires = shell[indices[0]].boundaries();
+    wires.extend(inner[entry].boundaries().iter().map(|w| w.inverse()));
+    let ring = truck_modeling::builder::try_attach_plane(&wires).map_err(|e| e.to_string())?;
+    let mut joined = shell.clone();
+    joined.remove(indices[0]);
+    roles.remove(indices[0]);
+    joined.push(ring);
+    roles.push(role);
+    let floor = roles.iter().copied().max().unwrap_or(0) + 1;
+    for (index, f) in inner.iter().enumerate() {
+        if index == entry {
+            continue;
+        }
+        joined.push(f.inverse());
+        let end = f
+            .edge_iter()
+            .all(|e| (e.front().point() - plane.origin).dot(plane.normal).abs() < 1e-7);
+        roles.push(if end {
+            floor
+        } else if profile.shape == Shape::Circle {
+            floor + 1
+        } else {
+            floor + 1 + index
+        });
+    }
+    Solid::try_new(joined.connected_components())
+        .map_err(|e| format!("Invalid terminated pocket boundary: {e}"))?;
+    let mut g = tessellate(&joined)?;
+    crate::edge_treatments::merge_surfaces(&mut g, &roles);
+    g.is_solid = true;
+    g.circles = base.circles.clone();
+    g.circles.extend(tool.circles);
+    Ok(Some(g))
+}
+
 /// Resolve termination from current dependencies; manual travel remains an authored value.
+#[cfg(test)]
 pub fn resolved_travel(
     profile: &Body,
     bore: &Bore,
     bodies: &[Body],
     scene: &[(u64, Geometry)],
 ) -> Result<f64, String> {
+    resolved_extent(profile, bore, bodies, scene).map(|(travel, _)| travel)
+}
+fn resolved_extent(
+    profile: &Body,
+    bore: &Bore,
+    bodies: &[Body],
+    scene: &[(u64, Geometry)],
+) -> Result<(f64, Option<crate::snapping::Plane>), String> {
     if bore.extent == Extent::Distance {
-        return Ok(bore.travel);
+        return Ok((bore.travel, None));
     }
     let direction = if bore.travel == 0. {
         if bore.mode == BoreMode::Generate {
@@ -255,6 +506,7 @@ pub fn resolved_travel(
             .map(|g| &g.1)
             .ok_or_else(|| format!("Extent target body {id} has no geometry."))
     };
+    let mut end = None;
     let travel = match bore.extent {
         Extent::Distance => unreachable!(),
         Extent::ThroughAll => {
@@ -264,25 +516,44 @@ pub fn resolved_travel(
                     bore.target
                 ));
             }
-            -target_thickness(lookup(bore.target)?, bore.face)
+            if bore.through_targets.is_empty() {
+                -target_thickness(lookup(bore.target)?, bore.face)
+            } else {
+                let mut farthest = 0_f64;
+                for id in std::iter::once(&bore.target).chain(&bore.through_targets) {
+                    let body = lookup(*id)?;
+                    let g = geometry(*id)?;
+                    if body.construction
+                        || body.boolean.is_some()
+                        || !g.is_solid
+                        || g.triangles.is_empty()
+                    {
+                        return Err(format!(
+                            "Through-all body {id} must be an earlier evaluated standalone solid."
+                        ));
+                    }
+                    let bounds = g
+                        .projection_range(normal)
+                        .map_err(|e| format!("Through-all body {id}: {e}"))?;
+                    let inward = origin.to_vec().dot(normal) - bounds[0];
+                    if inward <= 1e-7 {
+                        return Err(format!(
+                            "Through-all body {id} does not lie inward of the profile."
+                        ));
+                    }
+                    farthest = farthest.max(inward);
+                }
+                -farthest
+            }
         }
         Extent::UpToFace { target, face } => {
-            let body = lookup(target)?;
-            let g = geometry(target)?;
-            if !(0..g.face_count).any(|f| crate::edge_treatments::target(body, g, f) == Ok(face)) {
-                return Err(format!(
-                    "Extent target body {target} / {} no longer exists.",
-                    face.label()
-                ));
+            let plane = limit_face(target, face, bodies, scene)?;
+            if plane.normal.cross(normal).magnitude2() > 1e-16 {
+                end = Some(plane);
+                direction * plane_travel(profile, plane, direction)?[1]
+            } else {
+                (plane.origin - origin).dot(normal)
             }
-            let frame = support_frame(body, face)?;
-            if frame.z.truncate().dot(normal).abs() < 1. - 1e-7 {
-                return Err(format!(
-                    "Extent target body {target} / {} is not parallel to the profile. Angled termination requires trimming.",
-                    face.label()
-                ));
-            }
-            (Point3::from_vec(frame.w.truncate()) - origin).dot(normal)
         }
         Extent::UpToNext { target } => {
             let body = lookup(target)?;
@@ -291,60 +562,122 @@ pub fn resolved_travel(
                 && body.boolean.is_none()
                 && body.component_edits.is_empty()
                 && body.edge_treatments.is_empty()
+                && body.hollow.is_none()
+                && body.taper.is_none()
+                && body.face_extrusions.is_empty()
                 && !bodies.iter().any(|b| {
                     b.id < profile.id
-                        && b.bore
-                            .as_ref()
-                            .is_some_and(|op| op.target == target && op.mode != BoreMode::Generate)
+                        && b.bore.as_ref().is_some_and(|op| {
+                            (op.target == target || op.through_targets.contains(&target))
+                                && op.mode != BoreMode::Generate
+                        })
                 })
                 && crate::regions::boundaries(body, bodies)?.is_none();
-            let mut candidates: Vec<_> = (0..g.face_count)
-                .filter_map(|face| {
-                    let plane = crate::snapping::Plane::face(g, face)?;
-                    let distance = (plane.origin - origin).dot(normal);
-                    (plane.normal.dot(normal).abs() > 1. - 1e-7 && distance * direction > 1e-7)
-                        .then_some((distance, face))
-                })
-                .collect();
-            candidates.sort_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+            let mut candidates = Vec::<([f64; 2], crate::snapping::Plane, Vec<usize>)>::new();
+            for face in 0..g.face_count {
+                let Some(plane) = crate::snapping::Plane::face(g, face) else {
+                    continue;
+                };
+                if plane.normal.dot(normal).abs() < 1e-8 {
+                    continue;
+                }
+                let depths = plane_depths(profile, plane, direction)?;
+                if depths[1] <= 1e-7 {
+                    continue;
+                }
+                if let Some((_, _, faces)) = candidates.iter_mut().find(|(_, p, _)| {
+                    p.normal.dot(plane.normal).abs() > 1. - 1e-8
+                        && (p.origin - plane.origin).dot(plane.normal).abs() < 1e-7
+                }) {
+                    faces.push(face);
+                } else {
+                    candidates.push((depths, plane, vec![face]));
+                }
+            }
+            candidates.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
             let mut found = None;
-            let mut index = 0;
-            while index < candidates.len() {
-                let distance = candidates[index].0;
-                let faces: Vec<_> = candidates[index..]
-                    .iter()
-                    .take_while(|(d, _)| (*d - distance).abs() < 1e-7)
-                    .map(|(_, f)| *f)
-                    .collect();
-                index += faces.len();
+            let mut partial = false;
+            for (depths, plane, faces) in candidates {
+                let parallel = plane.normal.cross(normal).magnitude2() <= 1e-16;
                 let cap = faces.iter().any(|f| {
                     matches!(
                         crate::edge_treatments::target(body, g, *f),
                         Ok(FaceTarget::Top | FaceTarget::Bottom)
                     )
                 });
-                let (covered, overlap) = if pristine && cap && profile_fits(body, profile)? {
-                    (true, true)
-                } else {
-                    crate::booleans::profile_coverage(profile, g, &faces, distance)?
-                };
-                if covered {
-                    found = Some(distance);
-                    break;
+                let (covered, overlap) =
+                    if pristine && parallel && cap && profile_fits(body, profile)? {
+                        (true, true)
+                    } else {
+                        crate::booleans::profile_coverage(profile, g, &faces, plane)?
+                    };
+                if !covered {
+                    partial |= overlap;
+                    continue;
                 }
-                if overlap {
+                if depths[0] <= 1e-7 || depths[1] > 10000. {
                     return Err(format!(
-                        "Next faces on body {target} only partially terminate the profile; varying/curved termination is not supported yet."
+                        "Next faces on body {target} must lie ahead of the whole profile within 10,000 mm."
                     ));
                 }
+                // Another finite surface may be nearer for only part of the
+                // profile even when its infinite plane has a farther minimum.
+                // Clip actual boundaries between the start and proposed stop.
+                let ray = normal * direction;
+                let sign = ray.dot(plane.normal).signum();
+                let project = plane.projection_along(normal).unwrap();
+                let mut nearer = Geometry::default();
+                for (triangle, face) in g.triangles.iter().zip(&g.triangle_faces) {
+                    if faces.contains(face) {
+                        continue;
+                    }
+                    let points = crate::edge_treatments::clip_polygon(
+                        triangle,
+                        -ray,
+                        -origin.to_vec().dot(ray) - 1e-7,
+                    )
+                    .0;
+                    let points = crate::edge_treatments::clip_polygon(
+                        &points,
+                        plane.normal * sign,
+                        plane.origin.to_vec().dot(plane.normal) * sign - 1e-7,
+                    )
+                    .0;
+                    for i in 1..points.len().saturating_sub(1) {
+                        let triangle = [points[0], points[i], points[i + 1]]
+                            .map(|p| project.transform_point(p));
+                        if (triangle[1] - triangle[0])
+                            .cross(triangle[2] - triangle[0])
+                            .magnitude2()
+                            > 1e-20
+                        {
+                            nearer.triangles.push(triangle);
+                            nearer.triangle_faces.push(0);
+                        }
+                    }
+                }
+                if !nearer.triangles.is_empty()
+                    && crate::booleans::profile_coverage(profile, &nearer, &[0], plane)?.1
+                {
+                    return Err(format!(
+                        "Next faces on body {target} only partially terminate the profile on one plane; nearer surfaces require varying/curved termination."
+                    ));
+                }
+                if !parallel {
+                    end = Some(plane);
+                }
+                found = Some(direction * depths[1]);
+                break;
             }
-            found.ok_or_else(||format!("Extent target body {target} has no next parallel planar face fully covering the profile in this direction."))?
+            found.ok_or_else(||if partial {
+                format!("Next faces on body {target} only partially terminate the profile; select a complete end face or split the profile.")
+            } else {format!("Extent target body {target} has no next planar face fully covering the profile in this direction.")})?
         }
     };
     if !travel.is_finite() || travel * direction <= 1e-7 || travel.abs() > 10000. {
         return Err("Extent must terminate ahead of the profile, within 10,000 mm; check its target and direction.".into());
     }
-    Ok(travel)
+    Ok((travel, end))
 }
 
 pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), String> {
@@ -370,11 +703,11 @@ pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(),
             }
             let resolved = resolve_profile(profile, target, bore)?;
             let thickness=target_thickness(target,bore.face);
-            let travel=resolved_travel(&resolved,bore,bodies,scene).map_err(|e|format!("{}: {e}",bore.extent.references(bore.target)))?;
+            let (travel,end)=resolved_extent(&resolved,bore,bodies,scene).map_err(|e|format!("{}{}: {e}",bore.extent.references(bore.target),if bore.through_targets.is_empty(){String::new()}else{format!(" · scoped bodies {:?}",bore.through_targets)}))?;
             let output = if travel.abs() < 1e-8 {
                 crate::model::build(&resolved, None)?
             } else if bore.mode == BoreMode::Generate {
-                swept(&resolved, 0., travel)?
+                if let Some(plane)=end {terminated(&resolved,0.,plane,travel.signum())?}else{swept(&resolved, 0., travel)?}
             } else {
                 if travel < 0. {
                     let margin = (thickness * 0.02).max(0.02);
@@ -383,18 +716,17 @@ pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(),
                     } else {
                         0.
                     };
-                    let tool = crate::model::primitive_shell(&sweep_body(
-                        &resolved,
-                        travel.max(-thickness) - overrun,
-                        margin,
-                    ))?;
-                    let prismatic = if !modified_targets.contains(&target.id)
-                        && crate::regions::boundaries(target, bodies)?.is_none()
-                    {
-                        contained_profile(target, &resolved, bore.face, -travel)?
-                    } else {
-                        None
+                    let tool=if let Some(plane)=end {terminated(&resolved,margin,plane,-1.)?.shell.unwrap()}else {
+                        crate::model::primitive_shell(&sweep_body(&resolved,(if bore.through_targets.is_empty(){travel.max(-thickness)}else{travel})-overrun,margin))?
                     };
+                    let prismatic = if !modified_targets.contains(&target.id)&&crate::regions::boundaries(target,bodies)?.is_none() {
+                        if let Some(plane)=end {
+                            let depths=plane_travel(&resolved,plane,-1.)?;
+                            if depths[0]>=thickness-1e-7 {contained_profile(target,target_geometry,&resolved,bore.face,thickness)?}
+                            else if depths[1]<thickness-1e-7 {terminated_pocket(target,target_geometry,&resolved,bore.face,plane)?}
+                            else {None}
+                        }else{contained_profile(target,target_geometry,&resolved,bore.face,-travel)?}
+                    }else{None};
                     scene[target_index].1 = if let Some(g) = prismatic {
                         g
                     } else {
@@ -402,9 +734,39 @@ pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(),
                     };
                     scene[target_index].1.is_solid = true;
                     modified_targets.insert(target.id);
+                    for id in &bore.through_targets {
+                        let index=scene.iter().position(|(owner,_)|owner==id).ok_or_else(||format!("Through-all body {id} no longer exists."))?;
+                        let source=bodies.iter().find(|b|b.id==*id).unwrap();
+                        let mut direct=None;
+                        let normal=crate::regions::transform(&resolved).transform_vector(Vector3::unit_z()).normalize();
+                        if !modified_targets.contains(id)&&crate::regions::boundaries(source,bodies)?.is_none()
+                            && scene[index].1.projection_range(normal)?[1]<=Point3::from(resolved.position).to_vec().dot(normal)+1e-7 {
+                            for face in [FaceTarget::Top,FaceTarget::Bottom] {
+                                if support_frame(source,face).is_ok_and(|frame|frame.z.truncate().dot(normal)>1.-1e-7) {
+                                    direct=contained_profile(source,&scene[index].1,&resolved,face,target_thickness(source,face))?;
+                                    break;
+                                }
+                            }
+                        }
+                        scene[index].1=if let Some(g)=direct {g}else{difference(&scene[index].1,&tool).map_err(|e|format!("Through-all body {id}: {e}"))?};
+                        scene[index].1.is_solid=true;modified_targets.insert(*id);
+                    }
                 }
                 if bore.mode == BoreMode::GeneratorAndBorer {
-                    if travel > 0. {
+                    if let Some(plane)=end {
+                        if travel>0. {terminated(&resolved,0.,plane,1.)?}
+                        else {
+                            let depths=plane_travel(&resolved,plane,-1.)?;
+                            if depths[1]<=thickness+1e-7 {Geometry::default()}
+                            else if depths[0]>thickness+1e-7 {terminated(&resolved,-thickness,plane,-1.)?}
+                            else {
+                                let full=terminated(&resolved,0.,plane,-1.)?;
+                                let before=crate::model::primitive_shell(&sweep_body(&resolved,-thickness,0.02))?;
+                                difference(&full,&before)?
+                            }
+                        }
+                    }else if !bore.through_targets.is_empty() {Geometry::default()}
+                    else if travel > 0. {
                         swept(&resolved, 0., travel)?
                     } else if -travel > thickness + 1e-7 {
                         swept(&resolved, travel, -thickness)?
@@ -504,11 +866,12 @@ fn profile_fits(target: &Body, profile: &Body) -> Result<bool, String> {
 /// directly instead of sending concentric analytic surfaces through 3D CSG.
 fn contained_profile(
     target: &Body,
+    base: &Geometry,
     profile: &Body,
     face: FaceTarget,
     depth: f64,
 ) -> Result<Option<Geometry>, String> {
-    if !matches!(face, FaceTarget::Top | FaceTarget::Bottom) || !target.edge_treatments.is_empty() {
+    if !source_cap(target, face) {
         return Ok(None);
     }
     let inverse = crate::regions::transform(target)
@@ -532,12 +895,49 @@ fn contained_profile(
             .transform_vector(Vector3::unit_z())
             .magnitude())
     .min(target.extrusion);
-    if depth < target.extrusion - 1e-7 {
-        let outer = crate::model::profile_wire(target);
-        let mut shell: Shell =
-            truck_modeling::builder::tsweep(&outer, Vector3::unit_z() * target.extrusion);
+    let shell = pocket_shell(
+        crate::model::profile_wire(target),
+        inner,
+        target.extrusion,
+        face,
+        depth,
+    )?;
+    let shell = truck_modeling::builder::transformed(&shell, crate::regions::transform(target));
+    let mut g = tessellate(&shell)?;
+    g.circles = base.circles.clone();
+    if profile.shape == Shape::Circle {
+        let frame = support_frame(target, face)?;
+        let normal = frame.z.truncate();
+        let center = Point3::from(profile.position);
+        let entry = center + normal * (Point3::from_vec(frame.w.truncate()) - center).dot(normal);
+        let vector =
+            crate::regions::transform(target).transform_vector(face.plane(target).0 * depth);
+        let placement = crate::regions::transform(profile);
+        let radius = profile.width / 2.;
+        for center in [entry, entry - vector] {
+            g.circles.push(crate::model::CircularEdge {
+                center,
+                u: placement.transform_vector(Vector3::unit_x() * radius),
+                v: placement.transform_vector(Vector3::unit_y() * radius),
+            });
+        }
+    }
+    g.is_solid = true;
+    Ok(Some(g))
+}
+/// Close shared outer/inner wires into an exact blind pocket or through opening.
+/// The inner wire is clockwise in the XY plane.
+pub(crate) fn pocket_shell(
+    outer: truck_modeling::Wire,
+    inner: truck_modeling::Wire,
+    height: f64,
+    face: FaceTarget,
+    depth: f64,
+) -> Result<Shell, String> {
+    if depth < height - 1e-7 {
+        let mut shell: Shell = truck_modeling::builder::tsweep(&outer, Vector3::unit_z() * height);
         let start = if face == FaceTarget::Top {
-            target.extrusion - depth
+            height - depth
         } else {
             0.
         };
@@ -547,8 +947,6 @@ fn contained_profile(
         );
         let walls: Shell = truck_modeling::builder::tsweep(&inner, Vector3::unit_z() * depth);
         shell.extend(walls);
-        // Boundary wires share the walls' edge identities. Closing coplanar
-        // wires together creates a ring at the entry and a cap at the floor.
         let mut planes: Vec<(f64, Vec<truck_modeling::Wire>)> = Vec::new();
         for wire in shell.extract_boundaries() {
             let z = wire[0].front().point().z;
@@ -567,21 +965,12 @@ fn contained_profile(
             );
         }
         Solid::try_new(vec![shell.clone()]).map_err(|e| format!("Invalid pocket boundary: {e}"))?;
-        let shell = truck_modeling::builder::transformed(&shell, crate::regions::transform(target));
-        let mut geometry = tessellate(&shell)?;
-        geometry.is_solid = true;
-        return Ok(Some(geometry));
-    }
-    let face =
-        truck_modeling::builder::try_attach_plane(&[crate::model::profile_wire(target), inner])
+        Ok(shell)
+    } else {
+        let face = truck_modeling::builder::try_attach_plane(&[outer, inner])
             .map_err(|e| e.to_string())?;
-    let shell = truck_modeling::builder::transformed(
-        &crate::model::extrude_face(&face, target.extrusion)?,
-        crate::regions::transform(target),
-    );
-    let mut g = tessellate(&shell)?;
-    g.is_solid = true;
-    Ok(Some(g))
+        crate::model::extrude_face(&face, height)
+    }
 }
 
 pub(crate) fn solid(g: &Geometry) -> Result<Solid, String> {
@@ -639,6 +1028,11 @@ pub fn difference(target: &Geometry, tool: &Shell) -> Result<Geometry, String> {
     if target.triangles.is_empty() {
         return Ok(target.clone());
     }
+    if let Some(result) =
+        crate::edge_treatments::subtract_convex(target, tool, target.surface_mapping()?)?
+    {
+        return Ok(result);
+    }
     let target_solid = solid(target)?;
     let mut tool = Solid::try_new(tool.connected_components()).map_err(|e| e.to_string())?;
     tool.not();
@@ -660,6 +1054,82 @@ mod tests {
             .iter()
             .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
             .sum()
+    }
+    #[test]
+    fn angled_planar_termination_keeps_exact_caps_and_blind_pockets() {
+        for shape in [Shape::Rectangle, Shape::Circle, Shape::Semicircle] {
+            let mut base = Body::new(Shape::Rectangle);
+            base.id = 1;
+            base.width = 4.;
+            base.depth = 4.;
+            base.extrusion = 6.;
+            let mut end = Body::new(Shape::Rectangle);
+            end.id = 2;
+            end.position = [6., 0., 2.5];
+            end.rotation = [15., 0., 0.];
+            end.extrusion = 0.5;
+            let mut profile = Body::new(shape);
+            profile.id = 3;
+            profile.width = 1.;
+            profile.depth = 1.;
+            profile.position = [0., 0., 6.];
+            let mut bore = Bore::new(&base, FaceTarget::Top).unwrap();
+            bore.travel = -1.;
+            bore.extent = Extent::UpToFace {
+                target: 2,
+                face: FaceTarget::Top,
+            };
+            profile.bore = Some(bore);
+            let plane = limit_face(
+                2,
+                FaceTarget::Top,
+                &[end.clone()],
+                &[(2, evaluate(&end).unwrap())],
+            )
+            .unwrap();
+            let area = match shape {
+                Shape::Rectangle => 1.,
+                Shape::Circle => std::f64::consts::PI / 4.,
+                _ => std::f64::consts::PI / 8.,
+            };
+            let centroid = if shape == Shape::Semicircle {
+                2. / (3. * std::f64::consts::PI)
+            } else {
+                0.
+            };
+            let expected = area
+                * (6. - 2.5 - 0.5 / 15f64.to_radians().cos() - 15f64.to_radians().tan() * centroid);
+            for mode in [
+                BoreMode::Generate,
+                BoreMode::Borer,
+                BoreMode::GeneratorAndBorer,
+            ] {
+                profile.bore.as_mut().unwrap().mode = mode;
+                let scene =
+                    crate::model::evaluate_scene(&[base.clone(), end.clone(), profile.clone()])
+                        .unwrap();
+                assert!((volume(&scene[1].1) - volume(&evaluate(&end).unwrap())).abs() < 1e-6);
+                if mode == BoreMode::Generate {
+                    let g = &scene[2].1;
+                    assert!(
+                        (volume(g) - expected).abs() < 0.04,
+                        "{shape:?}: {} vs {expected}",
+                        volume(g)
+                    );
+                    assert!(g.points.iter().all(|p| (p.z - 6.).abs() < 1e-6
+                        || (*p - plane.origin).dot(plane.normal).abs() < 1e-6));
+                } else {
+                    assert!(scene[2].1.triangles.is_empty());
+                    assert!(
+                        (96. - volume(&scene[0].1) - expected).abs() < 0.04,
+                        "{shape:?}: {}",
+                        volume(&scene[0].1)
+                    );
+                    Solid::try_new(scene[0].1.shell.as_ref().unwrap().connected_components())
+                        .unwrap();
+                }
+            }
+        }
     }
     #[test]
     fn automatic_extents_follow_targets_preserve_scope_and_roundtrip() {
@@ -826,6 +1296,174 @@ mod tests {
         }
     }
     #[test]
+    fn next_angled_faces_preserve_finite_coverage_history_and_exports() {
+        for shape in [Shape::Rectangle, Shape::Circle, Shape::Semicircle] {
+            let mut base = Body::new(Shape::Rectangle);
+            base.id = 1;
+            base.width = 4.;
+            base.depth = 4.;
+            base.extrusion = 6.;
+            let mut end = Body::new(Shape::Rectangle);
+            end.id = 2;
+            end.width = 4.;
+            end.depth = 4.;
+            end.extrusion = 0.5;
+            end.position = [0., 0., 2.5];
+            end.rotation = [15., 0., 0.];
+            let mut profile = Body::new(shape);
+            profile.id = 3;
+            profile.width = 1.;
+            profile.depth = 1.;
+            profile.position = [0., 0., 6.];
+            let mut bore = Bore::new(&base, FaceTarget::Top).unwrap();
+            bore.extent = Extent::UpToNext { target: 2 };
+            bore.travel = -1.;
+            profile.bore = Some(bore);
+            let area = match shape {
+                Shape::Rectangle => 1.,
+                Shape::Circle => std::f64::consts::PI / 4.,
+                _ => std::f64::consts::PI / 8.,
+            };
+            let centroid = if shape == Shape::Semicircle {
+                2. / (3. * std::f64::consts::PI)
+            } else {
+                0.
+            };
+            let depth =
+                6. - 2.5 - 0.5 / 15f64.to_radians().cos() - 15f64.to_radians().tan() * centroid;
+            for mode in [
+                BoreMode::Generate,
+                BoreMode::Borer,
+                BoreMode::GeneratorAndBorer,
+            ] {
+                profile.bore.as_mut().unwrap().mode = mode;
+                let bodies = vec![base.clone(), end.clone(), profile.clone()];
+                let scene = crate::model::evaluate_scene(&bodies).unwrap();
+                assert_eq!(scene[1].1.triangles, evaluate(&end).unwrap().triangles);
+                if mode == BoreMode::Generate {
+                    assert!((volume(&scene[2].1) - area * depth).abs() < 0.04);
+                    assert!((volume(&scene[0].1) - 96.).abs() < 1e-6);
+                    if shape == Shape::Circle {
+                        assert_eq!(scene[2].1.face_count, 3);
+                        assert_eq!(scene[2].1.circles.len(), 2);
+                    }
+                } else {
+                    assert!(scene[2].1.triangles.is_empty());
+                    assert!((96. - volume(&scene[0].1) - area * depth).abs() < 0.04);
+                }
+                for (_, g) in scene.iter().filter(|(_, g)| !g.triangles.is_empty()) {
+                    Solid::try_new(g.shell.as_ref().unwrap().connected_components()).unwrap();
+                }
+                if shape == Shape::Circle {
+                    for format in [
+                        crate::export::Format::Stl,
+                        crate::export::Format::Glb,
+                        crate::export::Format::Step,
+                        crate::export::Format::Dxf,
+                    ] {
+                        assert!(!crate::export::encode(&bodies, format).unwrap().is_empty());
+                    }
+                }
+            }
+            let bodies = vec![base.clone(), end.clone(), profile.clone()];
+            let mut model = crate::model::Model::from_bodies(bodies.clone());
+            let mut moved = end.clone();
+            moved.position[2] += 0.5;
+            model.commit(moved.clone()).unwrap();
+            let scene = crate::model::evaluate_scene(&model.bodies).unwrap();
+            assert!((96. - volume(&scene[0].1) - area * (depth - 0.5)).abs() < 0.04);
+            model.undo();
+            assert_eq!(model.bodies, bodies);
+            model.redo();
+            assert_eq!(model.bodies[1], moved);
+            let project = crate::project::Project::new(
+                model.bodies.clone(),
+                crate::viewport::Camera::default(),
+                true,
+                Some(3),
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            project.save(file.path()).unwrap();
+            assert_eq!(
+                crate::project::Project::load(file.path()).unwrap().bodies,
+                model.bodies
+            );
+            let committed = model.bodies.clone();
+            moved.width = 0.25;
+            assert!(model.commit(moved).unwrap_err().contains("partially"));
+            assert_eq!(model.bodies, committed);
+            let mut disjoint = end.clone();
+            disjoint.position[0] = 6.;
+            assert!(model.commit(disjoint).is_err());
+            assert_eq!(model.bodies, committed);
+            profile.bore.as_mut().unwrap().travel = 1.;
+            assert!(model.commit(profile.clone()).is_err());
+            assert_eq!(model.bodies, committed);
+            profile.bore.as_mut().unwrap().travel = -1.;
+            end.position[2] = -2.;
+            let scene = crate::model::evaluate_scene(&[base, end.clone(), profile]).unwrap();
+            assert!((96. - volume(&scene[0].1) - area * 6.).abs() < 0.06);
+            let beyond = 2. - 0.5 / 15f64.to_radians().cos() - 15f64.to_radians().tan() * centroid;
+            assert!((volume(&scene[2].1) - area * beyond).abs() < 0.04);
+        }
+    }
+    #[test]
+    fn next_plane_checks_finite_nearer_surfaces_instead_of_plane_order() {
+        let mut base = Body::new(Shape::Rectangle);
+        base.id = 1;
+        base.extrusion = 1.;
+        let mut end = base.clone();
+        end.id = 2;
+        end.position[2] = -20.;
+        let mut profile = Body::new(Shape::Rectangle);
+        profile.id = 3;
+        let mut bore = Bore::new(&base, FaceTarget::Top).unwrap();
+        bore.extent = Extent::UpToNext { target: 2 };
+        bore.travel = 1.;
+        let mut stop = Body::new(Shape::Rectangle);
+        stop.width = 4.;
+        stop.depth = 4.;
+        stop.position[2] = 3.;
+        stop.rotation[1] = 45.;
+        let stop = evaluate(&stop).unwrap();
+        let mut patch = Body::new(Shape::Rectangle);
+        patch.width = 0.5;
+        patch.depth = 2.;
+        patch.position = [0.75, 0., 2.5];
+        for (x, blocked) in [(0.75, false), (-0.75, true)] {
+            patch.position[0] = x;
+            let patch = evaluate(&patch).unwrap();
+            let mut geometry = Geometry {
+                triangles: stop.triangles.clone(),
+                triangle_faces: vec![0; stop.triangles.len()],
+                face_count: 2,
+                ..Default::default()
+            };
+            geometry
+                .triangle_faces
+                .extend(vec![1; patch.triangles.len()]);
+            geometry.triangles.extend(patch.triangles);
+            let result = resolved_extent(
+                &profile,
+                &bore,
+                &[base.clone(), end.clone()],
+                &[(2, geometry)],
+            );
+            if blocked {
+                assert!(result.unwrap_err().contains("nearer"));
+            } else {
+                let (travel, plane) = result.unwrap();
+                assert!((travel - 4.).abs() < 1e-6);
+                assert!(plane.is_some());
+            }
+        }
+        assert!(
+            crate::snapping::Plane::ground()
+                .projection_along(Vector3::unit_x())
+                .is_none()
+        );
+    }
+    #[test]
     fn next_extent_rejects_partial_missing_and_angled_termination() {
         let mut outline = Body::new(Shape::Rectangle);
         outline.width = 3.;
@@ -842,11 +1480,23 @@ mod tests {
         joined.triangles.extend(right.triangles.iter());
         joined.triangle_faces.extend(vec![1; right.triangles.len()]);
         assert_eq!(
-            crate::booleans::profile_coverage(&outline, &joined, &[0, 1], -1.).unwrap(),
+            crate::booleans::profile_coverage(
+                &outline,
+                &joined,
+                &[0, 1],
+                crate::snapping::Plane::ground()
+            )
+            .unwrap(),
             (true, true)
         );
         assert_eq!(
-            crate::booleans::profile_coverage(&outline, &joined, &[0], -1.).unwrap(),
+            crate::booleans::profile_coverage(
+                &outline,
+                &joined,
+                &[0],
+                crate::snapping::Plane::ground()
+            )
+            .unwrap(),
             (false, true)
         );
         let mut base = Body::new(Shape::Rectangle);
@@ -971,8 +1621,9 @@ mod tests {
         let mut cutter = Body::new(Shape::Circle);
         cutter.width = 3.99;
         cutter.position[2] = 2.;
+        let base_geometry = evaluate(&base).unwrap();
         for depth in [0.5, 2.] {
-            let g = contained_profile(&base, &cutter, FaceTarget::Top, depth)
+            let g = contained_profile(&base, &base_geometry, &cutter, FaceTarget::Top, depth)
                 .unwrap()
                 .expect("thin pipe must avoid CSG");
             assert!(g.is_solid);
@@ -1158,5 +1809,290 @@ mod tests {
         let mut bad = profile.clone();
         bad.bore.as_mut().unwrap().reference_frame[0][0] = 2.;
         assert!(bad.validate().is_err());
+    }
+    #[test]
+    fn boundary_crossing_rectangular_bores_share_exact_subtraction() {
+        let mut target = Body::new(Shape::Rectangle);
+        target.id = 1;
+        target.width = 4.;
+        target.depth = 3.;
+        target.extrusion = 5.;
+        for mode in [BoreMode::Borer, BoreMode::GeneratorAndBorer] {
+            for travel in [-2., -5., -7.] {
+                let mut profile = Body::new(Shape::Rectangle);
+                profile.id = 2;
+                profile.width = 2.;
+                profile.depth = 2.;
+                profile.position = [1.5, 0., 5.];
+                let mut bore = Bore::new(&target, FaceTarget::Top).unwrap();
+                bore.mode = mode;
+                bore.travel = travel;
+                profile.bore = Some(bore);
+                let bodies = vec![target.clone(), profile];
+                let scene = crate::model::evaluate_scene(&bodies).unwrap();
+                assert!((volume(&scene[0].1) - (60. - 3. * (-travel).min(5.))).abs() < 1e-6);
+                let emergence = if mode == BoreMode::GeneratorAndBorer {
+                    4. * (-travel - 5.).max(0.)
+                } else {
+                    0.
+                };
+                assert!((volume(&scene[1].1) - emergence).abs() < 1e-6);
+                let shell = scene[0].1.shell.as_ref().unwrap();
+                assert!(
+                    shell
+                        .iter()
+                        .flat_map(|f| f.edge_iter())
+                        .all(|e| matches!(e.curve(), truck_modeling::Curve::Line(_)))
+                );
+                crate::components::solid_parts(shell).unwrap();
+                let mut mesh = scene[0].1.clone();
+                crate::components::weld_geometry(&mut mesh);
+                crate::components::boundary_shell(&mesh, true).unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("rectangular-notch.osk");
+                crate::project::Project::new(
+                    bodies.clone(),
+                    crate::viewport::Camera::default(),
+                    true,
+                    Some(1),
+                )
+                .save(&path)
+                .unwrap();
+                assert_eq!(crate::project::Project::load(&path).unwrap().bodies, bodies);
+                for format in crate::export::Format::ALL {
+                    assert!(!crate::export::encode(&bodies, format).unwrap().is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn through_all_scope_cuts_only_explicit_bodies_and_regenerates_atomically() {
+        use crate::{
+            model::{Model, evaluate_scene},
+            project::Project,
+            viewport::Camera,
+        };
+        for shape in [Shape::Rectangle, Shape::Circle] {
+            let mut upper = Body::new(shape);
+            upper.id = 1;
+            upper.width = 4.;
+            upper.depth = 4.;
+            upper.extrusion = 2.;
+            upper.position = [0., 0., 4.];
+            let mut lower = upper.clone();
+            lower.id = 2;
+            lower.position = [0., 0., 0.];
+            let mut unchecked = upper.clone();
+            unchecked.id = 3;
+            unchecked.extrusion = 1.;
+            unchecked.position = [0., 0., 2.5];
+            let initial = vec![upper.clone(), lower.clone(), unchecked.clone()];
+            let original = evaluate_scene(&initial).unwrap();
+            let base = volume(&original[0].1);
+            for mode in [
+                BoreMode::Borer,
+                BoreMode::GeneratorAndBorer,
+                BoreMode::Generate,
+            ] {
+                let mut profile = Body::new(Shape::Circle);
+                profile.id = 4;
+                profile.width = 1.;
+                profile.position = [0., 0., 6.];
+                let mut bore = Bore::new(&upper, FaceTarget::Top).unwrap();
+                bore.mode = mode;
+                bore.travel = -1.;
+                bore.extent = Extent::ThroughAll;
+                bore.through_targets = vec![2];
+                profile.bore = Some(bore);
+                let mut bodies = initial.clone();
+                bodies.push(profile.clone());
+                let scene = evaluate_scene(&bodies).unwrap();
+                let resolved =
+                    resolve_profile(&profile, &upper, profile.bore.as_ref().unwrap()).unwrap();
+                assert!(
+                    (resolved_travel(
+                        &resolved,
+                        profile.bore.as_ref().unwrap(),
+                        &bodies,
+                        &original
+                    )
+                    .unwrap()
+                        + 6.)
+                        .abs()
+                        < 1e-8
+                );
+                for index in [0, 1] {
+                    let expected = if mode == BoreMode::Generate {
+                        base
+                    } else {
+                        base - std::f64::consts::PI * 0.5
+                    };
+                    assert!(
+                        (volume(&scene[index].1) - expected).abs() < 0.15,
+                        "{shape:?} {mode:?} body {index}"
+                    );
+                    if mode != BoreMode::Generate {
+                        assert_eq!(
+                            scene[index].1.circles.len(),
+                            if shape == Shape::Circle { 4 } else { 2 },
+                            "Entry/exit circle snapping follows every cut target"
+                        );
+                    }
+                }
+                assert_eq!(
+                    scene[2].1.triangles, original[2].1.triangles,
+                    "Unchecked bodies remain unchanged even between targets"
+                );
+                if mode == BoreMode::Generate {
+                    assert!((volume(&scene[3].1) - std::f64::consts::PI * 1.5).abs() < 0.2);
+                    let low = scene[3]
+                        .1
+                        .points
+                        .iter()
+                        .map(|p| p.z)
+                        .fold(f64::INFINITY, f64::min);
+                    let high = scene[3]
+                        .1
+                        .points
+                        .iter()
+                        .map(|p| p.z)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    assert!(
+                        low.abs() < 1e-8 && (high - 6.).abs() < 1e-8,
+                        "End planes remain exact independently of display chord tolerance"
+                    );
+                } else {
+                    assert!(
+                        scene[3].1.triangles.is_empty(),
+                        "Automatic Through all ends at scope; it does not fill gaps or emit an extension"
+                    );
+                }
+                let mut model = Model::from_bodies(initial.clone());
+                model.commit(profile.clone()).unwrap();
+                let accepted = model.bodies.clone();
+                model.undo();
+                assert_eq!(model.bodies, initial);
+                model.redo();
+                assert_eq!(model.bodies, accepted);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("scope.osk");
+                let project = Project::new(accepted.clone(), Camera::default(), true, Some(1));
+                project.save(&path).unwrap();
+                assert_eq!(Project::load(&path).unwrap().bodies, accepted);
+                let mut old = serde_json::to_value(project).unwrap();
+                old["schema_version"] = 20.into();
+                old["modeling_version"] = 20.into();
+                std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+                assert!(
+                    Project::load(&path)
+                        .unwrap_err()
+                        .contains("Multiple-body Through all requires .osk version 21")
+                );
+                old["bodies"][3]["bore"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("through_targets");
+                std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+                assert!(
+                    Project::load(&path).unwrap().bodies[3]
+                        .bore
+                        .as_ref()
+                        .unwrap()
+                        .through_targets
+                        .is_empty()
+                );
+                for format in crate::export::Format::ALL {
+                    assert!(!crate::export::encode(&accepted, format).unwrap().is_empty());
+                }
+                for ids in [vec![1], vec![2, 2], vec![9]] {
+                    let mut invalid = profile.clone();
+                    invalid.bore.as_mut().unwrap().through_targets = ids;
+                    assert!(model.commit(invalid).is_err());
+                    assert_eq!(model.bodies, accepted);
+                }
+                let mut invalid = profile.clone();
+                invalid.bore.as_mut().unwrap().extent = Extent::Distance;
+                assert!(model.commit(invalid).is_err());
+                assert_eq!(model.bodies, accepted);
+                assert!(model.delete(2).is_err());
+                assert_eq!(model.bodies, accepted);
+                let mut deeper = lower.clone();
+                deeper.position[2] = -2.;
+                model.commit(deeper).unwrap();
+                let regenerated = evaluate_scene(&model.bodies).unwrap();
+                let resolved = resolve_profile(
+                    &model.bodies[3],
+                    &model.bodies[0],
+                    model.bodies[3].bore.as_ref().unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    (resolved_travel(
+                        &resolved,
+                        model.bodies[3].bore.as_ref().unwrap(),
+                        &model.bodies,
+                        &regenerated
+                    )
+                    .unwrap()
+                        + 8.)
+                        .abs()
+                        < 1e-8
+                );
+                let mut detached = profile.clone();
+                detached.bore = None;
+                model.commit(detached).unwrap();
+                let restored = evaluate_scene(&model.bodies).unwrap();
+                assert!(
+                    (volume(&restored[0].1) - base).abs() < 1e-6
+                        && (volume(&restored[1].1) - base).abs() < 1e-6
+                );
+            }
+        }
+    }
+    #[test]
+    fn analytic_scope_bounds_cover_curved_and_affine_geometry() {
+        for shape in [Shape::Rectangle, Shape::Circle, Shape::Semicircle] {
+            for rounded in [false, true] {
+                let mut b = Body::new(shape);
+                b.id = 1;
+                b.width = 4.;
+                b.depth = 3.;
+                b.extrusion = 5.;
+                b.position = [2., -3., 1.];
+                b.rotation = [17., 31., 43.];
+                b.scale = [1.5, 0.75, 2.];
+                if rounded {
+                    b.edge_treatments
+                        .push(crate::edge_treatments::Modifier::new(
+                            crate::edge_treatments::Kind::Bevel,
+                            FaceTarget::Top,
+                            &b,
+                        ));
+                }
+                let g = evaluate(&b).unwrap();
+                let direction = Vector3::new(0.3, -0.4, 0.5).normalize();
+                let bounds = g.projection_range(direction).unwrap();
+                assert!(g.triangles.iter().flatten().all(|p| {
+                    let v = p.to_vec().dot(direction);
+                    (bounds[0] - 1e-6..=bounds[1] + 1e-6).contains(&v)
+                }));
+                if shape == Shape::Circle && !rounded {
+                    let m = crate::regions::transform(&b);
+                    let radius = b.width / 2.;
+                    let radial = radius
+                        * direction
+                            .dot(m.x.truncate())
+                            .hypot(direction.dot(m.y.truncate()));
+                    let height = b.extrusion * direction.dot(m.z.truncate());
+                    let center = Point3::from(b.position).to_vec().dot(direction);
+                    assert!(
+                        bounds[0] <= center - radial + height.min(0.) + 1e-7
+                            && bounds[1] >= center + radial + height.max(0.) - 1e-7,
+                        "Analytic full-cylinder extrema cannot lie outside the support bound"
+                    );
+                }
+                assert!(g.projection_range(Vector3::new(f64::NAN, 0., 0.)).is_err());
+            }
+        }
     }
 }

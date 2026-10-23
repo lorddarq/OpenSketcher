@@ -2,9 +2,7 @@
 use crate::model::{Body, Geometry, evaluate_scene};
 use serde_json::json;
 use std::{fmt::Write, path::Path};
-use truck_modeling::{
-    BSplineCurve, BoundedCurve, Curve, InnerSpace, KnotVec, ParameterDivision1D, Solid,
-};
+use truck_modeling::{BSplineCurve, BoundedCurve, Curve, InnerSpace, KnotVec, ParameterDivision1D};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Format {
@@ -38,6 +36,7 @@ pub fn save(bodies: &[Body], format: Format, path: &Path) -> Result<(), String> 
 }
 pub(crate) fn encode(bodies: &[Body], format: Format) -> Result<Vec<u8>, String> {
     let mut scene = evaluate_scene(bodies)?;
+    scene.retain(|(id, _)| !bodies.iter().any(|b| b.id == *id && b.construction));
     // Reuse component editing's boundary reconciliation before writing a connected mesh.
     for (_, geometry) in &mut scene {
         crate::components::weld_geometry(geometry);
@@ -144,10 +143,8 @@ pub(crate) fn encode(bodies: &[Body], format: Format) -> Result<Vec<u8>, String>
                     crate::components::boundary_shell(g, closed)?
                 };
                 if closed {
-                    for part in shell.connected_components() {
-                        let mut solid = Solid::try_new(vec![part])
-                            .map_err(|e| e.to_string())?
-                            .compress();
+                    for part in crate::components::solid_parts(&shell)? {
+                        let mut solid = part.compress();
                         for shell in &mut solid.boundaries {
                             for face in &mut shell.faces {
                                 face.surface = cad_surface(&face.surface)?;

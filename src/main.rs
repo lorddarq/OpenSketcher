@@ -3,16 +3,20 @@
 use eframe::egui;
 mod booleans;
 mod components;
+mod curve_imprints;
+mod drafting;
 mod edge_treatments;
 mod evaluation;
 mod export;
 mod face_extrusions;
+mod face_operations;
 mod gizmo;
 mod model;
 mod operators;
 mod project;
 mod regions;
 mod selection;
+mod shelling;
 mod snapping;
 use project::Project;
 use selection::SelectionMode;
@@ -98,6 +102,7 @@ struct TransformGesture {
 
 struct FaceOffset {
     source: Body,
+    geometry: model::Geometry,
     face: components::OffsetTarget,
     distance: f64,
     valid: bool,
@@ -345,6 +350,66 @@ impl OpenSketcher {
         }
     }
 
+    fn apply_boolean(&mut self, kind: booleans::Kind, picks: Vec<selection::Pick>) {
+        let mut body = Body::new(Shape::Rectangle);
+        body.boolean = Some(booleans::Boolean::new(
+            kind,
+            &picks,
+            self.selection_mode,
+            &self.committed_scene,
+        ));
+        self.request_change(evaluation::Change::Edit(Box::new(body), false));
+    }
+    fn apply_face_operation(&mut self, kind: face_operations::FaceEdit) {
+        match face_operations::selected(
+            &self.model.bodies,
+            &self.committed_scene,
+            &self.selection,
+            kind,
+        ) {
+            Ok(changes) => {
+                self.selection_mode = SelectionMode::Volume;
+                self.set_picks(changes.iter().map(|b| (b.id, None)).collect());
+                self.request_change(evaluation::Change::Transform(changes));
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+    fn apply_shell(&mut self) {
+        let result = (|| {
+            if self.selection_mode != SelectionMode::Face || self.selection.len() != 1 {
+                return Err("Select one planar source face to open the shell.".to_owned());
+            }
+            let (id, Some(face)) = self.selection[0] else {
+                return Err("Select a planar source face.".into());
+            };
+            let mut body = self
+                .model
+                .bodies
+                .iter()
+                .find(|b| b.id == id)
+                .ok_or("Body no longer exists.")?
+                .clone();
+            let geometry = &self
+                .committed_scene
+                .iter()
+                .find(|g| g.0 == id)
+                .ok_or("Geometry no longer exists.")?
+                .1;
+            let opening = edge_treatments::target(&body, geometry, face)?;
+            body.hollow = Some(shelling::Hollow::new(&body, opening)?);
+            Ok(body)
+        })();
+        match result {
+            Ok(body) => {
+                self.selection_mode = SelectionMode::Volume;
+                self.set_picks(vec![(body.id, None)]);
+                self.request_change(evaluation::Change::Transform(vec![body]));
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     fn refresh(&mut self) {
         self.viewport.update_scene(
             &self.model.bodies,
@@ -434,8 +499,27 @@ impl OpenSketcher {
                             self.saved = p;
                             self.refresh();
                         } else {
+                            if self.drawing.plane.is_some_and(|id| {
+                                !self
+                                    .model
+                                    .bodies
+                                    .iter()
+                                    .any(|b| b.id == id && b.construction)
+                            }) {
+                                self.drawing.plane = None;
+                            }
                             match update.change {
-                                evaluation::Change::Edit(_, false) => self.select(update.selected),
+                                evaluation::Change::Edit(_, false) => {
+                                    if update.selected.is_some_and(|id| {
+                                        self.model
+                                            .bodies
+                                            .iter()
+                                            .any(|b| b.id == id && b.construction)
+                                    }) {
+                                        self.drawing.plane = update.selected;
+                                    }
+                                    self.select(update.selected);
+                                }
                                 evaluation::Change::Delete(_) => self.select(None),
                                 evaluation::Change::History(_)
                                 | evaluation::Change::Transform(_) => {
@@ -467,7 +551,27 @@ impl OpenSketcher {
                                                 .find(|(id, _)| *id == body.id)
                                         {
                                             self.selected_element = (0..g.face_count).find(|f| {
-                                                if edit.extrude {
+                                                if let components::OffsetTarget::EvaluatedPlane(
+                                                    face,
+                                                ) = edit.face
+                                                {
+                                                    let original =
+                                                        snapping::Plane::face(&edit.geometry, face)
+                                                            .unwrap();
+                                                    snapping::Plane::face(g, *f).is_some_and(
+                                                        |plane| {
+                                                            plane.normal.dot(original.normal)
+                                                                > 1. - 1e-6
+                                                                && (plane.origin
+                                                                    - original.origin
+                                                                    - original.normal
+                                                                        * edit.distance)
+                                                                    .dot(original.normal)
+                                                                    .abs()
+                                                                    < 1e-6
+                                                        },
+                                                    )
+                                                } else if edit.extrude {
                                                     face_extrusions::target(body, g, *f)
                                                         .map(components::OffsetTarget::Plane)
                                                         == Ok(edit.face)
@@ -555,12 +659,24 @@ impl OpenSketcher {
                     .find(|(owner, _)| *owner == id)
                     .ok_or("Selected geometry no longer exists.")?
                     .1;
-                let face = face_extrusions::target(body, geometry, element)
-                    .map(components::OffsetTarget::Plane)
-                    .or_else(|_| components::offset_target(body, geometry, element))?;
-                components::offset_source(body, face, 0.)?;
+                let face = if (!body.component_edits.is_empty()
+                    || body.boolean.is_some()
+                    || face_extrusions::target(body, geometry, element).is_err())
+                    && geometry.is_solid
+                    && geometry.shell.is_some()
+                    && snapping::Plane::face(geometry, element).is_some()
+                {
+                    components::OffsetTarget::EvaluatedPlane(element)
+                } else {
+                    let face = face_extrusions::target(body, geometry, element)
+                        .map(components::OffsetTarget::Plane)
+                        .or_else(|_| components::offset_target(body, geometry, element))?;
+                    components::offset_source(body, face, 0.)?;
+                    face
+                };
                 Ok(FaceOffset {
                     source: body.clone(),
+                    geometry: geometry.clone(),
                     face,
                     distance: 0.,
                     valid: true,
@@ -577,11 +693,16 @@ impl OpenSketcher {
             }
         }
         let mut edit = self.face_offset.take().unwrap();
-        if matches!(edit.face, components::OffsetTarget::Plane(_)) {
+        if matches!(
+            edit.face,
+            components::OffsetTarget::Plane(_) | components::OffsetTarget::EvaluatedPlane(_)
+        ) {
             let previous = edit.extrude;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut edit.extrude, true, "Extrude face");
-                ui.selectable_value(&mut edit.extrude, false, "Offset source");
+                if !matches!(edit.face, components::OffsetTarget::EvaluatedPlane(_)) {
+                    ui.selectable_value(&mut edit.extrude, false, "Offset source");
+                }
             });
             if previous != edit.extrude {
                 self.finish_model_edit();
@@ -608,18 +729,26 @@ impl OpenSketcher {
             edit.face.label()
         ));
         let response = ui
-            .horizontal(|ui| {
-                ui.label("Distance");
-                ui.add(
-                    egui::DragValue::new(&mut edit.distance)
-                        .speed(0.05)
-                        .suffix(" mm"),
-                )
-            })
+            .scope_builder(
+                egui::UiBuilder::new().id(egui::Id::new("face_offset_distance")),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Distance");
+                        ui.add(
+                            egui::DragValue::new(&mut edit.distance)
+                                .speed(0.05)
+                                .suffix(" mm"),
+                        )
+                    })
+                    .inner
+                },
+            )
             .inner;
         ui.weak(if edit.extrude {"+ adds material; − subtracts it. Passing the far wall opens a through-cut; no body emerges."} else if edit.face == components::OffsetTarget::CylinderWall {"+ grows radius · − shrinks radius. Axis and cap positions stay fixed."} else {"From the selected position: + outward, − inward. Edits the source shape; the opposite face stays fixed."});
         if edit.distance != before {
-            let changed = if edit.extrude {
+            let changed = if let components::OffsetTarget::EvaluatedPlane(face) = edit.face {
+                components::sweep_face(&edit.source, &edit.geometry, face, edit.distance)
+            } else if edit.extrude {
                 let mut body = edit.source.clone();
                 if let components::OffsetTarget::Plane(face) = edit.face
                     && edit.distance != 0.
@@ -714,6 +843,16 @@ impl OpenSketcher {
         };
         let plane = if let Some(plane) = self.construction.filter(|_| self.anchor.is_some()) {
             plane
+        } else if selected.is_none()
+            && let Some(id) = self.drawing.plane
+        {
+            snapping::Plane::reference(
+                self.model
+                    .bodies
+                    .iter()
+                    .find(|b| b.id == id)
+                    .ok_or("Active construction plane no longer exists.")?,
+            )?
         } else {
             snapping::acquire_plane(
                 &self.viewport.scene,
@@ -744,6 +883,9 @@ impl OpenSketcher {
         let selected = (self.selection_mode == SelectionMode::Face)
             .then_some(self.selected.zip(self.selected_element))
             .flatten();
+        if self.drawing.plane.is_some() && selected.is_none() {
+            return None;
+        }
         let hit = selection::surface_hit(&self.viewport.scene, &self.camera, pointer, rect)
             .map(|(_, id, face)| (id, face));
         let (owner, face) = selected.or(hit).or_else(|| {
@@ -811,11 +953,27 @@ fn scalar(
     v: &mut f64,
     range: std::ops::RangeInclusive<f64>,
 ) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let response = ui.add(egui::DragValue::new(v).speed(0.05).range(range));
-        response.drag_stopped() || response.lost_focus()
-    })
+    let response = scalar_response(ui, label, v, range);
+    response.drag_stopped() || response.lost_focus()
+}
+fn scalar_response(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+) -> egui::Response {
+    // A sheet becoming solid changes preceding controls during the same drag.
+    // Global scope also keeps egui's child auto IDs independent of that order.
+    ui.scope_builder(
+        egui::UiBuilder::new().id(ui.make_persistent_id(("scalar", label))),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.add(egui::DragValue::new(v).speed(0.05).range(range))
+            })
+            .inner
+        },
+    )
     .inner
 }
 fn vector(
@@ -997,7 +1155,7 @@ impl eframe::App for OpenSketcher {
                 Tool::Move=>"Move · Select geometry, then drag an axis arrow or plane handle · Snap: 0.5 units · Escape cancels · Alt-click sets pivot",
                 Tool::Rotate=>"Rotate · Select geometry, then drag an axis ring · Snap: 15° · Alt-click sets pivot (needed for a single point) · Escape cancels",
                 Tool::Orbit=>"Drag to orbit · Shift-drag / right / middle to pan · Scroll to zoom",
-                Tool::Create(_)=>"Draw on a selected or visible planar face, otherwise XY · Snap: visible geometry + grid · Escape cancels",
+                Tool::Create(_)=>"Draw on a selected face or active construction plane; otherwise visible plane / XY · Snap: geometry + grid · Escape cancels",
             });
         });
         let canvas = ui.available_rect_before_wrap();
@@ -1042,6 +1200,16 @@ impl eframe::App for OpenSketcher {
                                 self.pivot = None;
                                 self.refresh();
                             }
+                        }
+                        if ui.button("Add construction plane").clicked() {
+                            self.anchor=None;self.construction=None;self.construction_support=None;
+                            self.tool=Tool::Select;
+                            let mut plane=Body::new(Shape::Rectangle);plane.construction=true;plane.width=10.;plane.depth=10.;
+                            self.commit(plane);
+                        }
+                        if let Some(id)=self.drawing.plane {
+                            ui.weak(format!("Drawing on plane {id}"));
+                            if ui.button("Auto drawing plane").clicked(){self.drawing.plane=None;self.anchor=None;self.construction=None;self.construction_support=None;}
                         }
                         ui.checkbox(&mut self.snap, "Snap")
                             .on_hover_text("Creation: geometry limits plus grid/anchor alignment. Configure both in Preferences. Move: 0.5-unit offsets. Rotate: 15° offsets.");
@@ -1126,13 +1294,17 @@ impl eframe::App for OpenSketcher {
                     ui.horizontal(|ui| {
                         for kind in [booleans::Kind::Union,booleans::Kind::Subtract,booleans::Kind::Intersect] {
                             if ui.add_enabled(!self.evaluator.pending(),egui::Button::new(kind.label())).clicked() {
-                                let mut body=Body::new(Shape::Rectangle);
-                                body.boolean=Some(booleans::Boolean::new(kind,&self.selection,self.selection_mode,&self.committed_scene));
-                                self.request_change(evaluation::Change::Edit(Box::new(body),false));
+                                self.apply_boolean(kind,self.selection.clone());
                             }
                         }
                     });
-                    ui.weak("First selected is the target. Face operations require coplanar faces; the result is a separate sheet.");
+                    if self.selection_mode==SelectionMode::Face && ui.add_enabled(!self.evaluator.pending(),egui::Button::new("Replace face")).clicked() {
+                        self.apply_boolean(booleans::Kind::ReplaceFace,self.selection.clone());
+                    }
+                    if self.selection_mode==SelectionMode::Face && ui.add_enabled(!self.evaluator.pending(),egui::Button::new("Imprint")).clicked() {
+                        self.apply_boolean(booleans::Kind::Imprint,self.selection.clone());
+                    }
+                    ui.weak("First face is the source; second is the reference. Replace face extends/trims the source solid to the reference plane and keeps the reference body. Imprint splits the selected solid face with a coplanar profile. Face set operations create a sheet.");
                 }
                 if self.selection.len()>1 && self.selection_mode==SelectionMode::Volume && ui.button("Delete selected volumes").clicked() {self.delete_selected();}
                 if self.has_uncommitted_input() {
@@ -1145,33 +1317,88 @@ impl eframe::App for OpenSketcher {
                         ui.label(format!("{} {} · Object {}",self.selection_mode.label(),element+1,id));
                     }else{ui.label(format!("Pick a {} in the viewport.",self.selection_mode.label().to_lowercase()));}
                     ui.weak("Choose Move or Rotate and drag the gizmo to edit this component. Adjacent boundaries rebuild together.");
+                    if self.selection_mode==SelectionMode::Face {ui.weak("Convex planar solids use exact plane retrimming. Curved/concave bodies use component deformation.");}
                     self.offset_face_properties(ui);
                     if matches!(self.selection_mode,SelectionMode::Face|SelectionMode::Edge) && !self.selection.is_empty() {
                         ui.horizontal(|ui| {
                             if ui.button("Chamfer").clicked() { self.apply_edge_treatment(edge_treatments::Kind::Chamfer); }
                             if ui.button("Bevel").clicked() { self.apply_edge_treatment(edge_treatments::Kind::Bevel); }
+                            if self.selection_mode==SelectionMode::Face && self.selection.len()==1 && ui.button("Shell").clicked() {self.apply_shell();}
                         });
                         ui.weak("Shift-select faces or edges. Box edges are treated individually; circular rims use their full perimeter. One action creates one undo step.");
                     }
+                    if self.selection_mode==SelectionMode::Face && self.selection.len()==1 {
+                        if self.committed_scene.iter().any(|(id,g)|Some(*id)==self.selected && g.is_solid) {
+                            let curves=self.model.bodies.iter().filter(|b|!b.construction && Some(b.id)!=self.selected && self.committed_scene.iter().any(|(id,g)|*id==b.id && g.triangles.is_empty() && g.edge_count==1 && !g.edges.is_empty())).map(|b|(b.id,b.label())).collect::<Vec<_>>();
+                            if !curves.is_empty() {ui.menu_button("Imprint using curve",|ui| {
+                                for (id,label) in curves {
+                                    if ui.add_enabled(!self.evaluator.pending(),egui::Button::new(label)).clicked() {
+                                        self.apply_boolean(booleans::Kind::ImprintCurve,vec![self.selection[0],(id,None)]);ui.close();
+                                    }
+                                }
+                            });}
+                            let profiles=self.model.bodies.iter().filter(|b|!b.construction && Some(b.id)!=self.selected && self.committed_scene.iter().any(|(id,g)|*id==b.id && !g.is_solid && !g.triangles.is_empty() && g.shell.is_some())).map(|b|(b.id,b.label())).collect::<Vec<_>>();
+                            if !profiles.is_empty() {ui.menu_button("Imprint using profile",|ui| {
+                                for (id,label) in profiles {
+                                    if ui.add_enabled(!self.evaluator.pending(),egui::Button::new(label)).clicked() {
+                                        self.apply_boolean(booleans::Kind::Imprint,vec![self.selection[0],(id,None)]);ui.close();
+                                    }
+                                }
+                            });}
+                        }
+                        let planes=self.model.bodies.iter().filter(|b|b.construction).map(|b|(b.id,b.label())).collect::<Vec<_>>();
+                        if !planes.is_empty() {ui.menu_button("Replace using plane",|ui| {
+                            for (id,label) in planes {
+                                if ui.add_enabled(!self.evaluator.pending(),egui::Button::new(label)).clicked() {
+                                    self.apply_boolean(booleans::Kind::ReplaceFace,vec![self.selection[0],(id,Some(0))]);
+                                    ui.close();
+                                }
+                            }
+                        });}
+                    }
+                    if self.selection_mode==SelectionMode::Face && !self.selection.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in [face_operations::FaceEdit::Open,face_operations::FaceEdit::Cap,face_operations::FaceEdit::Heal] {
+                                if ui.button(kind.label()).clicked() {self.apply_face_operation(kind);}
+                            }
+                        });
+                        ui.weak("Open leaves a sheet. Cap closes planar openings. Heal extends supported neighboring planes.");
+                    }
                     if self.selection_mode==SelectionMode::Point { ui.weak("Rotation around a point itself has no effect. Alt-click to place an offset pivot."); }
                     if self.selection_mode==SelectionMode::Point {ui.weak("Points are topology vertices; deformation control nodes are separate future editing tools.");}
+                }
+                if self.selection_mode==SelectionMode::Volume && self.selection.len()==1
+                    && self.committed_scene.iter().any(|(id,g)|Some(*id)==self.selected && !g.is_solid && !g.triangles.is_empty() && g.shell.is_some())
+                    && ui.button("Cap openings").clicked() {
+                    self.apply_face_operation(face_operations::FaceEdit::CapOpenings);
                 }
                 if self.draft.as_ref().is_some_and(|b| b.boolean.is_some()) {
                     let mut body=self.draft.take().unwrap();
                     let before=body.clone();
                     let operation=body.boolean.as_mut().unwrap();
-                    ui.heading("Boolean result");
+                    let replacing=operation.kind==booleans::Kind::ReplaceFace;
+                    let imprinting=matches!(operation.kind,booleans::Kind::Imprint|booleans::Kind::ImprintCurve);
+                    ui.heading(if replacing {"Replace face result"}else if imprinting {"Imprint result"}else{"Boolean result"});
                     ui.label(format!("{} · {}",operation.kind.label(),operation.references()));
-                    ui.checkbox(&mut operation.keep_tools,"Keep tools");
+                    if !replacing {ui.checkbox(&mut operation.keep_tools,"Keep tools");}
                     if ui.button("Swap operands").clicked() {operation.operands.swap(0,1);operation.topology.swap(0,1);}
                     if body!=before {self.request_change(evaluation::Change::Edit(Box::new(body.clone()),false));}
-                    if ui.button("Remove Boolean / restore inputs").clicked() {self.request_change(evaluation::Change::Delete(vec![body.id]));}
+                    if ui.button(if replacing {"Remove replacement / restore source"}else if imprinting {"Remove imprint / restore inputs"}else{"Remove Boolean / restore inputs"}).clicked() {self.request_change(evaluation::Change::Delete(vec![body.id]));}
                     self.draft=Some(body);
                 } else if let Some(mut draft)=self.draft.take() {
-                    ui.separator();ui.heading(format!("{} {}",draft.shape.label(),draft.id));
+                    ui.separator();ui.heading(draft.label());
                     let before=draft.clone();
                     let mut detach=false;
                     let mut finished = false;
+                    if draft.construction {
+                        ui.weak("Reference only · excluded from exports and Boolean tools. Use Volume Move/Rotate or edit placement below.");
+                        if ui.button("Draw on this plane").clicked(){self.drawing.plane=Some(draft.id);self.anchor=None;self.construction=None;self.construction_support=None;}
+                        ui.horizontal(|ui| {
+                            for (label,rotation) in [("XY",[0.,0.,0.]),("XZ",[90.,0.,0.]),("YZ",[0.,90.,0.])] {
+                                if ui.button(label).clicked(){draft.rotation=rotation;finished=true;}
+                            }
+                        });
+                    }
                     if let Some(bore)=&mut draft.bore {
                         ui.label(format!("Attached to body {} · {}",bore.target,bore.face.label()));
                         egui::ComboBox::from_id_salt("sweep_operation").selected_text(bore.mode.label()).show_ui(ui,|ui| {
@@ -1187,7 +1414,7 @@ impl eframe::App for OpenSketcher {
                                 (matches!(bore.extent,Extent::UpToNext{..}),Extent::UpToNext{target:bore.target}),
                                 (matches!(bore.extent,Extent::UpToFace{..}),Extent::UpToFace{target:bore.target,face:bore.face.opposite()})
                             ] {
-                                if ui.selectable_label(active,value.label()).clicked() && !active {bore.extent=value;finished=true;}
+                                if ui.selectable_label(active,value.label()).clicked() && !active {bore.extent=value;if value!=Extent::ThroughAll {bore.through_targets.clear();}finished=true;}
                             }
                         });
                         if bore.extent==Extent::Distance {finished|=scalar(ui,"Travel · mm",&mut bore.travel,-10000.0..=10000.0);}
@@ -1210,9 +1437,22 @@ impl eframe::App for OpenSketcher {
                                     }
                                 });
                             }
-                            ui.weak(if bore.extent==Extent::ThroughAll {"Through the attached target only; unrelated bodies stay unchanged."}else{"Parallel planar termination; target changes regenerate this sweep."});
+                            if bore.extent==Extent::ThroughAll {
+                                ui.label(format!("Through-all scope · attached body {}",bore.target));
+                                for body in self.model.bodies.iter().filter(|b|b.id<draft.id&&b.id!=bore.target&&!b.construction&&b.boolean.is_none()) {
+                                    if self.committed_scene.iter().any(|(id,g)|*id==body.id&&g.is_solid&&g.shell.is_some()&&!g.triangles.is_empty()) {
+                                        let mut included=bore.through_targets.contains(&body.id);
+                                        if ui.checkbox(&mut included,body.label()).changed() {
+                                            if included {bore.through_targets.push(body.id);bore.through_targets.sort_unstable();}
+                                            else {bore.through_targets.retain(|id|*id!=body.id);}
+                                            finished=true;
+                                        }
+                                    }
+                                }
+                                ui.weak("Borer modes cut only the attached and checked bodies. Through all stops at the scope end; use Distance for an emerging extension.");
+                            }else{ui.weak("Planar end-face termination; target changes regenerate this sweep.");}
                         }
-                        ui.weak("+ outward · − inward. Generator + borer creates a separate body beyond the target exit.");
+                        ui.weak(if bore.extent==Extent::ThroughAll {"Through all follows the current scope. New body generates without cutting."}else{"+ outward · − inward. Generator + borer creates a separate body beyond the target exit."});
                         detach=ui.button("Detach / remove operation").clicked();
                     }
                     if detach {
@@ -1282,12 +1522,55 @@ impl eframe::App for OpenSketcher {
                         if let Some(index) = remove { self.finish_model_edit(); draft.edge_treatments.remove(index); }
                         ui.weak("Applied geometry stays editable. Source parameters are retained as modeling history.");
                     }
-                    finished |= dimensions(ui,&mut draft);
-                    if draft.shape!=Shape::Line && draft.bore.is_none() {finished|=ui.checkbox(&mut draft.cuts_profiles,"Cut older coplanar profiles").changed();}
+                    if let Some(operation)=&mut draft.taper {
+                        ui.separator();ui.label("Draft · source side walls");
+                        finished|=scalar(ui,"Angle · degrees",&mut operation.degrees,-80.0..=80.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Neutral cap");
+                            finished|=ui.selectable_value(&mut operation.neutral,edge_treatments::FaceTarget::Bottom,"Bottom").changed();
+                            finished|=ui.selectable_value(&mut operation.neutral,edge_treatments::FaceTarget::Top,"Top").changed();
+                        });
+                        ui.weak("The neutral cap stays fixed. Positive angles expand away from it; negative angles taper inward. Applied before object scaling.");
+                        if ui.button("Remove draft").clicked(){self.finish_model_edit();draft.taper=None;finished=true;}
+                    }else if draft.extrusion>0. && draft.shape!=Shape::Line && draft.bore.is_none() {
+                        let supported=matches!(draft.shape,Shape::Rectangle|Shape::Circle|Shape::Semicircle) && draft.hollow.is_none() && draft.edge_treatments.is_empty() && draft.component_edits.is_empty();
+                        if ui.add_enabled(supported,egui::Button::new("Draft walls")).on_disabled_hover_text("Source prisms are supported. Drafting treated, shelled or deformed geometry requires general trimming.").clicked(){self.finish_model_edit();draft.taper=Some(drafting::Draft{degrees:3.,neutral:edge_treatments::FaceTarget::Bottom});finished=true;}
+                    }
+                    if let Some(operation)=&mut draft.hollow {
+                        ui.separator();ui.label("Shell · source-local units");
+                        ui.horizontal(|ui| {
+                            finished|=ui.selectable_value(&mut operation.outward,false,"Inward").changed();
+                            finished|=ui.selectable_value(&mut operation.outward,true,"Outward").changed();
+                        });
+                        finished|=scalar(ui,"Wall thickness",&mut operation.thickness,0.00001..=100.);
+                        finished|=ui.checkbox(&mut operation.closed,"Closed cavity · keep all outer faces").changed();
+                        ui.add_enabled_ui(!operation.closed,|ui| {
+                        egui::ComboBox::from_id_salt("shell_opening").selected_text(format!("Opening · {}",operation.opening.label())).show_ui(ui,|ui| {
+                            for face in [edge_treatments::FaceTarget::Top,edge_treatments::FaceTarget::Bottom,edge_treatments::FaceTarget::Left,edge_treatments::FaceTarget::Right,edge_treatments::FaceTarget::Front,edge_treatments::FaceTarget::Back] {
+                                if face.supported(&before) {finished|=ui.selectable_value(&mut operation.opening,face,face.label()).changed();}
+                            }
+                        });
+                        });
+                        ui.weak(if operation.closed {"Uniform thickness is applied before object scaling. All outer faces remain. Inward preserves the exterior; outward preserves the cavity at the source dimensions."}else{"Uniform thickness is applied before object scaling. The opening plane stays fixed. Inward preserves the exterior; outward preserves the cavity at the source dimensions."});
+                        if ui.button("Remove shell").clicked(){self.finish_model_edit();draft.hollow=None;finished=true;}
+                    }else if draft.extrusion>0. && draft.shape!=Shape::Line && draft.bore.is_none() {
+                        let supported=draft.taper.is_none() && draft.edge_treatments.is_empty() && draft.component_edits.is_empty();
+                        if ui.add_enabled(supported,egui::Button::new("Shell · open top")).on_disabled_hover_text("Shell requires a source prism; treated, drafted or deformed solids need general offset/retrim.").clicked(){
+                            match shelling::Hollow::new(&draft,edge_treatments::FaceTarget::Top) {
+                                Ok(operation)=>{self.finish_model_edit();draft.hollow=Some(operation);finished=true;}
+                                Err(error)=>self.error=Some(error),
+                            }
+                        }
+                    }
+                    if draft.construction {
+                        finished|=scalar(ui,"Reference width",&mut draft.width,0.01..=100.);
+                        finished|=scalar(ui,"Reference depth",&mut draft.depth,0.01..=100.);
+                    }else{finished |= dimensions(ui,&mut draft);}
+                    if !draft.construction && draft.shape!=Shape::Line && draft.bore.is_none() {finished|=ui.checkbox(&mut draft.cuts_profiles,"Cut older coplanar profiles").changed();}
                     ui.add_space(8.);finished |= vector(ui,if draft.bore.is_some() {"Position · attached reference placement"}else{"Position · world units"},&mut draft.position,-1000.0..=1000.0);
                     finished |= vector(ui,if draft.bore.is_some() {"Rotation · reference placement · degrees"}else{"Rotation · degrees · local X, Y, Z order"},&mut draft.rotation,-36000.0..=36000.0);
                     finished |= vector(ui,"Scale · local axes",&mut draft.scale,0.01..=100.0);
-                    ui.weak("Changes update automatically. Rotation and scale pivot at the profile center; extrusion follows local +Z.");
+                    ui.weak(if draft.construction {"Placement and reference size update automatically. Drawings retain their captured placement."}else{"Changes update automatically. Rotation and scale pivot at the profile center; extrusion follows local +Z."});
                     let delete=ui.button("Delete selected").clicked();
                     if draft != before {
                         self.request_change(evaluation::Change::Edit(Box::new(draft.clone()),true));
@@ -1573,6 +1856,68 @@ impl eframe::App for OpenSketcher {
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
+    #[test]
+    fn extrusion_drag_survives_inspector_controls_disappearing() {
+        let ctx = egui::Context::default();
+        let mut value = 0.;
+        let mut time = 0.;
+        let mut frame = |events, flat| {
+            time += 0.02;
+            let mut response = None;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600., 400.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show_inside(root, |ui| {
+                        // The actual inspector offers this only while the profile is a sheet.
+                        if flat {
+                            let _ = ui.button("Cap openings");
+                        }
+                        response = Some(scalar_response(ui, "Extrusion", &mut value, 0.0..=100.));
+                    });
+                },
+            );
+            (response.unwrap(), value)
+        };
+        let (initial, _) = frame(vec![], true);
+        let start = initial.rect.center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        let moved = start + egui::vec2(30., 0.);
+        let (drag, first) = frame(vec![egui::Event::PointerMoved(moved)], true);
+        assert!(drag.dragged());
+        let (continued, second) = frame(
+            vec![egui::Event::PointerMoved(moved + egui::vec2(30., 0.))],
+            false,
+        );
+        assert_eq!(initial.id, continued.id);
+        assert!(
+            continued.dragged(),
+            "Geometry updates must not release the numeric drag"
+        );
+        assert!(
+            second > first,
+            "The held gesture must keep adjusting extrusion"
+        );
+        let (released, _) = frame(vec![button(moved + egui::vec2(30., 0.), false)], false);
+        assert!(released.drag_stopped());
+    }
+
     #[test]
     fn redo_chord_is_not_consumed_as_undo() {
         for (modifiers, redo) in [

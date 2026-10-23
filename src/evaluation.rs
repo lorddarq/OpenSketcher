@@ -278,6 +278,10 @@ mod tests {
         plain
             .component_edits
             .push(crate::components::ComponentEdit {
+                retrim: false,
+                sweep: None,
+                tangent_walls: false,
+                face_edit: None,
                 evaluated: false,
                 mode: crate::selection::SelectionMode::Face,
                 element: 0,

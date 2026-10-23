@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 13,
-            modeling_version: 13,
+            schema_version: 26,
+            modeling_version: 26,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,121 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=13) || !matches!(self.modeling_version, 1..=13) {
+        if !matches!(self.schema_version, 1..=26) || !matches!(self.modeling_version, 1..=26) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–13 and modeling versions 1–13."
+                "Unsupported .osk version. This application supports schema versions 1–26 and modeling versions 1–26."
                     .into(),
             );
+        }
+        if (self.schema_version < 26 || self.modeling_version < 26)
+            && self.bodies.iter().any(|b| {
+                b.boolean
+                    .as_ref()
+                    .is_some_and(|op| op.kind == crate::booleans::Kind::ImprintCurve)
+            })
+        {
+            return Err("Imprint curve requires .osk version 26.".into());
+        }
+        if (self.schema_version < 25 || self.modeling_version < 25)
+            && self.bodies.iter().any(|b| {
+                b.boolean.as_ref().is_some_and(|op| {
+                    op.kind == crate::booleans::Kind::Imprint && op.operands[1].1.is_none()
+                })
+            })
+        {
+            return Err("Whole-profile Imprint requires .osk version 25.".into());
+        }
+        if (self.schema_version < 24 || self.modeling_version < 24)
+            && self.bodies.iter().any(|b| {
+                b.boolean
+                    .as_ref()
+                    .is_some_and(|op| op.kind == crate::booleans::Kind::Imprint)
+                    || b.component_edits.iter().any(|e| e.tangent_walls)
+            })
+        {
+            return Err(
+                "Imprint and tangent-aware evaluated sweeps require .osk version 24.".into(),
+            );
+        }
+        if (self.schema_version < 23 || self.modeling_version < 23)
+            && self.bodies.iter().any(|b| {
+                b.boolean
+                    .as_ref()
+                    .is_some_and(|op| op.kind == crate::booleans::Kind::ReplaceFace)
+            })
+        {
+            return Err("Replace Face requires .osk version 23.".into());
+        }
+        if (self.schema_version < 22 || self.modeling_version < 22)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.face_edit.is_some()))
+        {
+            return Err("Evaluated face deletion and capping require .osk version 22.".into());
+        }
+        if (self.schema_version < 21 || self.modeling_version < 21)
+            && self.bodies.iter().any(|b| {
+                b.bore
+                    .as_ref()
+                    .is_some_and(|op| !op.through_targets.is_empty())
+            })
+        {
+            return Err("Multiple-body Through all requires .osk version 21.".into());
+        }
+        if (self.schema_version < 20 || self.modeling_version < 20)
+            && (self.drawing.plane.is_some() || self.bodies.iter().any(|b| b.construction))
+        {
+            return Err("Construction planes require .osk version 20.".into());
+        }
+        if self
+            .drawing
+            .plane
+            .is_some_and(|id| !self.bodies.iter().any(|b| b.id == id && b.construction))
+        {
+            return Err("The active construction plane does not exist.".into());
+        }
+        if (self.schema_version < 19 || self.modeling_version < 19)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.sweep.is_some()))
+        {
+            return Err("Evaluated planar face sweeps require .osk version 19.".into());
+        }
+        if (self.schema_version < 18 || self.modeling_version < 18)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.retrim))
+        {
+            return Err("Exact planar face retrim requires .osk version 18.".into());
+        }
+        if (self.schema_version < 17 || self.modeling_version < 17)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.hollow.as_ref().is_some_and(|op| op.closed))
+        {
+            return Err("Closed shells require .osk version 17.".into());
+        }
+        if (self.schema_version < 16 || self.modeling_version < 16)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.hollow.as_ref().is_some_and(|op| op.outward))
+        {
+            return Err("Outward shells require .osk version 16.".into());
+        }
+        if (self.schema_version < 15 || self.modeling_version < 15)
+            && self.bodies.iter().any(|b| b.taper.is_some())
+        {
+            return Err("Draft operations require .osk version 15.".into());
+        }
+        if (self.schema_version < 14 || self.modeling_version < 14)
+            && self.bodies.iter().any(|b| b.hollow.is_some())
+        {
+            return Err("Shell operations require .osk version 14.".into());
         }
         if (self.schema_version < 13 || self.modeling_version < 13)
             && self
@@ -224,8 +334,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 13;
-        project.modeling_version = 13;
+        project.schema_version = 26;
+        project.modeling_version = 26;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

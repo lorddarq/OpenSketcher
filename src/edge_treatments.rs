@@ -48,6 +48,16 @@ impl FaceTarget {
             Self::Back => (Vector3::unit_y(), b.depth / 2.),
         }
     }
+    /// Actual outer support after source shelling; the authored planes stay intact.
+    pub(crate) fn evaluated_plane(self, b: &Body) -> (Vector3, f64) {
+        let (normal, distance) = self.plane(b);
+        let offset = b
+            .hollow
+            .as_ref()
+            .filter(|op| op.outward && (op.closed || op.opening != self))
+            .map_or(0., |op| op.thickness);
+        (normal, distance + offset)
+    }
     pub(crate) fn supported(self, b: &Body) -> bool {
         b.shape == Shape::Rectangle || matches!(self, Self::Top | Self::Bottom)
     }
@@ -245,7 +255,7 @@ pub fn target(b: &Body, g: &Geometry, face: usize) -> Result<FaceTarget, String>
             FaceTarget::Front,
             FaceTarget::Back,
         ] {
-            let (n, d) = role.plane(b);
+            let (n, d) = role.evaluated_plane(b);
             if role.supported(b) && points.iter().all(|p| (p.to_vec().dot(n) - d).abs() < 1e-6) {
                 return Ok(role);
             }
@@ -404,6 +414,31 @@ struct Face {
     points: Vec<Point3>,
     group: usize,
 }
+pub(crate) fn clip_polygon(input: &[Point3], n: Vector3, d: f64) -> (Vec<Point3>, Vec<Point3>) {
+    let mut points = Vec::new();
+    let mut cut = Vec::new();
+    for i in 0..input.len() {
+        let a = input[i];
+        let b = input[(i + 1) % input.len()];
+        let da = a.to_vec().dot(n) - d;
+        let db = b.to_vec().dot(n) - d;
+        if da <= 1e-9 {
+            points.push(a);
+        }
+        if (da > 1e-9 && db < -1e-9) || (db > 1e-9 && da < -1e-9) {
+            let p = a + (b - a) * (da / (da - db));
+            points.push(p);
+            cut.push(p);
+        } else if da.abs() <= 1e-9 {
+            cut.push(a);
+        }
+    }
+    points.dedup_by(|a, b| (*a - *b).magnitude2() < 1e-18);
+    if points.len() > 1 && (points[0] - points[points.len() - 1]).magnitude2() < 1e-18 {
+        points.pop();
+    }
+    (points, cut)
+}
 fn clip(faces: &mut Vec<Face>, n: Vector3, d: f64, group: usize) -> Result<(), String> {
     if !faces
         .iter()
@@ -415,27 +450,8 @@ fn clip(faces: &mut Vec<Face>, n: Vector3, d: f64, group: usize) -> Result<(), S
     let mut cut = Vec::new();
     let mut next = Vec::new();
     for f in faces.iter() {
-        let mut points = Vec::new();
-        for i in 0..f.points.len() {
-            let a = f.points[i];
-            let b = f.points[(i + 1) % f.points.len()];
-            let da = a.to_vec().dot(n) - d;
-            let db = b.to_vec().dot(n) - d;
-            if da <= 1e-9 {
-                points.push(a);
-            }
-            if (da > 1e-9 && db < -1e-9) || (db > 1e-9 && da < -1e-9) {
-                let p = a + (b - a) * (da / (da - db));
-                points.push(p);
-                cut.push(p);
-            } else if da.abs() <= 1e-9 {
-                cut.push(a);
-            }
-        }
-        points.dedup_by(|a, b| (*a - *b).magnitude2() < 1e-18);
-        if points.len() > 1 && (points[0] - points[points.len() - 1]).magnitude2() < 1e-18 {
-            points.pop();
-        }
+        let (points, intersections) = clip_polygon(&f.points, n, d);
+        cut.extend(intersections);
         if points.len() >= 3 {
             next.push(Face {
                 points,
@@ -483,6 +499,375 @@ fn clip(faces: &mut Vec<Face>, n: Vector3, d: f64, group: usize) -> Result<(), S
     }
     *faces = next;
     Ok(())
+}
+
+fn linear_polygons(
+    shell: &truck_modeling::Shell,
+    roles: &[usize],
+    split_holes: bool,
+) -> Option<Vec<Face>> {
+    let mut polygons = Vec::new();
+    for (index, face) in shell.iter().enumerate() {
+        let wires = face.boundaries();
+        if (!split_holes && wires.len() != 1)
+            || wires.is_empty()
+            || face
+                .edge_iter()
+                .any(|edge| !matches!(edge.curve(), truck_modeling::Curve::Line(_)))
+        {
+            return None;
+        }
+        if wires.len() > 1 {
+            if !matches!(face.oriented_surface(), truck_modeling::Surface::Plane(_)) {
+                return None;
+            }
+            let geometry =
+                crate::model::tessellate(&std::iter::once(face.clone()).collect()).ok()?;
+            polygons.extend(geometry.triangles.into_iter().map(|triangle| Face {
+                points: triangle.to_vec(),
+                group: roles[index],
+            }));
+            continue;
+        }
+        let mut points = Vec::new();
+        for edge in &wires[0] {
+            let a = edge.front().point();
+            let b = edge.back().point();
+            let ab = b - a;
+            if ab.magnitude2() < 1e-16 || !matches!(edge.curve(), truck_modeling::Curve::Line(_)) {
+                return None;
+            }
+            points.push(a);
+        }
+        polygons.push(Face {
+            points,
+            group: roles[index],
+        });
+    }
+    Some(polygons)
+}
+
+/// Exact convex planar intersection, including coincident supports and unequal depths.
+pub(crate) fn intersect_convex(a: &Geometry, b: &Geometry) -> Result<Option<Geometry>, String> {
+    let (Ok(ap), Ok(bp)) = (
+        crate::components::planar_supports(a),
+        crate::components::planar_supports(b),
+    ) else {
+        return Ok(None);
+    };
+    let inside = |g: &Geometry, planes: &[(Vector3, f64)]| {
+        planes
+            .iter()
+            .all(|(n, d)| g.points.iter().all(|p| n.dot(p.to_vec()) <= *d + 1e-9))
+    };
+    if inside(a, &bp) {
+        return Ok(Some(a.clone()));
+    }
+    if inside(b, &ap) {
+        return Ok(Some(b.clone()));
+    }
+    let Some(mut faces) = linear_polygons(
+        a.shell
+            .as_ref()
+            .ok_or("Intersection requires an exact boundary.")?,
+        a.surface_mapping()?,
+        false,
+    ) else {
+        return Ok(None);
+    };
+    for (index, (n, d)) in bp.into_iter().enumerate() {
+        clip(&mut faces, n, d, a.face_count + index)?;
+    }
+    let Some(origin) = faces.first().and_then(|f| f.points.first()).copied() else {
+        return Ok(Some(Geometry::default()));
+    };
+    let volume = faces
+        .iter()
+        .map(|f| {
+            (1..f.points.len().saturating_sub(1))
+                .map(|i| {
+                    (f.points[0] - origin)
+                        .dot((f.points[i] - origin).cross(f.points[i + 1] - origin))
+                        / 6.
+                })
+                .sum::<f64>()
+        })
+        .sum::<f64>();
+    if volume.abs() < 1e-10 {
+        return Ok(Some(Geometry::default()));
+    }
+    let mut result = geometry(faces)?;
+    result.shell = Some(crate::components::boundary_shell(&result, true)?);
+    result.is_solid = true;
+    Ok(Some(result))
+}
+
+/// Exact linear-face subtraction. Unsupported curved/nonconvex inputs return
+/// None so callers retain the kernel path; no mesh Boolean is substituted.
+pub(crate) fn subtract_convex(
+    g: &Geometry,
+    tool: &truck_modeling::Shell,
+    roles: &[usize],
+) -> Result<Option<Geometry>, String> {
+    fn plane(face: &Face) -> Option<(Vector3, f64)> {
+        let a = *face.points.first()?;
+        let normal = face
+            .points
+            .windows(2)
+            .map(|p| (p[0] - a).cross(p[1] - a))
+            .sum::<Vector3>();
+        if normal.magnitude2() < 1e-20 {
+            return None;
+        }
+        let normal = normal.normalize();
+        let d = normal.dot(a.to_vec());
+        face.points
+            .iter()
+            .all(|p| (normal.dot(p.to_vec()) - d).abs() < 1e-6)
+            .then_some((normal, d))
+    }
+    fn convex(faces: &[Face], planes: &[(Vector3, f64)]) -> bool {
+        planes.iter().all(|(n, d)| {
+            faces
+                .iter()
+                .flat_map(|f| &f.points)
+                .all(|p| n.dot(p.to_vec()) <= *d + 1e-7)
+        })
+    }
+    let shell = g.shell.as_ref().ok_or("Missing exact solid boundary.")?;
+    let Some(body) = linear_polygons(shell, roles, false) else {
+        return Ok(None);
+    };
+    let tool_roles = (g.face_count..g.face_count + tool.len()).collect::<Vec<_>>();
+    let Some(cutter) = linear_polygons(tool, &tool_roles, false) else {
+        return Ok(None);
+    };
+    let Some(body_planes) = body.iter().map(plane).collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    let Some(tool_planes) = cutter.iter().map(plane).collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    if body_planes.len() > 512
+        || tool_planes.len() > 256
+        || !convex(&body, &body_planes)
+        || !convex(&cutter, &tool_planes)
+    {
+        return Ok(None);
+    }
+    // Preserve the original boundary and references for disjoint/touching tools.
+    if (0..3).any(|axis| {
+        let bounds = |faces: &[Face]| {
+            faces
+                .iter()
+                .flat_map(|f| &f.points)
+                .map(|p| p[axis])
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                    (lo.min(v), hi.max(v))
+                })
+        };
+        let (alo, ahi) = bounds(&body);
+        let (blo, bhi) = bounds(&cutter);
+        ahi <= blo + 1e-9 || bhi <= alo + 1e-9
+    }) {
+        return Ok(Some(g.clone()));
+    }
+    let mut output = Vec::new();
+    for face in body {
+        let mut remainder = face.points;
+        for (n, d) in &tool_planes {
+            let outside = clip_polygon(&remainder, -*n, -*d).0;
+            if outside.len() >= 3 && remainder.iter().any(|p| n.dot(p.to_vec()) > *d + 1e-9) {
+                let candidate = Face {
+                    points: outside,
+                    group: face.group,
+                };
+                if plane(&candidate).is_some() {
+                    output.push(candidate);
+                }
+            }
+            remainder = clip_polygon(&remainder, *n, *d).0;
+            if remainder.len() < 3 {
+                break;
+            }
+        }
+    }
+    for (face, (n, d)) in cutter.into_iter().zip(&tool_planes) {
+        // Coincident outer boundaries are removed material, not new zero-thickness walls.
+        if body_planes.iter().any(|(other, offset)| {
+            ((*other - *n).magnitude() < 1e-7 && (*offset - *d).abs() < 1e-7)
+                || ((*other + *n).magnitude() < 1e-7 && (*offset + *d).abs() < 1e-7)
+        }) {
+            continue;
+        }
+        let mut points = face.points;
+        for (n, d) in &body_planes {
+            points = clip_polygon(&points, *n, *d).0;
+            if points.len() < 3 {
+                break;
+            }
+        }
+        points.reverse();
+        let candidate = Face {
+            points,
+            group: face.group,
+        };
+        if plane(&candidate).is_some() {
+            output.push(candidate);
+        }
+    }
+    if output.is_empty() {
+        return Ok(Some(Geometry::default()));
+    }
+    if output.len() > 4096 {
+        return Err("Planar subtraction exceeds the face budget.".into());
+    }
+    join_linear_faces(output).map(Some)
+}
+
+/// Reconcile a planar face partition with every adjacent straight boundary.
+pub(crate) fn imprint_linear(
+    g: &Geometry,
+    face: usize,
+    remainder: &Geometry,
+    inner: &Geometry,
+) -> Result<Option<Geometry>, String> {
+    let Some(mut output) = linear_polygons(
+        g.shell
+            .as_ref()
+            .ok_or("Imprint requires a retained boundary.")?,
+        g.surface_mapping()?,
+        true,
+    ) else {
+        return Ok(None);
+    };
+    output.retain(|f| f.group != face);
+    for (part, role) in [(remainder, face), (inner, g.face_count)] {
+        let shell = part
+            .shell
+            .as_ref()
+            .ok_or("Imprint partition has no boundary.")?;
+        let Some(polygons) = linear_polygons(shell, &vec![role; shell.len()], true) else {
+            return Ok(None);
+        };
+        output.extend(polygons);
+    }
+    if output.len() > 4096 {
+        return Err("Imprint exceeds the face budget.".into());
+    }
+    join_linear_faces(output).map(Some)
+}
+
+fn join_linear_faces(output: Vec<Face>) -> Result<Geometry, String> {
+    // Reconcile cut T-junctions before constructing shared topological edges.
+    let mut points = Vec::new();
+    let mut point_map = HashMap::new();
+    let mut polygons = Vec::new();
+    for face in &output {
+        polygons.push(
+            face.points
+                .iter()
+                .map(|p| {
+                    *point_map
+                        .entry([p.x, p.y, p.z].map(|v| (v * 1e7).round() as i64))
+                        .or_insert_with(|| {
+                            let i = points.len();
+                            points.push(*p);
+                            i
+                        })
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    if points.len() > 8192 {
+        return Err("Planar subtraction exceeds the vertex budget.".into());
+    }
+    if polygons
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_mul(points.len())
+        > 4_000_000
+    {
+        return Err("Planar subtraction exceeds the edge reconciliation budget.".into());
+    }
+    let vertices = points
+        .iter()
+        .copied()
+        .map(truck_modeling::builder::vertex)
+        .collect::<Vec<_>>();
+    let mut edges = HashMap::new();
+    let mut joined = truck_modeling::Shell::default();
+    let mut groups = Vec::new();
+    for (polygon, face) in polygons.iter().zip(&output) {
+        let mut wire = truck_modeling::Wire::default();
+        for i in 0..polygon.len() {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % polygon.len()];
+            let ab = points[b] - points[a];
+            let length = ab.magnitude2();
+            if length < 1e-16 {
+                continue;
+            }
+            let mut split = points
+                .iter()
+                .enumerate()
+                .filter_map(|(index, p)| {
+                    let t = (*p - points[a]).dot(ab) / length;
+                    (t > 1e-8 && t < 1. - 1e-8 && (*p - points[a] - ab * t).magnitude() < 1e-7)
+                        .then_some((t, index))
+                })
+                .collect::<Vec<_>>();
+            split.push((0., a));
+            split.push((1., b));
+            split.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for pair in split.windows(2) {
+                let a = pair[0].1;
+                let b = pair[1].1;
+                let key = if a < b { (a, b) } else { (b, a) };
+                let edge = edges.entry(key).or_insert_with(|| {
+                    truck_modeling::builder::line(&vertices[key.0], &vertices[key.1])
+                });
+                wire.push_back(if a < b { edge.clone() } else { edge.inverse() });
+            }
+        }
+        joined.push(
+            truck_modeling::builder::try_attach_plane(&[wire])
+                .map_err(|e| format!("Cannot construct planar cut face: {e}"))?,
+        );
+        groups.push(face.group);
+    }
+    crate::components::solid_parts(&joined)?;
+    let mut result = crate::model::tessellate(&joined)?;
+    // A cut may disconnect regions that belonged to one original plane.
+    // Merge only neighboring fragments, keeping those regions independently selectable.
+    let mut parents = (0..joined.len()).collect::<Vec<_>>();
+    let root = |mut i: usize, parents: &[usize]| {
+        while parents[i] != i {
+            i = parents[i];
+        }
+        i
+    };
+    let mut owners = HashMap::new();
+    for (index, face) in joined.iter().enumerate() {
+        for edge in face.edge_iter() {
+            if let Some(&other) = owners.get(&edge.id()) {
+                if groups[index] == groups[other] {
+                    let a = root(index, &parents);
+                    let b = root(other, &parents);
+                    parents[b] = a;
+                }
+            } else {
+                owners.insert(edge.id(), index);
+            }
+        }
+    }
+    let connected = (0..joined.len())
+        .map(|i| root(i, &parents))
+        .collect::<Vec<_>>();
+    merge_surfaces(&mut result, &connected);
+    result.is_solid = true;
+    Ok(result)
 }
 
 pub fn evaluate(b: &Body, split: bool) -> Result<Geometry, String> {
@@ -747,9 +1132,10 @@ pub(crate) fn merge_surfaces(g: &mut Geometry, roles: &[usize]) {
     };
     let mut edge_map = HashMap::new();
     for (old, mut faces) in owners.into_iter().enumerate() {
+        let boundary = faces.len() == 1;
         faces.sort_unstable();
         faces.dedup();
-        if faces.len() < 2 {
+        if faces.len() < 2 && !boundary {
             continue;
         }
         let index = topology.edges.len();
@@ -776,6 +1162,77 @@ pub(crate) fn merge_surfaces(g: &mut Geometry, roles: &[usize]) {
     g.surface_roles = faces;
     g.face_count = groups.len();
     g.edge_count = edge_map.len();
+}
+
+/// Remove convex planar constraints and extend the surviving neighboring planes.
+pub(crate) fn heal_planar_faces(g: &Geometry, removed: &[usize]) -> Result<Geometry, String> {
+    let planes = crate::components::planar_supports(g)?
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !removed.contains(i))
+        .collect::<Vec<_>>();
+    if !(4..=64).contains(&planes.len()) {
+        return Err("Heal requires 4–64 remaining convex planar supports.".into());
+    }
+    let mut corners = Vec::<Point3>::new();
+    for i in 0..planes.len() {
+        for j in i + 1..planes.len() {
+            for k in j + 1..planes.len() {
+                let (a, da) = planes[i].1;
+                let (b, db) = planes[j].1;
+                let (c, dc) = planes[k].1;
+                let determinant = a.dot(b.cross(c));
+                if determinant.abs() < 1e-10 {
+                    continue;
+                }
+                let point = Point3::from_vec(
+                    (b.cross(c) * da + c.cross(a) * db + a.cross(b) * dc) / determinant,
+                );
+                if [point.x, point.y, point.z]
+                    .iter()
+                    .any(|p| !p.is_finite() || p.abs() > 1e6)
+                {
+                    continue;
+                }
+                if planes
+                    .iter()
+                    .all(|(_, (n, d))| n.dot(point.to_vec()) <= *d + 1e-7)
+                    && !corners.iter().any(|p| (*p - point).magnitude2() < 1e-14)
+                {
+                    corners.push(point);
+                }
+            }
+        }
+    }
+    let mut faces = Vec::new();
+    for (group, (n, d)) in planes {
+        let mut points = corners
+            .iter()
+            .copied()
+            .filter(|p| (n.dot(p.to_vec()) - d).abs() < 1e-7)
+            .collect::<Vec<_>>();
+        if points.len() < 3 {
+            continue;
+        }
+        let center = points.iter().map(|p| p.to_vec()).sum::<Vector3>() / points.len() as f64;
+        let u = (points[0].to_vec() - center).normalize();
+        let v = n.cross(u);
+        points.sort_by(|a, b| {
+            let a = a.to_vec() - center;
+            let b = b.to_vec() - center;
+            a.dot(v)
+                .atan2(a.dot(u))
+                .total_cmp(&b.dot(v).atan2(b.dot(u)))
+        });
+        faces.push(Face { points, group });
+    }
+    let mut result = geometry(faces)?;
+    result.shell = Some(
+        crate::components::boundary_shell(&result, true)
+            .map_err(|e| format!("The remaining planes cannot heal a closed solid: {e}"))?,
+    );
+    result.is_solid = true;
+    Ok(result)
 }
 
 fn geometry(faces: Vec<Face>) -> Result<Geometry, String> {
@@ -880,6 +1337,67 @@ mod tests {
             .iter()
             .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
             .sum()
+    }
+    #[test]
+    fn planar_intersection_handles_coincident_unequal_depth_and_affine_inputs() {
+        use truck_modeling::{Deg, Matrix4};
+        let mut a = Body::new(Shape::Rectangle);
+        a.width = 4.;
+        a.depth = 3.;
+        a.extrusion = 3.;
+        let mut b = Body::new(Shape::Rectangle);
+        b.width = 3.;
+        b.depth = 2.;
+        b.extrusion = 4.;
+        b.position = [1., 0.5, -1.];
+        let transform = Matrix4::from_angle_z(Deg(13.))
+            * Matrix4::from_angle_y(Deg(17.))
+            * Matrix4::from_nonuniform_scale(1.5, 0.75, 2.);
+        for affine in [false, true] {
+            let mut ga = evaluate(&a).unwrap();
+            let mut gb = evaluate(&b).unwrap();
+            if affine {
+                crate::components::map_geometry(&mut ga, transform);
+                crate::components::map_geometry(&mut gb, transform);
+            }
+            for (first, second) in [(&ga, &gb), (&gb, &ga)] {
+                let result = intersect_convex(first, second).unwrap().unwrap();
+                assert!((volume(&result) - 15. * if affine { 2.25 } else { 1. }).abs() < 1e-6);
+                assert!(result.is_solid);
+                crate::components::solid_parts(result.shell.as_ref().unwrap()).unwrap();
+                crate::components::planar_supports(&result).unwrap();
+            }
+            let identical = intersect_convex(&ga, &ga).unwrap().unwrap();
+            assert_eq!(identical.topology, ga.topology);
+            assert_eq!(identical.triangles, ga.triangles);
+        }
+        let ga = evaluate(&a).unwrap();
+        for x in [3.5, 20.] {
+            b.position[0] = x;
+            assert!(
+                intersect_convex(&ga, &evaluate(&b).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .triangles
+                    .is_empty()
+            );
+        }
+        b.width = 1.;
+        b.depth = 1.;
+        b.extrusion = 1.;
+        b.position = [0., 0., 1.];
+        let gb = evaluate(&b).unwrap();
+        assert_eq!(
+            intersect_convex(&ga, &gb).unwrap().unwrap().triangles,
+            gb.triangles
+        );
+        let mut curved = Body::new(Shape::Circle);
+        curved.extrusion = 3.;
+        assert!(
+            intersect_convex(&ga, &evaluate(&curved).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn selected_box_edges_and_multi_input_are_local_atomic_and_persistent() {

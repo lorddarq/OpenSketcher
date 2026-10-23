@@ -86,7 +86,7 @@ pub fn area(p: &[P]) -> f64 {
 }
 
 pub fn boundaries(body: &Body, bodies: &[Body]) -> Result<Option<Vec<Vec<P>>>, String> {
-    if body.shape == Shape::Line {
+    if body.shape == Shape::Line || body.construction {
         return Ok(None);
     }
     let outer = profile(body);

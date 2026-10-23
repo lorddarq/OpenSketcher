@@ -23,6 +23,14 @@ pub struct ComponentEdit {
     /// False preserves legacy edits on the source; true edits the evaluated result.
     #[serde(default)]
     pub evaluated: bool,
+    #[serde(default)]
+    pub retrim: bool,
+    #[serde(default)]
+    pub sweep: Option<[f64; 3]>,
+    #[serde(default)]
+    pub tangent_walls: bool,
+    #[serde(default)]
+    pub face_edit: Option<crate::face_operations::FaceEdit>,
     pub mode: SelectionMode,
     pub element: usize,
     #[serde(default)]
@@ -112,12 +120,14 @@ pub fn transformed(
 pub enum OffsetTarget {
     Plane(crate::edge_treatments::FaceTarget),
     CylinderWall,
+    EvaluatedPlane(usize),
 }
 impl OffsetTarget {
     pub fn label(self) -> &'static str {
         match self {
             Self::Plane(face) => face.label(),
             Self::CylinderWall => "Cylinder wall",
+            Self::EvaluatedPlane(_) => "Evaluated planar face",
         }
     }
 }
@@ -156,6 +166,7 @@ pub fn offset_target(body: &Body, g: &Geometry, face: usize) -> Result<OffsetTar
 pub fn offset_source(body: &Body, target: OffsetTarget, distance: f64) -> Result<Body, String> {
     match target {
         OffsetTarget::Plane(face) => offset_source_face(body, face, distance),
+        OffsetTarget::EvaluatedPlane(_)=>Err("Use Extrude face for this evaluated boundary; source offset does not apply.".into()),
         OffsetTarget::CylinderWall => {
             (|| {
             body.validate()?;
@@ -275,6 +286,10 @@ fn transformed_many(
         let placement = crate::regions::transform(body);
         result.component_edits.push(ComponentEdit {
             evaluated: true,
+            retrim: mode == SelectionMode::Face && planar_supports(g).is_ok(),
+            sweep: None,
+            tangent_walls: false,
+            face_edit: None,
             mode,
             element,
             elements: elements.iter().skip(1).copied().collect(),
@@ -285,6 +300,40 @@ fn transformed_many(
     }
     result.validate()?;
     Ok(result)
+}
+
+pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Result<Body, String> {
+    if !distance.is_finite() || distance.abs() > 100. {
+        return Err("Face extrusion distance must be finite and within ±100 mm.".into());
+    }
+    let mut changed = body.clone();
+    if distance == 0. {
+        return Ok(changed);
+    }
+    let plane = crate::snapping::Plane::face(g, face).ok_or("Select a planar face to extrude.")?;
+    if g.shell.is_none() {
+        return Err(
+            "This component deformation does not retain an exact boundary for extrusion.".into(),
+        );
+    }
+    let vector = crate::regions::transform(body)
+        .invert()
+        .ok_or("Invalid source placement.")?
+        .transform_vector(plane.normal * distance);
+    changed.component_edits.push(ComponentEdit {
+        evaluated: true,
+        retrim: false,
+        sweep: Some(vector.into()),
+        tangent_walls: true,
+        face_edit: None,
+        mode: SelectionMode::Face,
+        element: face,
+        elements: Vec::new(),
+        topology: g.topology.clone(),
+        matrix: Matrix4::identity().into(),
+    });
+    changed.validate()?;
+    Ok(changed)
 }
 
 pub fn transform_selection(
@@ -357,7 +406,25 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
     }
     for (index, edit) in edits.iter().enumerate() {
         let m = Matrix4::from(edit.matrix);
-        if edit.mode == SelectionMode::Volume
+        if (edit.tangent_walls && edit.sweep.is_none())
+            || edit.face_edit.is_some_and(|_| {
+                !edit.evaluated
+                    || edit.mode != SelectionMode::Face
+                    || edit.retrim
+                    || edit.sweep.is_some()
+                    || m != Matrix4::identity()
+            })
+            || edit.sweep.is_some_and(|v| {
+                edit.mode != SelectionMode::Face
+                    || !edit.evaluated
+                    || m != Matrix4::identity()
+                    || !edit.elements.is_empty()
+                    || edit.retrim
+                    || v.iter().any(|x| !x.is_finite() || x.abs() > 10000.)
+                    || Vector3::from(v).magnitude2() < 1e-16
+            })
+            || (edit.retrim && edit.mode != SelectionMode::Face)
+            || edit.mode == SelectionMode::Volume
             || edit.elements.len() > 8192
             || edit.topology.edges.len() > 8192
             || edit.topology.faces.len() > 8192
@@ -412,6 +479,12 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         if edit.topology != g.topology {
             return Err("An upstream edit changed component topology. Undo it or remove component edits before changing topology.".into());
         }
+        if let Some(kind)=edit.face_edit {
+            let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
+            if faces.iter().any(|f|*f>=g.face_count) {return Err("Selected face no longer exists.".into());}
+            *g=crate::face_operations::apply(g,&faces,kind).map_err(|e|format!("{}: {e}",kind.label()))?;
+            return Ok(());
+        }
         let mut selected = Vec::new();
         for element in std::iter::once(&edit.element).chain(&edit.elements) {
             let vertices = vertices(g, edit.mode, Some(*element));
@@ -425,7 +498,16 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         if selected.is_empty() {
             return Err("A component transform references a missing element.".into());
         }
+        if let Some(vector)=edit.sweep {
+            *g=crate::face_extrusions::evaluated_sweep(g,edit.element,vector.into(),body.shape==Shape::Circle,edit.tangent_walls)?;
+            return Ok(());
+        }
         let matrix = Matrix4::from(edit.matrix);
+        if edit.retrim {
+            let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
+            *g=retrim_faces(g,&faces,matrix)?;
+            return Ok(());
+        }
         let old = g.clone();
         let weight = |i: usize| if selected.contains(&i) { 1. } else { 0. };
         let mut lengths = vec![0.; g.edge_count];
@@ -490,14 +572,206 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         }
         weld_geometry(g);
         validate_boundary(g, if evaluated {old.is_solid} else {body.extrusion > 0. && body.shape != Shape::Line})?;
+        g.shell=None;g.circles.clear();
         Ok(())
         })().map_err(|reason:String|format!("Component operation {} · {} {}: {reason}",index+1,edit.mode.label(),edit.element.saturating_add(1)))?;
     }
-    g.shell = None;
-    g.circles.clear();
     map_geometry(g, placement);
     Ok(())
 }
+// Convex planar boundaries admit exact neighbor extension/retrim. Curved or
+// concave geometry must not be flattened into this representation.
+pub(crate) fn convex_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
+    if !g.is_solid || g.face_count > 256 || g.face_count < 4 {
+        return Err("Exact face retrim requires a convex planar solid (4–256 faces).".into());
+    }
+    let mut planes = Vec::new();
+    for face in 0..g.face_count {
+        let triangles = g
+            .triangles
+            .iter()
+            .zip(&g.triangle_faces)
+            .filter(|(_, f)| **f == face)
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>();
+        let t = triangles.first().ok_or("Missing planar face.")?;
+        let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize();
+        let d = n.dot(t[0].to_vec());
+        if triangles
+            .iter()
+            .flat_map(|t| t.iter())
+            .any(|p| (n.dot(p.to_vec()) - d).abs() > 1e-6)
+            || g.points.iter().any(|p| n.dot(p.to_vec()) > d + 1e-6)
+        {
+            return Err("Exact face retrim requires planar faces bounding a convex solid.".into());
+        }
+        planes.push((n, d));
+    }
+    Ok(planes)
+}
+pub(crate) fn planar_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
+    let planes = convex_supports(g)?;
+    for (segment, group) in g.edges.iter().zip(&g.edge_groups) {
+        let [a, b] = g.topology.edges[*group];
+        let ab = g.points[b] - g.points[a];
+        if ab.magnitude2() < 1e-16
+            || segment
+                .iter()
+                .any(|p| (*p - g.points[a]).cross(ab).magnitude() > 1e-6 * ab.magnitude())
+        {
+            return Err("Exact planar face retrim requires straight boundary edges.".into());
+        }
+    }
+    Ok(planes)
+}
+pub(crate) fn retrim_faces(
+    g: &Geometry,
+    faces: &[usize],
+    matrix: Matrix4,
+) -> Result<Geometry, String> {
+    let mut planes = planar_supports(g)?;
+    for face in faces {
+        let t = g
+            .triangles
+            .iter()
+            .zip(&g.triangle_faces)
+            .find(|(_, f)| **f == *face)
+            .ok_or("Missing face reference.")?
+            .0;
+        let [a, b, c] = t.map(|p| matrix.transform_point(p));
+        let n = (b - a).cross(c - a).normalize();
+        planes[*face] = (n, n.dot(a.to_vec()));
+    }
+    let mut points = Vec::new();
+    for vertex in 0..g.points.len() {
+        let incident = (0..g.face_count)
+            .filter(|face| {
+                g.topology.faces[*face]
+                    .iter()
+                    .any(|e| g.topology.edges[*e].contains(&vertex))
+            })
+            .collect::<Vec<_>>();
+        let mut solution = None;
+        let mut determinant = 1e-10;
+        for (i, &a) in incident.iter().enumerate() {
+            for (j, &b) in incident.iter().enumerate().skip(i + 1) {
+                for &c in incident.iter().skip(j + 1) {
+                    let (na, da) = planes[a];
+                    let (nb, db) = planes[b];
+                    let (nc, dc) = planes[c];
+                    let det = na.dot(nb.cross(nc));
+                    if det.abs() > determinant {
+                        determinant = det.abs();
+                        solution = Some(Point3::from_vec(
+                            (nb.cross(nc) * da + nc.cross(na) * db + na.cross(nb) * dc) / det,
+                        ));
+                    }
+                }
+            }
+        }
+        // A sweep can retain a seam vertex in the middle of a straight edge.
+        // Such a vertex has two independent supports; project onto their exact
+        // intersection instead of requiring a third, nonexistent corner plane.
+        if solution.is_none()
+            && let Some(&first) = incident.first()
+        {
+            let (na, da) = planes[first];
+            let original = g.points[vertex];
+            solution = Some(original + na * (da - na.dot(original.to_vec())));
+            for &other in &incident {
+                let (nb, db) = planes[other];
+                let cosine = na.dot(nb);
+                let determinant = 1. - cosine * cosine;
+                if determinant > 1e-10 {
+                    let a = da - na.dot(original.to_vec());
+                    let b = db - nb.dot(original.to_vec());
+                    solution = Some(
+                        original + (na * (a - cosine * b) + nb * (b - cosine * a)) / determinant,
+                    );
+                    break;
+                }
+            }
+        }
+        let p = solution.ok_or("Face retrim references a missing corner.")?;
+        if incident
+            .iter()
+            .any(|f| (planes[*f].0.dot(p.to_vec()) - planes[*f].1).abs() > 1e-6)
+            || planes.iter().any(|(n, d)| n.dot(p.to_vec()) > *d + 1e-6)
+        {
+            return Err("Face retrim consumes a face or changes corner connectivity; reduce the movement/rotation.".into());
+        }
+        points.push(p);
+    }
+    let vertices = points
+        .iter()
+        .copied()
+        .map(builder::vertex)
+        .collect::<Vec<_>>();
+    let edges = g
+        .topology
+        .edges
+        .iter()
+        .map(|[a, b]| {
+            if (points[*a] - points[*b]).magnitude2() < 1e-16 {
+                return Err("Face retrim collapses an edge.");
+            }
+            Ok(builder::line(&vertices[*a], &vertices[*b]))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut shell = Shell::default();
+    for (face, (normal, _)) in planes.iter().enumerate() {
+        let mut indices = crate::components::vertices(g, SelectionMode::Face, Some(face));
+        let center =
+            indices.iter().map(|i| points[*i].to_vec()).sum::<Vector3>() / indices.len() as f64;
+        let u = (points[indices[0]].to_vec() - center).normalize();
+        let v = normal.cross(u);
+        indices.sort_by(|a, b| {
+            let a = points[*a].to_vec() - center;
+            let b = points[*b].to_vec() - center;
+            a.dot(v)
+                .atan2(a.dot(u))
+                .total_cmp(&b.dot(v).atan2(b.dot(u)))
+        });
+        let wire: Wire = (0..indices.len())
+            .map(|i| {
+                let a = indices[i];
+                let b = indices[(i + 1) % indices.len()];
+                let edge = g.topology.faces[face]
+                    .iter()
+                    .find(|e| {
+                        let pair = g.topology.edges[**e];
+                        pair == [a, b] || pair == [b, a]
+                    })
+                    .ok_or("Face retrim changes boundary connectivity.")?;
+                Ok(if g.topology.edges[*edge] == [a, b] {
+                    edges[*edge].clone()
+                } else {
+                    edges[*edge].inverse()
+                })
+            })
+            .collect::<Result<Wire, &str>>()?;
+        shell.push(
+            builder::try_attach_plane(&[wire])
+                .map_err(|e| format!("Cannot retrim planar face: {e}"))?,
+        );
+    }
+    solid_parts(&shell)?;
+    let mut result = crate::model::tessellate(&shell)?;
+    // Keep guarded logical references stable; the retained BRep face order matches.
+    result.points = points;
+    result.topology = g.topology.clone();
+    result.edge_count = g.edge_count;
+    result.edges = result
+        .topology
+        .edges
+        .iter()
+        .map(|[a, b]| [result.points[*a], result.points[*b]])
+        .collect();
+    result.edge_groups = (0..result.edge_count).collect();
+    result.is_solid = true;
+    Ok(result)
+}
+
 pub fn map_geometry(g: &mut Geometry, matrix: Matrix4) {
     if let Some(shell) = &mut g.shell {
         *shell = builder::transformed(shell, matrix);
@@ -559,6 +833,71 @@ fn validate_boundary(g: &Geometry, closed: bool) -> Result<(), String> {
     boundary_shell(g, closed).map(|_| ())
 }
 
+// STEP represents enclosed cavities as BREP_WITH_VOIDS, while disconnected
+// positive-volume islands remain independent solids. Do not export a void as material.
+pub(crate) fn solid_parts(shell: &truck_modeling::Shell) -> Result<Vec<Solid>, String> {
+    let parts = shell.connected_components();
+    let meshes = parts
+        .iter()
+        .map(crate::model::tessellate)
+        .collect::<Result<Vec<_>, _>>()?;
+    let volumes: Vec<f64> = meshes
+        .iter()
+        .map(|g| {
+            let origin = g.triangles[0][0];
+            g.triangles
+                .iter()
+                .map(|t| {
+                    let [a, b, c] = t.map(|p| p - origin);
+                    a.dot(b.cross(c)) / 6.
+                })
+                .sum()
+        })
+        .collect();
+    let mut groups: Vec<_> = volumes
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > 0.)
+        .map(|(i, _)| (i, vec![parts[i].clone()]))
+        .collect();
+    for (index, volume) in volumes.iter().enumerate() {
+        if volume.abs() <= 1e-10 || !volume.is_finite() {
+            return Err("Cannot export a zero-volume solid boundary.".into());
+        }
+        if *volume > 0. {
+            continue;
+        }
+        let point = meshes[index].triangles[0][0];
+        let owner = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (i, _))| {
+                let winding: f64 = meshes[*i]
+                    .triangles
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.map(|p| p - point);
+                        2. * a.dot(b.cross(c)).atan2(
+                            a.magnitude() * b.magnitude() * c.magnitude()
+                                + a.dot(b) * c.magnitude()
+                                + b.dot(c) * a.magnitude()
+                                + c.dot(a) * b.magnitude(),
+                        )
+                    })
+                    .sum();
+                winding.abs() > std::f64::consts::TAU
+            })
+            .min_by(|(_, (a, _)), (_, (b, _))| volumes[*a].total_cmp(&volumes[*b]))
+            .map(|(i, _)| i)
+            .ok_or("An inward solid boundary has no enclosing outer boundary.")?;
+        groups[owner].1.push(parts[index].clone());
+    }
+    groups
+        .into_iter()
+        .map(|(_, boundaries)| Solid::try_new(boundaries).map_err(|e| e.to_string()))
+        .collect()
+}
+
 pub fn boundary_shell(g: &Geometry, closed: bool) -> Result<Shell, String> {
     if g.points
         .iter()
@@ -608,23 +947,8 @@ pub fn boundary_shell(g: &Geometry, closed: bool) -> Result<Shell, String> {
         return Err("Component transform creates inconsistent adjacent faces.".into());
     }
     if closed && !shell.is_empty() {
-        for part in shell.connected_components() {
-            let volume: f64 = part
-                .face_iter()
-                .map(|face| {
-                    let wire = &face.boundaries()[0];
-                    let a = wire[0].front().point().to_vec();
-                    let b = wire[1].front().point().to_vec();
-                    let c = wire[2].front().point().to_vec();
-                    a.dot(b.cross(c)) / 6.
-                })
-                .sum();
-            if volume <= 1e-10 {
-                return Err("Component transform collapses or inverts a solid region.".into());
-            }
-            Solid::try_new(vec![part])
-                .map_err(|e| format!("Component transform would open or tear the body: {e}"))?;
-        }
+        solid_parts(&shell)
+            .map_err(|e| format!("Component transform would invalidate the body: {e}"))?;
     }
     Ok(shell)
 }
@@ -940,6 +1264,16 @@ mod tests {
                     let output = evaluate_scene(&model.bodies).unwrap();
                     let chosen = vertices(&g, mode, element);
                     for i in 0..g.points.len() {
+                        if edited.component_edits.last().is_some_and(|e| e.retrim) {
+                            let face = element.unwrap();
+                            let support = crate::snapping::Plane::face(&g, face).unwrap();
+                            let origin = matrix.transform_point(support.origin);
+                            let normal = matrix.transform_vector(support.normal).normalize();
+                            if chosen.contains(&i) {
+                                assert!((output[0].1.points[i] - origin).dot(normal).abs() < 1e-6);
+                            }
+                            continue;
+                        }
                         let expected = if chosen.contains(&i) {
                             matrix.transform_point(g.points[i])
                         } else {
@@ -1063,6 +1397,334 @@ mod tests {
         assert_eq!(
             transformed(&body, &geometry, SelectionMode::Point, Some(0), matrix).unwrap(),
             body
+        );
+    }
+    #[test]
+    fn convex_planar_face_moves_retrim_neighbors_and_preserve_exact_history() {
+        use crate::edge_treatments::{FaceTarget, Kind, Modifier};
+        for chamfer in [false, true] {
+            let mut body = Body::new(Shape::Rectangle);
+            body.id = 1;
+            body.width = 4.;
+            body.depth = 3.;
+            body.extrusion = 5.;
+            body.position = [2., -3., 1.];
+            body.rotation = [15., 25., 35.];
+            body.scale = [1.5, 0.75, 2.];
+            if chamfer {
+                body.edge_treatments
+                    .push(Modifier::new(Kind::Chamfer, FaceTarget::Top, &body));
+            }
+            let g = evaluate(&body).unwrap();
+            let face = (0..g.face_count)
+                .find(|f| crate::edge_treatments::target(&body, &g, *f) == Ok(FaceTarget::Top))
+                .unwrap();
+            let plane = crate::snapping::Plane::face(&g, face).unwrap();
+            let center = pivot(&g, SelectionMode::Face, Some(face)).unwrap();
+            let originals = planar_supports(&g).unwrap();
+            for matrix in [
+                Matrix4::from_translation(plane.normal * 0.4),
+                Matrix4::from_translation(center.to_vec())
+                    * Matrix4::from_axis_angle(plane.u, Deg(7.))
+                    * Matrix4::from_translation(-center.to_vec()),
+            ] {
+                let edited =
+                    transformed(&body, &g, SelectionMode::Face, Some(face), matrix).unwrap();
+                assert!(edited.component_edits.last().unwrap().retrim);
+                let out = evaluate(&edited).unwrap();
+                assert_eq!(out.topology, g.topology);
+                let supports = planar_supports(&out).unwrap();
+                for (i, (n, d)) in supports.iter().enumerate() {
+                    let (expected_n, expected_d) = if i == face {
+                        let n = matrix.transform_vector(plane.normal).normalize();
+                        (n, n.dot(matrix.transform_point(plane.origin).to_vec()))
+                    } else {
+                        originals[i]
+                    };
+                    assert!(
+                        (*n - expected_n).magnitude() < 1e-7 && (*d - expected_d).abs() < 1e-7,
+                        "Neighbor planes must extend/retrim without deforming"
+                    );
+                }
+                let shell = out.shell.as_ref().unwrap();
+                assert_eq!(shell.len(), g.face_count);
+                assert!(
+                    shell
+                        .iter()
+                        .all(|f| matches!(f.oriented_surface(), truck_modeling::Surface::Plane(_)))
+                );
+                solid_parts(shell).unwrap();
+                let mut model = Model::from_bodies(vec![body.clone()]);
+                model.commit(edited.clone()).unwrap();
+                model.undo();
+                assert_eq!(model.bodies, vec![body.clone()]);
+                model.redo();
+                assert_eq!(model.bodies, vec![edited.clone()]);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("retrim.osk");
+                let project = Project::new(vec![edited.clone()], Camera::default(), true, Some(1));
+                project.save(&path).unwrap();
+                assert_eq!(Project::load(&path).unwrap().bodies, vec![edited.clone()]);
+                let mut legacy = serde_json::to_value(project).unwrap();
+                legacy["schema_version"] = 17.into();
+                legacy["modeling_version"] = 17.into();
+                std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                assert!(
+                    Project::load(&path)
+                        .unwrap_err()
+                        .contains("Exact planar face retrim requires .osk version 18")
+                );
+                legacy["bodies"][0]["component_edits"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("retrim");
+                std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                assert!(!Project::load(&path).unwrap().bodies[0].component_edits[0].retrim);
+                for format in [
+                    crate::export::Format::Stl,
+                    crate::export::Format::Glb,
+                    crate::export::Format::Step,
+                    crate::export::Format::Dxf,
+                ] {
+                    let bytes =
+                        crate::export::encode(std::slice::from_ref(&edited), format).unwrap();
+                    assert!(!bytes.is_empty());
+                    if format == crate::export::Format::Step {
+                        assert_eq!(
+                            String::from_utf8(bytes)
+                                .unwrap()
+                                .matches(" = PLANE(")
+                                .count(),
+                            g.face_count
+                        );
+                    }
+                }
+                let bad = Matrix4::from_translation(plane.normal * -30.);
+                let invalid =
+                    transformed(&edited, &out, SelectionMode::Face, Some(face), bad).unwrap();
+                assert!(model.commit(invalid).is_err());
+                assert_eq!(model.bodies, vec![edited]);
+            }
+        }
+    }
+    #[test]
+    fn ordered_evaluated_face_sweeps_follow_retrim_and_boolean_results() {
+        let volume = |g: &Geometry| {
+            g.triangles
+                .iter()
+                .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                .sum::<f64>()
+        };
+        for rotated in [false, true] {
+            let mut body = Body::new(Shape::Rectangle);
+            body.id = 1;
+            body.width = 4.;
+            body.depth = 3.;
+            body.extrusion = 5.;
+            body.position = [2., -3., 1.];
+            body.rotation = [15., 25., 35.];
+            body.scale = [1.5, 0.75, 2.];
+            let original = evaluate(&body).unwrap();
+            let face = (0..original.face_count)
+                .find(|f| {
+                    crate::edge_treatments::target(&body, &original, *f)
+                        == Ok(crate::edge_treatments::FaceTarget::Top)
+                })
+                .unwrap();
+            let plane = crate::snapping::Plane::face(&original, face).unwrap();
+            body = transformed(
+                &body,
+                &original,
+                SelectionMode::Face,
+                Some(face),
+                Matrix4::from_translation(plane.normal * 0.5),
+            )
+            .unwrap();
+            if rotated {
+                let g = evaluate(&body).unwrap();
+                let center = pivot(&g, SelectionMode::Face, Some(face)).unwrap();
+                body = transformed(
+                    &body,
+                    &g,
+                    SelectionMode::Face,
+                    Some(face),
+                    Matrix4::from_translation(center.to_vec())
+                        * Matrix4::from_axis_angle(plane.u, Deg(7.))
+                        * Matrix4::from_translation(-center.to_vec()),
+                )
+                .unwrap();
+            }
+            let g = evaluate(&body).unwrap();
+            let before = volume(&g);
+            let area = g
+                .triangles
+                .iter()
+                .zip(&g.triangle_faces)
+                .filter(|(_, f)| **f == face)
+                .map(|(t, _)| (t[1] - t[0]).cross(t[2] - t[0]).magnitude() / 2.)
+                .sum::<f64>();
+            for distance in if rotated {
+                vec![0.4]
+            } else {
+                vec![0.4, -0.4, -30.]
+            } {
+                let changed = sweep_face(&body, &g, face, distance).unwrap();
+                assert!(changed.component_edits.last().unwrap().sweep.is_some());
+                let out = evaluate(&changed).unwrap();
+                let expected = (before + area * distance).max(0.);
+                assert!(
+                    (volume(&out) - expected).abs() < 1e-6,
+                    "World normal displacement after source scaling/rotation: {} vs {expected}",
+                    volume(&out)
+                );
+                if expected > 0. {
+                    assert!(out.shell.is_some());
+                    solid_parts(out.shell.as_ref().unwrap()).unwrap();
+                }
+                let mut model = Model::from_bodies(vec![body.clone()]);
+                model.commit(changed.clone()).unwrap();
+                model.undo();
+                assert_eq!(model.bodies, vec![body.clone()]);
+                model.redo();
+                assert_eq!(model.bodies, vec![changed.clone()]);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("sweep.osk");
+                let project = Project::new(vec![changed.clone()], Camera::default(), true, Some(1));
+                project.save(&path).unwrap();
+                assert_eq!(Project::load(&path).unwrap().bodies, vec![changed.clone()]);
+                let mut old = serde_json::to_value(project).unwrap();
+                // Exercise the original v19 payload without the v24 opt-in.
+                for edit in old["bodies"][0]["component_edits"].as_array_mut().unwrap() {
+                    edit.as_object_mut().unwrap().remove("tangent_walls");
+                }
+                old["schema_version"] = 18.into();
+                old["modeling_version"] = 18.into();
+                std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+                assert!(
+                    Project::load(&path)
+                        .unwrap_err()
+                        .contains("Evaluated planar face sweeps require .osk version 19")
+                );
+                old["schema_version"] = 19.into();
+                old["modeling_version"] = 19.into();
+                std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+                let legacy = Project::load(&path).unwrap();
+                assert!(
+                    !legacy.bodies[0]
+                        .component_edits
+                        .last()
+                        .unwrap()
+                        .tangent_walls
+                );
+                assert!((volume(&evaluate(&legacy.bodies[0]).unwrap()) - expected).abs() < 1e-6);
+                if expected > 0. {
+                    for format in crate::export::Format::ALL {
+                        assert!(
+                            !crate::export::encode(std::slice::from_ref(&changed), format)
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    // A later move uses the swept topology, not the old source face slots.
+                    let plane = crate::snapping::Plane::face(&g, face).unwrap();
+                    let cap = (0..out.face_count)
+                        .find(|f| {
+                            crate::snapping::Plane::face(&out, *f).is_some_and(|p| {
+                                p.normal.dot(plane.normal) > 1. - 1e-6
+                                    && (p.origin - plane.origin - plane.normal * distance)
+                                        .dot(plane.normal)
+                                        .abs()
+                                        < 1e-6
+                            })
+                        })
+                        .unwrap();
+                    let continued = transformed(
+                        &changed,
+                        &out,
+                        SelectionMode::Face,
+                        Some(cap),
+                        Matrix4::from_translation(plane.normal * 0.1),
+                    )
+                    .unwrap();
+                    assert!(
+                        (volume(&evaluate(&continued).unwrap()) - (expected + area * 0.1)).abs()
+                            < 1e-6
+                    );
+                }
+                let mut invalid = changed.clone();
+                invalid.component_edits.last_mut().unwrap().sweep = Some([f64::NAN, 0., 0.]);
+                assert!(model.commit(invalid).is_err());
+                assert_eq!(model.bodies, vec![changed]);
+            }
+        }
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.width = 4.;
+        a.depth = 4.;
+        a.extrusion = 3.;
+        let mut b = a.clone();
+        b.id = 2;
+        b.position = [1., 0., 0.];
+        let mut bodies = vec![a, b];
+        let input = crate::model::evaluate_scene(&bodies).unwrap();
+        let mut result = Body::new(Shape::Rectangle);
+        result.id = 3;
+        result.boolean = Some(crate::booleans::Boolean::new(
+            crate::booleans::Kind::Intersect,
+            &[(1, None), (2, None)],
+            SelectionMode::Volume,
+            &input,
+        ));
+        bodies.push(result);
+        let scene = crate::model::evaluate_scene(&bodies).unwrap();
+        let g = &scene[2].1;
+        let face = (0..g.face_count)
+            .find(|f| crate::snapping::Plane::face(g, *f).is_some_and(|p| p.normal.z > 0.99))
+            .unwrap();
+        let before = volume(g);
+        let area = g
+            .triangles
+            .iter()
+            .zip(&g.triangle_faces)
+            .filter(|(_, f)| **f == face)
+            .map(|(t, _)| (t[1] - t[0]).cross(t[2] - t[0]).magnitude() / 2.)
+            .sum::<f64>();
+        bodies[2] = sweep_face(&bodies[2], g, face, 0.5).unwrap();
+        let out = crate::model::evaluate_scene(&bodies).unwrap();
+        assert!((volume(&out[2].1) - before - area * 0.5).abs() < 1e-6);
+        assert!(out[0].1.triangles.is_empty() && out[1].1.triangles.is_empty());
+        for format in crate::export::Format::ALL {
+            assert!(!crate::export::encode(&bodies, format).unwrap().is_empty());
+        }
+        let mut treated = Body::new(Shape::Rectangle);
+        treated.id = 1;
+        treated.extrusion = 4.;
+        treated
+            .edge_treatments
+            .push(crate::edge_treatments::Modifier::new(
+                crate::edge_treatments::Kind::Chamfer,
+                crate::edge_treatments::FaceTarget::Top,
+                &treated,
+            ));
+        let g = evaluate(&treated).unwrap();
+        let band = (0..g.face_count)
+            .find(|f| {
+                crate::edge_treatments::target(&treated, &g, *f).is_err()
+                    && crate::snapping::Plane::face(&g, *f).is_some()
+            })
+            .unwrap();
+        let area = g
+            .triangles
+            .iter()
+            .zip(&g.triangle_faces)
+            .filter(|(_, f)| **f == band)
+            .map(|(t, _)| (t[1] - t[0]).cross(t[2] - t[0]).magnitude() / 2.)
+            .sum::<f64>();
+        let expanded = sweep_face(&treated, &g, band, 0.2).unwrap();
+        let out = evaluate(&expanded).unwrap();
+        assert!(
+            (volume(&out) - volume(&g) - area * 0.2).abs() < 1e-6,
+            "Planar transition regions use their evaluated boundary"
         );
     }
 }

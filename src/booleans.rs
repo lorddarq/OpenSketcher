@@ -1,4 +1,4 @@
-//! Ordered, persistent set operations; inputs remain authored and undoable.
+//! Ordered two-input geometry features; sources and references remain authored and undoable.
 use crate::{
     components::Topology,
     model::{Body, Geometry},
@@ -13,6 +13,9 @@ pub enum Kind {
     Union,
     Subtract,
     Intersect,
+    ReplaceFace,
+    Imprint,
+    ImprintCurve,
 }
 impl Kind {
     pub fn label(self) -> &'static str {
@@ -20,6 +23,9 @@ impl Kind {
             Self::Union => "Union",
             Self::Subtract => "Subtract",
             Self::Intersect => "Intersect",
+            Self::ReplaceFace => "Replace face",
+            Self::Imprint => "Imprint",
+            Self::ImprintCurve => "Imprint curve",
         }
     }
     fn contains(self, a: bool, b: bool) -> bool {
@@ -27,6 +33,9 @@ impl Kind {
             Self::Union => a || b,
             Self::Subtract => a && !b,
             Self::Intersect => a && b,
+            Self::ReplaceFace | Self::Imprint | Self::ImprintCurve => {
+                unreachable!("Replace Face is not a planar set operation")
+            }
         }
     }
 }
@@ -66,13 +75,30 @@ impl Boolean {
     pub fn references(&self) -> String {
         let label = |(id, face): Pick| match face {
             Some(index) => format!("body {id} face {}", index.saturating_add(1)),
-            None => format!("body {id} volume"),
+            None => format!(
+                "body {id} {}",
+                if self.kind == Kind::ImprintCurve {
+                    "curve"
+                } else if self.kind == Kind::Imprint {
+                    "profile"
+                } else {
+                    "volume"
+                }
+            ),
         };
-        format!(
-            "target {} · tool {}",
-            label(self.operands[0]),
-            label(self.operands[1])
-        )
+        if self.kind == Kind::ReplaceFace {
+            format!(
+                "source {} · replacement {}",
+                label(self.operands[0]),
+                label(self.operands[1])
+            )
+        } else {
+            format!(
+                "target {} · tool {}",
+                label(self.operands[0]),
+                label(self.operands[1])
+            )
+        }
     }
     pub fn validate(&self, body: &Body) -> Result<(), String> {
         if self.operands[0] == self.operands[1]
@@ -80,9 +106,25 @@ impl Boolean {
                 .operands
                 .iter()
                 .any(|p| p.0 == 0 || (body.id != 0 && p.0 >= body.id))
-            || self.operands[0].1.is_some() != self.operands[1].1.is_some()
+            || (!matches!(self.kind, Kind::Imprint | Kind::ImprintCurve)
+                && self.operands[0].1.is_some() != self.operands[1].1.is_some())
         {
             return Err("Choose two distinct earlier volumes, or two coplanar faces.".into());
+        }
+        if self.kind == Kind::ReplaceFace
+            && (self.operands.iter().any(|p| p.1.is_none()) || self.keep_tools)
+        {
+            return Err("Replace Face requires two faces; its reference is always retained and its source is replaced.".into());
+        }
+        if self.kind == Kind::ImprintCurve
+            && (self.operands[0].1.is_none() || self.operands[1].1.is_some())
+        {
+            return Err(
+                "Imprint curve requires a solid face first and a whole line second.".into(),
+            );
+        }
+        if self.kind == Kind::Imprint && self.operands[0].1.is_none() {
+            return Err("Imprint requires a solid face first and a planar profile second.".into());
         }
         if body.bore.is_some()
             || crate::components::has_source_edits(body)
@@ -107,6 +149,12 @@ pub fn apply(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), Strin
     for body in features {
         let op = body.boolean.as_ref().unwrap();
         (|| {
+            if op.operands.iter().enumerate().any(|(i, p)| {
+                bodies.iter().any(|b| b.id == p.0 && b.construction)
+                    && !(op.kind == Kind::ReplaceFace && i == 1)
+            }) {
+                return Err("Construction references cannot be Boolean operands.".into());
+            }
             let operands: Vec<_> = op
                 .operands
                 .iter()
@@ -119,7 +167,13 @@ pub fn apply(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), Strin
                 })
                 .collect::<Result<_, _>>()?;
             let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if op.operands[0].1.is_some() {
+                if op.kind == Kind::ReplaceFace {
+                    crate::face_operations::replace(op, &operands, bodies)
+                } else if op.kind == Kind::ImprintCurve {
+                    crate::curve_imprints::apply(op, &operands)
+                } else if op.kind == Kind::Imprint {
+                    crate::face_operations::imprint(op, &operands)
+                } else if op.operands[0].1.is_some() {
                     faces(op, &operands)
                 } else {
                     prisms(op, operands[0], operands[1]).and_then(|g| match g {
@@ -134,6 +188,17 @@ pub fn apply(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), Strin
             })??;
             crate::components::apply_evaluated(body, &mut result)?;
             scene.iter_mut().find(|g| g.0 == body.id).unwrap().1 = result;
+            if op.kind == Kind::ReplaceFace {
+                suppressed.push((op.operands[0].0, None));
+                return Ok(());
+            }
+            if matches!(op.kind, Kind::Imprint | Kind::ImprintCurve) {
+                suppressed.push((op.operands[0].0, None));
+                if !op.keep_tools {
+                    suppressed.push((op.operands[1].0, None));
+                }
+                return Ok(());
+            }
             // Face operations produce a sheet; a solid containing a picked face remains intact.
             for (i, p) in op.operands.iter().enumerate() {
                 if (i == 0 || !op.keep_tools) && (p.1.is_none() || !operands_solid(scene, p.0)) {
@@ -261,6 +326,11 @@ fn volumes(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
             "Volume Booleans require two closed solids. Use Face selection for sheets.".into(),
         );
     }
+    if kind == Kind::Intersect
+        && let Some(result) = crate::edge_treatments::intersect_convex(a, b)?
+    {
+        return Ok(result);
+    }
     let result = match kind {
         Kind::Union => truck_shapeops::or(
             &crate::operators::solid(a)?,
@@ -272,6 +342,9 @@ fn volumes(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
             &crate::operators::solid(b)?,
             0.01,
         ),
+        Kind::ReplaceFace | Kind::Imprint | Kind::ImprintCurve => {
+            return Err("This operation requires face operands.".into());
+        }
         Kind::Subtract => {
             return crate::operators::difference(
                 a,
@@ -289,16 +362,18 @@ pub(crate) fn profile_coverage(
     profile: &Body,
     g: &Geometry,
     faces: &[usize],
-    travel: f64,
+    plane: crate::snapping::Plane,
 ) -> Result<(bool, bool), String> {
-    let mut moved = profile.clone();
-    moved.position = (truck_modeling::Point3::from(profile.position)
-        + crate::regions::transform(profile)
-            .transform_vector(truck_modeling::Vector3::unit_z())
-            .normalize()
-            * travel)
-        .into();
-    let mesh = crate::model::build(&moved, None)?;
+    let axis = crate::regions::transform(profile)
+        .transform_vector(truck_modeling::Vector3::unit_z())
+        .normalize();
+    let projection = plane
+        .projection_along(axis)
+        .ok_or("Sweep direction is parallel to the end plane.")?;
+    let mut mesh = crate::model::build(profile, None)?;
+    for point in mesh.triangles.iter_mut().flatten() {
+        *point = projection.transform_point(*point);
+    }
     face_coverage(&mesh, g, faces)
 }
 pub(crate) fn face_coverage(
@@ -338,7 +413,13 @@ pub(crate) fn face_coverage(
             .is_empty(),
     ))
 }
-fn faces(op: &Boolean, geometry: &[&Geometry]) -> Result<Geometry, String> {
+pub(crate) fn faces(op: &Boolean, geometry: &[&Geometry]) -> Result<Geometry, String> {
+    if matches!(
+        op.kind,
+        Kind::ReplaceFace | Kind::Imprint | Kind::ImprintCurve
+    ) {
+        return Err("Use the solid face-operation path.".into());
+    }
     let mut triangles = Vec::new();
     for (i, g) in geometry.iter().enumerate() {
         if g.topology != op.topology[i] {
@@ -481,6 +562,7 @@ mod tests {
                         Kind::Union => 18.,
                         Kind::Subtract => 10.,
                         Kind::Intersect => 6.,
+                        Kind::ReplaceFace | Kind::Imprint | Kind::ImprintCurve => unreachable!(),
                     };
                     assert!(
                         (volume - expected).abs() < 1e-6,
@@ -493,6 +575,7 @@ mod tests {
                         Kind::Union => 9.,
                         Kind::Subtract => 5.,
                         Kind::Intersect => 3.,
+                        Kind::ReplaceFace | Kind::Imprint | Kind::ImprintCurve => unreachable!(),
                     };
                     assert!((measure(&evaluated[2].1) - expected).abs() < 1e-6);
                 }
@@ -602,5 +685,153 @@ mod tests {
                 assert_eq!(model.bodies, sources);
             }
         }
+    }
+    #[test]
+    fn general_planar_subtract_reuses_exact_cuts_voids_and_ordered_history() {
+        use truck_modeling::EuclideanSpace;
+        let volume = |g: &Geometry| {
+            g.triangles
+                .iter()
+                .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                .sum::<f64>()
+        };
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.width = 4.;
+        a.depth = 3.;
+        a.extrusion = 5.;
+        let mut b = Body::new(Shape::Rectangle);
+        b.id = 2;
+        b.width = 1.2;
+        b.depth = 6.;
+        b.extrusion = 9.;
+        b.position = [0.2, 0., -2.];
+        b.rotation[2] = 35.;
+        let overlap = 1.2 / 35_f64.to_radians().cos() * 3. * 5.;
+        for reverse in [false, true] {
+            for keep in [false, true] {
+                let bodies = vec![a.clone(), b.clone()];
+                let scene = evaluate_scene(&bodies).unwrap();
+                let picks = if reverse {
+                    [(2, None), (1, None)]
+                } else {
+                    [(1, None), (2, None)]
+                };
+                let mut result = Body::new(Shape::Rectangle);
+                result.boolean = Some(Boolean::new(
+                    Kind::Subtract,
+                    &picks,
+                    SelectionMode::Volume,
+                    &scene,
+                ));
+                result.boolean.as_mut().unwrap().keep_tools = keep;
+                let mut model = Model::from_bodies(bodies.clone());
+                model.commit(result).unwrap();
+                let accepted = model.bodies.clone();
+                let out = evaluate_scene(&accepted).unwrap();
+                let g = &out[2].1;
+                let expected = if reverse {
+                    1.2 * 6. * 9. - overlap
+                } else {
+                    60. - overlap
+                };
+                assert!(
+                    (volume(g) - expected).abs() < 1e-6,
+                    "Ordered subtraction: {} vs {expected}",
+                    volume(g)
+                );
+                let shell = g.shell.as_ref().unwrap();
+                assert!(
+                    shell
+                        .iter()
+                        .all(|f| matches!(f.oriented_surface(), truck_modeling::Surface::Plane(_)))
+                );
+                assert!(
+                    shell
+                        .iter()
+                        .flat_map(|f| f.edge_iter())
+                        .all(|e| matches!(e.curve(), truck_modeling::Curve::Line(_))),
+                    "Supported subtraction must retain exact line/plane boundaries"
+                );
+                let target = if reverse { 1 } else { 0 };
+                let tool = 1 - target;
+                assert!(out[target].1.triangles.is_empty());
+                assert_eq!(!out[tool].1.triangles.is_empty(), keep);
+                let parts = crate::components::solid_parts(shell).unwrap();
+                if !reverse {
+                    assert_eq!(parts.len(), 2);
+                }
+                crate::components::boundary_shell(g, true).unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("planar-subtract.osk");
+                let project = crate::project::Project::new(
+                    accepted.clone(),
+                    crate::viewport::Camera::default(),
+                    true,
+                    Some(3),
+                );
+                project.save(&path).unwrap();
+                assert_eq!(
+                    crate::project::Project::load(&path).unwrap().bodies,
+                    accepted
+                );
+                for format in crate::export::Format::ALL {
+                    assert!(!crate::export::encode(&accepted, format).unwrap().is_empty());
+                }
+                model.undo();
+                assert_eq!(model.bodies, bodies);
+                model.redo();
+                assert_eq!(model.bodies, accepted);
+                assert!(model.delete(2).is_err());
+                assert_eq!(model.bodies, accepted);
+            }
+        }
+        // A fully enclosed cutter is one void, not an inverted independent body.
+        b.width = 1.;
+        b.depth = 1.;
+        b.extrusion = 1.;
+        b.position = [0., 0., 2.];
+        b.rotation = [0.; 3];
+        let mut bodies = vec![a.clone(), b.clone()];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut result = Body::new(Shape::Rectangle);
+        result.id = 3;
+        result.boolean = Some(Boolean::new(
+            Kind::Subtract,
+            &[(1, None), (2, None)],
+            SelectionMode::Volume,
+            &scene,
+        ));
+        bodies.push(result);
+        let out = evaluate_scene(&bodies).unwrap();
+        let g = &out[2].1;
+        assert!((volume(g) - 59.).abs() < 1e-6);
+        let solids = crate::components::solid_parts(g.shell.as_ref().unwrap()).unwrap();
+        assert_eq!(solids.len(), 1);
+        assert_eq!(solids[0].boundaries().len(), 2);
+        let step =
+            String::from_utf8(crate::export::encode(&bodies, crate::export::Format::Step).unwrap())
+                .unwrap();
+        assert_eq!(step.matches("BREP_WITH_VOIDS(").count(), 1);
+        // Disjoint and touching-only tools leave original topology/references intact.
+        let source = crate::model::evaluate(&a).unwrap();
+        for x in [2.5, 10.] {
+            b.position = [x, 0., 2.];
+            let tool = crate::model::primitive_shell(&b).unwrap();
+            let unchanged = crate::operators::difference(&source, &tool).unwrap();
+            assert_eq!(unchanged.topology, source.topology);
+            assert_eq!(unchanged.points, source.points);
+            assert_eq!(unchanged.triangles, source.triangles);
+        }
+        b.width = 10.;
+        b.depth = 10.;
+        b.extrusion = 10.;
+        b.position = [0., 0., -2.];
+        assert!(
+            crate::operators::difference(&source, &crate::model::primitive_shell(&b).unwrap())
+                .unwrap()
+                .triangles
+                .is_empty()
+        );
     }
 }

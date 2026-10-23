@@ -6,7 +6,7 @@ use crate::{
 };
 use eframe::egui::{Pos2, Rect};
 use serde::{Deserialize, Serialize};
-use truck_modeling::{EuclideanSpace, InnerSpace, Matrix3, Point3, Vector3};
+use truck_modeling::{EuclideanSpace, InnerSpace, Matrix3, ParametricSurface, Point3, Vector3};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -15,6 +15,7 @@ pub struct Preferences {
     pub grid_axes: bool,
     pub cut_on_creation: bool,
     pub project_to_base_plane: bool,
+    pub plane: Option<u64>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -23,6 +24,7 @@ impl Default for Preferences {
             grid_axes: true,
             cut_on_creation: false,
             project_to_base_plane: false,
+            plane: None,
         }
     }
 }
@@ -35,6 +37,19 @@ pub struct Plane {
     pub normal: Vector3,
 }
 impl Plane {
+    /// Affine projection onto this plane along parallel sweep rays.
+    pub fn projection_along(self, axis: Vector3) -> Option<truck_modeling::Matrix4> {
+        let denominator = axis.dot(self.normal);
+        if !denominator.is_finite() || denominator.abs() < 1e-8 {
+            return None;
+        }
+        Some(truck_modeling::Matrix4::from_cols(
+            (Vector3::unit_x() - axis * (self.normal.x / denominator)).extend(0.),
+            (Vector3::unit_y() - axis * (self.normal.y / denominator)).extend(0.),
+            (Vector3::unit_z() - axis * (self.normal.z / denominator)).extend(0.),
+            (axis * (self.origin.to_vec().dot(self.normal) / denominator)).extend(1.),
+        ))
+    }
     pub fn ground() -> Self {
         Self {
             origin: Point3::new(0., 0., 0.),
@@ -42,6 +57,22 @@ impl Plane {
             v: Vector3::unit_y(),
             normal: Vector3::unit_z(),
         }
+    }
+    pub fn reference(body: &Body) -> Result<Self, String> {
+        if !body.construction {
+            return Err("Drawing reference is not a construction plane.".into());
+        }
+        body.validate()?;
+        use truck_modeling::{InnerSpace, Transform};
+        let matrix = crate::regions::transform(body);
+        let u = matrix.transform_vector(Vector3::unit_x()).normalize();
+        let v = matrix.transform_vector(Vector3::unit_y()).normalize();
+        Ok(Self {
+            origin: Point3::from(body.position),
+            u,
+            v,
+            normal: u.cross(v).normalize(),
+        })
     }
     pub fn face(g: &Geometry, face: usize) -> Option<Self> {
         let triangles: Vec<_> = g
@@ -51,7 +82,25 @@ impl Plane {
             .filter(|(_, f)| **f == face)
             .map(|(t, _)| t)
             .collect();
-        let first = triangles.first()?;
+        let reference_triangle;
+        let first = if let Some(first) = triangles.first() {
+            *first
+        } else {
+            let shell = g.shell.as_ref()?;
+            if shell.len() != g.face_count {
+                return None;
+            }
+            let truck_modeling::Surface::Plane(surface) = shell.get(face)?.oriented_surface()
+            else {
+                return None;
+            };
+            reference_triangle = [
+                surface.subs(0., 0.),
+                surface.subs(1., 0.),
+                surface.subs(0., 1.),
+            ];
+            &reference_triangle
+        };
         let normal = (first[1] - first[0]).cross(first[2] - first[0]);
         if normal.magnitude2() < 1e-20 {
             return None;
@@ -498,6 +547,7 @@ mod tests {
             grid_axes: false,
             cut_on_creation: false,
             project_to_base_plane: false,
+            plane: None,
         };
         let raw = Point3::new(1.12, -0.13, top);
         let unsnapped = point(
@@ -694,6 +744,162 @@ mod tests {
             .unwrap();
             assert_ne!(off.label, "Circle center");
             assert!(serde_json::to_value(&b).unwrap().get("circles").is_none());
+        }
+    }
+    #[test]
+    fn construction_planes_place_drawings_preserve_history_and_stay_out_of_exports() {
+        use crate::{components, model::Model, selection::SelectionMode};
+        use truck_modeling::Matrix4;
+        for rotation in [[0., 0., 0.], [90., 0., 0.], [0., 90., 0.], [17., 25., 35.]] {
+            let mut reference = Body::new(Shape::Rectangle);
+            reference.id = 1;
+            reference.construction = true;
+            reference.width = 6.;
+            reference.depth = 5.;
+            reference.position = [3., -2., 1.];
+            reference.rotation = rotation;
+            reference.scale = [1.5, 0.75, 2.];
+            let g = evaluate(&reference).unwrap();
+            assert!(g.triangles.is_empty() && !g.edges.is_empty());
+            let plane = Plane::reference(&reference).unwrap();
+            assert_eq!(plane.origin, Point3::from(reference.position));
+            assert!(plane.u.dot(plane.v).abs() < 1e-8);
+            assert!(
+                (plane.u.magnitude() - 1.).abs() < 1e-8
+                    && (plane.normal.magnitude() - 1.).abs() < 1e-8
+            );
+            assert!(g.points.iter().all(|p| plane.contains(*p)));
+            let inferred = Plane::face(&g, 0).unwrap();
+            assert!(inferred.normal.dot(plane.normal) > 1. - 1e-8);
+            let mut camera = Camera::default();
+            let scene = vec![(1, g.clone())];
+            camera.fit(&scene);
+            let rect = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(800., 600.));
+            let raw = plane.origin + plane.u * 0.2 + plane.v * 0.3;
+            let preferences = Preferences {
+                geometry: false,
+                plane: Some(1),
+                ..Default::default()
+            };
+            let snapped = point(
+                &scene,
+                &camera,
+                rect,
+                camera.project(raw, rect).0,
+                plane,
+                None,
+                &preferences,
+            )
+            .unwrap();
+            assert!(
+                (snapped.position - (plane.origin + plane.v * 0.5)).magnitude() < 1e-5,
+                "Grid uses the reference origin and world distances, not its display scale"
+            );
+            let a = plane.origin + plane.u * 0.5 + plane.v * 0.5;
+            let mut drawn = plane
+                .body(Shape::Circle, a, a + plane.u * 1.25, false)
+                .unwrap();
+            drawn.id = 2;
+            drawn.extrusion = 1.2;
+            assert!(!drawn.construction && drawn.bore.is_none());
+            assert!((Point3::from(drawn.position) - a).magnitude() < 1e-8);
+            let physical = evaluate(&drawn).unwrap();
+            assert!(physical.points.iter().all(|p| {
+                let d = (*p - a).dot(plane.normal);
+                (-1e-6..=1.2 + 1e-6).contains(&d)
+            }));
+            for format in crate::export::Format::ALL {
+                assert!(crate::export::encode(std::slice::from_ref(&reference), format).is_err());
+                let with =
+                    crate::export::encode(&[reference.clone(), drawn.clone()], format).unwrap();
+                let without = crate::export::encode(std::slice::from_ref(&drawn), format).unwrap();
+                if format != crate::export::Format::Step {
+                    assert_eq!(
+                        with, without,
+                        "Construction references cannot leak into an export"
+                    );
+                } else {
+                    let step = String::from_utf8(with).unwrap();
+                    assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 1);
+                    assert!(!step.contains("OPEN_SHELL("));
+                }
+            }
+            let mut model = Model::from_bodies(vec![reference.clone(), drawn.clone()]);
+            let moved = components::transformed(
+                &reference,
+                &g,
+                SelectionMode::Volume,
+                None,
+                Matrix4::from_translation(plane.normal * 2.),
+            )
+            .unwrap();
+            model.commit(moved.clone()).unwrap();
+            assert_eq!(
+                model.bodies[1], drawn,
+                "Drawings capture placement independently"
+            );
+            let moved_plane = Plane::reference(&moved).unwrap();
+            assert!((moved_plane.origin - plane.origin - plane.normal * 2.).magnitude() < 1e-8);
+            model.undo();
+            assert_eq!(model.bodies[0], reference);
+            model.redo();
+            assert_eq!(model.bodies[0], moved);
+            let mut project = Project::new(model.bodies.clone(), Camera::default(), true, Some(1));
+            project.drawing.plane = Some(1);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("construction.osk");
+            project.save(&path).unwrap();
+            assert_eq!(Project::load(&path).unwrap(), project);
+            let mut invalid = project.clone();
+            invalid.drawing.plane = Some(2);
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .contains("active construction plane")
+            );
+            let mut old = serde_json::to_value(&project).unwrap();
+            old["schema_version"] = 19.into();
+            old["modeling_version"] = 19.into();
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(
+                Project::load(&path)
+                    .unwrap_err()
+                    .contains("Construction planes require .osk version 20")
+            );
+            old["drawing"].as_object_mut().unwrap().remove("plane");
+            for body in old["bodies"].as_array_mut().unwrap() {
+                body.as_object_mut().unwrap().remove("construction");
+            }
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let legacy = Project::load(&path).unwrap();
+            assert!(
+                legacy.drawing.plane.is_none() && legacy.bodies.iter().all(|b| !b.construction)
+            );
+            let before = model.bodies.clone();
+            let scene = crate::model::evaluate_scene(&before).unwrap();
+            let mut operation = Body::new(Shape::Rectangle);
+            operation.boolean = Some(crate::booleans::Boolean::new(
+                crate::booleans::Kind::Subtract,
+                &[(1, None), (2, None)],
+                SelectionMode::Volume,
+                &scene,
+            ));
+            assert!(
+                model
+                    .commit(operation)
+                    .unwrap_err()
+                    .contains("Construction references cannot be Boolean operands")
+            );
+            assert_eq!(model.bodies, before);
+            let mut invalid = reference.clone();
+            invalid.extrusion = 1.;
+            assert!(model.commit(invalid).is_err());
+            assert_eq!(model.bodies, before);
+            model.delete(1).unwrap();
+            assert_eq!(model.bodies, vec![drawn]);
+            model.undo();
+            assert_eq!(model.bodies, before);
         }
     }
 }

@@ -268,7 +268,7 @@ mod tests {
             project::Project,
             viewport::Camera,
         };
-        use truck_modeling::{InnerSpace, Matrix4, Vector3};
+        use truck_modeling::{InnerSpace, Matrix4, Transform, Vector3};
         let mut a = Body::new(Shape::Rectangle);
         a.id = 1;
         a.extrusion = 2.;
@@ -344,7 +344,27 @@ mod tests {
             vertices.extend(components::vertices(&geometry, mode, Some(1)));
             vertices.sort_unstable();
             vertices.dedup();
+            if mode == SelectionMode::Face {
+                assert!(changed[0].component_edits[0].retrim);
+                for face in 0..geometry.face_count {
+                    let before = crate::snapping::Plane::face(&geometry, face).unwrap();
+                    let after = crate::snapping::Plane::face(&g, face).unwrap();
+                    let origin = if face < 2 {
+                        matrix.transform_point(before.origin)
+                    } else {
+                        before.origin
+                    };
+                    assert!((after.normal - before.normal).magnitude() < 1e-6);
+                    assert!(
+                        (after.origin - origin).dot(before.normal).abs() < 1e-6,
+                        "Each selected plane must move once; unselected planes stay fixed"
+                    );
+                }
+            }
             for (index, (before, after)) in geometry.points.iter().zip(&g.points).enumerate() {
+                if mode == SelectionMode::Face {
+                    continue;
+                }
                 let expected = *before
                     + if vertices.contains(&index) {
                         Vector3::new(0., 0., 0.25)

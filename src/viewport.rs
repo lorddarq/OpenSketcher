@@ -436,6 +436,8 @@ impl Viewport {
                                 && chosen.contains(&(*id, Some(g.edge_groups[index]))))
                         {
                             [0.35, 0.75, 1.]
+                        } else if bodies.iter().any(|b| b.id == *id && b.construction) {
+                            [0.8, 0.6, 0.3]
                         } else {
                             [0.55, 0.6, 0.65]
                         },
