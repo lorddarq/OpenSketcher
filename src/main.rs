@@ -387,6 +387,7 @@ impl OpenSketcher {
                 point,
                 selected,
                 preferences.geometry,
+                preferences.project_to_base_plane,
             )?
         };
         snapping::point(
@@ -564,21 +565,18 @@ impl eframe::App for OpenSketcher {
                 }
             });
         });
-        let mut preferences_changed = false;
         egui::Window::new("Drawing preferences")
             .open(&mut self.show_preferences).resizable(false).collapsible(false)
             .enabled(self.pending.is_none()).show(&ctx,|ui| {
                 ui.label("Saved with this project. New projects start with geometry/grid snapping on and cutting off.");
-                preferences_changed|=ui.checkbox(&mut self.drawing.geometry,"Snap to geometry").changed();
+                ui.checkbox(&mut self.drawing.geometry,"Snap to geometry");
                 ui.weak("Visible endpoints, midpoints, edges, and projected limits. Selected faces pin the drawing plane.");
-                preferences_changed|=ui.checkbox(&mut self.drawing.grid_axes,"Snap to grid and anchor axes").changed();
-                preferences_changed|=ui.checkbox(&mut self.drawing.cut_on_creation,"New profiles cut coplanar regions").changed();
+                ui.checkbox(&mut self.drawing.grid_axes,"Snap to grid and anchor axes");
+                ui.checkbox(&mut self.drawing.project_to_base_plane,"Project drawing to base XY plane");
+                ui.weak("Off by default. A selected planar face still takes priority.");
+                ui.checkbox(&mut self.drawing.cut_on_creation,"New profiles cut coplanar regions");
                 ui.weak("Off by default. Applies to new profiles only; existing cuts are retained. This is not a general solid Boolean tool.");
             });
-        if preferences_changed {
-            self.anchor = None;
-            self.construction = None;
-        }
         egui::Panel::bottom("status").show_inside(ui,|ui| {
             if let Some(e)=&self.error {ui.colored_label(egui::Color32::LIGHT_RED,e);}
             ui.label(match self.tool {
@@ -695,7 +693,7 @@ impl eframe::App for OpenSketcher {
                 if let Tool::Create(shape)=self.tool {
                     ui.heading(format!("Create {}",shape.label()));
                     ui.label(match shape { Shape::Rectangle=>"Pick opposite corners on the drawing plane.", Shape::Circle=>"Pick center, then a point on the radius.", Shape::Line=>"Pick the start and end points.", Shape::Semicircle=>"Pick the two diameter endpoints." });
-                    ui.weak("A selected planar face pins the plane; otherwise the first click captures a visible face with geometry snapping on.");
+                    ui.weak("A selected planar face pins the plane; otherwise the first click captures a visible planar face.");
                     ui.weak(if self.drawing.cut_on_creation {"New closed profiles cut older coplanar regions."}else{"New profiles are independent; automatic cutting is off."});
                     ui.weak(if self.anchor.is_some() {"Pick the second point. Escape cancels."}else{"Pick the first point in the viewport."});
                     if shape==Shape::Semicircle {ui.weak("The filled half-disc lies to the left of the directed diameter.");}

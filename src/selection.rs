@@ -55,7 +55,7 @@ pub fn surface_hit(
     rect: egui::Rect,
 ) -> Option<(f64, u64, usize)> {
     let (o, d) = camera.ray(p, rect);
-    scene
+    let hits: Vec<_> = scene
         .iter()
         .flat_map(|(id, g)| {
             g.triangles.iter().enumerate().filter_map(move |(i, t)| {
@@ -64,7 +64,12 @@ pub fn surface_hit(
                     .map(|depth| (depth, *id, g.triangle_faces[i]))
             })
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .collect();
+    let nearest = hits.iter().map(|hit| hit.0).min_by(f64::total_cmp)?;
+    // Prefer the latest profile only when surfaces are actually coincident.
+    hits.into_iter()
+        .filter(|hit| hit.0 <= nearest + 1e-7)
+        .max_by_key(|hit| (hit.1, hit.2))
 }
 
 pub fn visible(scene: &[(u64, Geometry)], camera: &Camera, p: Point3, rect: egui::Rect) -> bool {
@@ -91,7 +96,9 @@ pub fn pick(
     if mode == SelectionMode::Volume
         && let Some((depth, id, _)) = surface
     {
-        candidates.push((0., depth, id, None));
+        // A visible standalone line needs its screen-space acquisition radius
+        // even when it lies on a filled face; otherwise the face always wins.
+        candidates.push((6.5, depth, id, None));
     }
     for (id, g) in scene {
         if mode == SelectionMode::Point {
@@ -181,6 +188,26 @@ mod tests {
         };
         assert!((scene[0].1.points[index].z - 2.).abs() < 1e-6);
         assert!(!visible(&scene, &camera, Point3::new(0., 0., 0.), rect));
+        let mut profile = Body::new(Shape::Rectangle);
+        profile.width = 1.;
+        profile.depth = 1.;
+        profile.position[2] = 2.;
+        let overlaid = vec![
+            (1, evaluate(&body).unwrap()),
+            (2, evaluate(&profile).unwrap()),
+        ];
+        assert_eq!(
+            pick(&overlaid, &camera, center, rect, SelectionMode::Volume),
+            Some((2, None))
+        );
+        let mut line_on_face = Body::new(Shape::Line);
+        line_on_face.position[2] = 2.;
+        let mut with_line = overlaid;
+        with_line.push((3, evaluate(&line_on_face).unwrap()));
+        assert_eq!(
+            pick(&with_line, &camera, center, rect, SelectionMode::Volume),
+            Some((3, None))
+        );
         let line = Body::new(Shape::Line);
         let scene = vec![(2, evaluate(&line).unwrap())];
         assert!(pick(&scene, &camera, center, rect, SelectionMode::Face).is_none());

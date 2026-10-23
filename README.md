@@ -4,9 +4,9 @@ A Rust desktop application aiming to offer approachable 3D modeling with functio
 
 ## Current state
 
-Native editor with a depth-tested wgpu viewport, ground grid, world axes, and Truck-backed parametric geometry. Create rectangles, circles, lines, and semicircles using two picked points on the XY plane. Choose Volume, Face, Edge, or Point selection in the toolbar. Volume selection exposes automatic dimension, extrusion, position, rotation, and scale edits; component modes pick and highlight individual topology elements. Move and Rotate expose constrained gizmos in all four selection modes. Whole-object deletion and undo/redo are supported.
+Native editor with a depth-tested wgpu viewport, ground grid, world axes, and Truck-backed parametric geometry. Create rectangles, circles, lines, and semicircles using two picked points on a selected or visible planar face, with XY fallback. Choose Volume, Face, Edge, or Point selection in the toolbar. Volume selection exposes automatic dimension, extrusion, position, rotation, and scale edits; component modes pick and highlight individual topology elements. Move and Rotate expose constrained gizmos in all four selection modes. Whole-object deletion and undo/redo are supported.
 
-Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Import/export to other formats, solid boring, face-level push/pull, node editing, and transform gizmos are not implemented yet. There is no longer a demonstration cube.
+Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Import/export to other formats, solid boring, face-level push/pull, node editing, and a Scale gizmo are not implemented yet. There is no longer a demonstration cube.
 
 ## Feature checklist
 
@@ -14,9 +14,10 @@ Checked items are implemented; platform runtime verification is tracked separate
 
 ### Creation and modeling
 
-- [x] Canvas creation on the XY plane: rectangle corners, circle center/radius, line endpoints, semicircle diameter endpoints.
+- [x] Canvas creation on selected/visible planar faces or XY: rectangle corners, circle center/radius, line endpoints, semicircle diameter endpoints.
 - [x] Live creation preview and Escape cancellation.
-- [x] Default-on 0.5-unit grid snapping and X/Y alignment to the creation anchor.
+- [x] Default-on geometry snapping (visible endpoints, edge midpoints, edges, projected limits) plus 0.5-unit grid and anchor alignment on the captured plane.
+- [x] Project drawing preferences; base-XY projection and automatic coplanar cutting are opt-in. Existing cuts retain their saved intent.
 - [x] Automatic numeric dimension, position, Euler rotation, and local scale editing.
 - [x] Straight local +Z extrusion: closed profiles to solids, lines to surfaces.
 - [x] Coplanar closed-profile partitioning: holes, edge notches, disconnected remaining regions, and new cut walls.
@@ -25,12 +26,12 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [x] Whole-object deletion and grouped session undo/redo.
 - [ ] Regular polygons and additional arc/freehand/rotated-rectangle tools.
 - [ ] Circle Radius field and radius preview label (canvas input is already center/radius; properties still display diameter).
-- [ ] Face-first sketching on a selected support face, including elevated faces and contextual reference points.
+- [ ] Persistent parent-linked sketches, expanded contextual point/center overlays, and an explicit support-plane indicator (fixed placement on selected/elevated faces works).
 - [ ] Open-line face partitioning and exact analytic curved intersections (split curves currently use polygon approximations).
 - [ ] Dedicated face-normal push/pull and component scaling (component movement/rotation are implemented).
 - [ ] Negative extrusion, mirrored scaling, and a canvas Scale gizmo.
 - [ ] Explicit X/Y/Z axis locks and labeled axis-inference feedback during drawing/moving.
-- [ ] Existing-geometry endpoint, midpoint, face, and intersection snapping.
+- [ ] Geometry-intersection snapping and analytic center references (endpoints, midpoints, edges, and projected limits are implemented).
 - [ ] Borer-only and generator-plus-borer operations, including pockets, through-cuts, and separate emerging bodies.
 - [ ] Persistent semantic face/edge references for dependent modeling features.
 - [ ] Whole-face NURBS/deformation-preserving movement and control-node soft selection with falloff, radius, and heatmap.
@@ -75,16 +76,30 @@ Camera basis and isometric foreshortening have a runnable regression check in `c
 
 ## Creation and editing
 
-1. Choose **Rectangle**, **Circle**, **Line**, or **Semicircle**, then click two points on the XY construction plane. Use Top or Isometric; Side views the plane edge-on.
+1. Choose **Rectangle**, **Circle**, **Line**, or **Semicircle**, then click two points on the drawing plane. A selected planar face pins the support; otherwise the first click captures a visible planar face, with XY as fallback. Side views support vertical faces too.
 2. Rectangles use opposite corners; circles use center then radius; lines use endpoints; semicircles use diameter endpoints. Semicircles create a filled half-disc to the left of the directed diameter.
-3. The first point anchors a green outline preview. The second commits one creation action. Escape cancels the preview without adding geometry. Snapping is on by default: 0.5-unit grid plus X/Y alignment near the first point. This does not yet include existing-geometry endpoint snapping.
+3. The first point anchors a green outline preview. The second commits one creation action. Escape cancels the preview without adding geometry. Snapping is on by default: visible geometry references plus a 0.5-unit grid and anchor alignment in the captured plane. Geometry targets take priority over grid rounding, so an exact non-grid corner stays exact. The plane remains fixed until commit/cancel, including when the pointer leaves the face or Snap is disabled.
 4. Choose **Select** and click an object, or use the model list. Selected geometry is highlighted. Dimension, extrusion, position, Euler rotation, and local-axis scale values regenerate geometry automatically—there is no Apply or Revert Fields action.
 5. Extrusion follows the profile's local +Z. Filled profiles create solids; lines create surfaces. Rotation and scaling pivot at the profile center (the center of a semicircle's diameter).
 6. Use **Undo / Redo** or Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z. A continuous numeric drag or text edit is grouped as one undo action. Delete selected geometry with the inspector button or Delete/Backspace outside a text field. History retains up to 100 actions per session.
 
-Input validation rejects invalid dimensions or geometry and keeps the last valid object. Current supported dimensions are 0.01–100 units, extrusion zero or 0.01–100, and positive scale 0.01–100. Negative extrusion and mirrored scaling are not yet supported. Objects are not automatically fused. Newer coplanar closed profiles partition older profiles before extrusion, as described below.
+Input validation rejects invalid dimensions or geometry and keeps the last valid object. Current supported dimensions are 0.01–100 units, extrusion zero or 0.01–100, and positive scale 0.01–100. Negative extrusion and mirrored scaling are not yet supported. Objects are not automatically fused. New profiles are independent by default. Explicitly cutting coplanar profiles partition older profiles before extrusion, as described below.
 
 The document stores authored parameters independently of GPU data. One Truck evaluator serves creation, live edits, and previews. Tessellated faces and sampled boundary edges feed rendering and picking; editing does not modify triangles directly. The regression check exercises all four profiles, two-point dimensions, extrusion, transformations, grouped live-edit history, invalid-input rejection, and deletion recovery.
+
+## Drawing preferences and geometry snapping
+
+Use **Preferences** to configure this project's drawing defaults. **Snap to geometry** and **Snap to grid and anchor axes** start enabled; the Tools **Snap** checkbox temporarily disables both. Turning Snap off does not change an already captured plane or force a hovered face back to XY.
+
+A selected planar face always takes priority. Otherwise the first point uses the visible planar face under the pointer; nearby visible boundaries can acquire a silhouette just outside it. Endpoint, midpoint, and edge targets use screen-space tolerances and actual evaluated geometry, including extrusion and component edits. Visible boundary coordinates can also project alignment limits across the active plane, with a labeled marker and guide. Hidden base geometry and references off the captured plane are excluded. Curved/nonplanar support faces report an error rather than pretending to be XY.
+
+**Project drawing to base XY plane** is off by default. Enable it explicitly for world-plane placement through/under visible geometry; a selected face still wins. Placement settings apply when a sketch starts, and its plane stays locked during the gesture.
+
+**New profiles cut coplanar regions** is also off by default. It sets cutting intent on new closed profiles only; it does not change existing shapes. Each closed profile exposes **Cut older coplanar profiles** in its inspector for an undoable per-profile change. This is the existing coplanar-profile partition operation, not a general solid Boolean or an imprint on an arbitrary solid face.
+
+The settings and individual `cuts_profiles` flags persist in `.osk` version 4. Modeling versions 2–3 migrate with cutting flags enabled to preserve existing cuts; version 1 keeps its original independent profiles. Newly drawn profiles still default to independent geometry. A profile placed on a face saves its exact position/orientation but does not follow future parent edits as an attached sketch.
+
+Selected flat profiles use a separate coplanar display pass to avoid flickering against the supporting face. This leaves saved geometry and picking at the actual surface depth. Coincident picking prefers the newer profile without selecting hidden geometry through the solid.
 
 ## Selection modes
 
@@ -95,7 +110,7 @@ The document stores authored parameters independently of GPU data. One Truck eva
 
 Face, Edge, and Point support Move/Rotate gizmos for the selected component; adjacent boundaries rebuild to remain connected. Whole-object numeric properties and deletion remain in Volume mode. Changing mode clears the previous selection but keeps Move/Rotate active. Completed component transforms retain their selection, and undo/redo preserves it when its topology slot still exists. Empty-space clicks clear selection within the current mode. Occluded components are not selectable through opaque faces. Edge/point acquisition uses screen-space tolerances so zoom does not shrink the click target.
 
-`.osk` schema/modeling version 3 also preserves component-transform matrices and guarded topology references. Source connectivity must match before replay; an upstream edit that changes it is rejected rather than targeting another component. Files migrated from modeling version 1 reset component selection to Volume because partitioning changes topology slots. This guard is not a general semantic naming system for arbitrary CAD feature histories.
+`.osk` schema/modeling version 4 preserves drawing preferences and cutting intent alongside component-transform matrices and guarded topology references. Source connectivity must match before replay; an upstream edit that changes it is rejected rather than targeting another component. Files migrated from modeling version 1 reset component selection to Volume because partitioning changes topology slots. This guard is not a general semantic naming system for arbitrary CAD feature histories.
 
 ## Save and open projects
 
@@ -138,7 +153,7 @@ The initial goals are modeling, scene management, texture-only materials, and ba
 
 The [soft-selection specification](docs/specs/soft-selection.md) defines behavior for node falloff, deformation previews, heatmap feedback, and editable project persistence.
 
-The planned [face-first sketching workflow](docs/specs/face-sketching.md) requires selecting a supporting face before drawing on it, exposing contextual references, and displaying circle radius consistently. The [Plasticity/SketchUp research](docs/research/face-sketching-workflows.md) separates documented product behavior from OpenSketcher's chosen rules. Current creation remains XY-only until this work is implemented.
+The [face-sketching workflow](docs/specs/face-sketching.md) now supports fixed placement on selected or visible planar faces, including extruded top/side faces, with geometry snapping. Expanded contextual overlays, persistent parent attachment, and consistent Radius inspector/readout remain pending. The [Plasticity/SketchUp research](docs/research/face-sketching-workflows.md) separates reference behavior from OpenSketcher's chosen rules.
 
 Resolve the topology and document format around the first modeling workflow before adding more tools. SketchUp file compatibility is not assumed.
 
@@ -205,4 +220,4 @@ Component edits retain the source profile plus ordered local transform matrices 
 
 Component edits on a profile that cuts another region are currently rejected; Volume transforms of that cutting profile remain available. Topology-changing edits and deletions that invalidate saved component references are rejected without replacing the last valid scene. General semantic CAD feature references and exact curved-surface reconstruction remain pending.
 
-Closed shapes drawn over older coplanar profiles now split their regions. Extruding the surrounding profile excludes the newer regions and creates walls along their boundaries; those inner regions retain their own height. This supports holes, boundary notches, and cuts that divide a profile. Open-line splitting and sketches on elevated solid faces remain pending. See the [.osk modeling rules](docs/formats/osk.md#coplanar-region-evaluation-modeling-version-2), including curved-boundary approximation and older-file migration.
+Closed profiles with **Cut older coplanar profiles** enabled split older coplanar regions. New profiles leave this off by default. Extruding the surrounding profile excludes the newer regions and creates walls along their boundaries; those inner regions retain their own height. This supports holes, boundary notches, and cuts that divide a profile. Open-line splitting and persistent attached-face dependencies remain pending; fixed sketches on elevated planar faces work. See the [.osk modeling rules](docs/formats/osk.md#coplanar-region-evaluation-modeling-version-2), including curved-boundary approximation and older-file migration.

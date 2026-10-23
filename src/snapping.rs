@@ -14,6 +14,7 @@ pub struct Preferences {
     pub geometry: bool,
     pub grid_axes: bool,
     pub cut_on_creation: bool,
+    pub project_to_base_plane: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -21,6 +22,7 @@ impl Default for Preferences {
             geometry: true,
             grid_axes: true,
             cut_on_creation: false,
+            project_to_base_plane: false,
         }
     }
 }
@@ -189,22 +191,27 @@ pub fn acquire_plane(
     pointer: Pos2,
     selected: Option<(u64, usize)>,
     geometry: bool,
+    base_plane: bool,
 ) -> Result<Plane, String> {
     if let Some((owner, face)) = selected {
         return scene.iter().find(|(id,_)|*id==owner).and_then(|(_,g)|Plane::face(g,face))
             .ok_or_else(||"Drawing requires a planar support face. Select a planar face or clear the selection.".into());
     }
+    if base_plane {
+        return Ok(Plane::ground());
+    }
+    // Choosing a support face is placement, not snapping; disabling Snap must
+    // not silently move drawing back to the ground plane.
+    if let Some((_, owner, face)) = selection::surface_hit(scene, camera, pointer, rect) {
+        return scene
+            .iter()
+            .find(|(id, _)| *id == owner)
+            .and_then(|(_, g)| Plane::face(g, face))
+            .ok_or_else(|| {
+                "This surface is not planar. Select a planar support face before drawing.".into()
+            });
+    }
     if geometry {
-        if let Some((_, owner, face)) = selection::surface_hit(scene, camera, pointer, rect) {
-            return scene
-                .iter()
-                .find(|(id, _)| *id == owner)
-                .and_then(|(_, g)| Plane::face(g, face))
-                .ok_or_else(|| {
-                    "This surface is not planar. Select a planar support face before drawing."
-                        .into()
-                });
-        }
         // Acquire silhouettes just outside a face too, using its visible boundary.
         let nearby = targets(scene, camera, rect, pointer, None);
         for target in &nearby {
@@ -351,7 +358,7 @@ mod tests {
             .copied()
             .unwrap();
         let pointer = camera.project(corner, rect).0 + eframe::egui::vec2(2., 2.);
-        let plane = acquire_plane(&scene, &camera, rect, pointer, None, true).unwrap();
+        let plane = acquire_plane(&scene, &camera, rect, pointer, None, true, false).unwrap();
         assert!(
             plane.contains(corner),
             "plane {plane:?}, corner {corner:?}, visible {}, targets {}",
@@ -416,13 +423,35 @@ mod tests {
                 .iter()
                 .all(|p| (p.z - top).abs() < 1e-6)
         );
-        let pinned =
-            acquire_plane(&scene, &camera, rect, Pos2::ZERO, Some((1, face)), false).unwrap();
+        let no_snap_plane = acquire_plane(
+            &scene,
+            &camera,
+            rect,
+            camera.project(Point3::new(1.2, -0.7, top), rect).0,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(no_snap_plane.contains(corner));
+        let base = acquire_plane(&scene, &camera, rect, rect.center(), None, true, true).unwrap();
+        assert_eq!(base.origin.z, 0.);
+        let pinned = acquire_plane(
+            &scene,
+            &camera,
+            rect,
+            Pos2::ZERO,
+            Some((1, face)),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(pinned.contains(corner));
         let disabled = Preferences {
             geometry: false,
             grid_axes: false,
             cut_on_creation: false,
+            project_to_base_plane: false,
         };
         let raw = Point3::new(1.12, -0.13, top);
         let unsnapped = point(
@@ -445,8 +474,16 @@ mod tests {
             .find(|(t, _)| t.iter().all(|p| (p.x - 2.85).abs() < 1e-7))
             .map(|(_, face)| *face)
             .unwrap();
-        let plane =
-            acquire_plane(&scene, &camera, rect, rect.center(), Some((1, side)), true).unwrap();
+        let plane = acquire_plane(
+            &scene,
+            &camera,
+            rect,
+            rect.center(),
+            Some((1, side)),
+            true,
+            false,
+        )
+        .unwrap();
         let patch = plane
             .body(
                 Shape::Rectangle,
@@ -505,5 +542,13 @@ mod tests {
         assert!(old.bodies.iter().all(|b| b.cuts_profiles));
         assert!(!old.drawing.cut_on_creation);
         assert!((area(&evaluate_scene(&old.bodies).unwrap()[0].1) - 13.51).abs() < 1e-6);
+        legacy["schema_version"] = 1.into();
+        legacy["modeling_version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("selection_mode");
+        legacy.as_object_mut().unwrap().remove("selected_element");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let original = Project::load(&path).unwrap();
+        assert!(original.bodies.iter().all(|b| !b.cuts_profiles));
+        assert!((area(&evaluate_scene(&original.bodies).unwrap()[0].1) - 15.51).abs() < 1e-6);
     }
 }

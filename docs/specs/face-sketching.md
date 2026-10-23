@@ -1,13 +1,13 @@
 # Face-first sketching and circle creation
 
-Status: behavior requirements and proposed implementation sequence; not implemented.
+Status: fixed placement on selected/visible planar faces and geometry snapping implemented; attached dependencies, expanded reference overlays, and Radius presentation remain pending.
 Date: 2026-10-23.
 Related: [workflow research](../research/face-sketching-workflows.md), [soft selection](soft-selection.md), [product scope](../product-scope.md).
 
 ## Confirmed behavior
 
 - Circle creation is driven on the canvas: pick a center point, move the mouse to set radius, then click to finish. Radius, not diameter, is the user-facing creation measurement.
-- Drawing on existing geometry requires the user to select the supporting face first. Hovering over another face must not silently change the support.
+- A selected supporting face pins the plane. Without one, the first click can capture a visible planar face (updated drawing behavior); subsequent hovering over other faces must not silently change the captured support.
 - Selecting that face exposes its relevant points and boundary references so the user can position the new shape accurately.
 - Snapping starts enabled. The canvas preview and numeric controls must describe the same geometry.
 
@@ -20,7 +20,7 @@ The precise shortcut choices, point display policy, face-boundary handling, and 
 3. Display the support explicitly, for example `Sketch plane: Object 3 / selected face`, with a local-axis indicator.
 4. The selected face establishes a plane origin, orthonormal U/V axes, and normal N. These are geometric plane axes, not necessarily the raw NURBS parameter directions, which need not represent equal physical distances.
 5. Starting a sketch captures this support. Orbiting or hovering over other faces does not change it. Offer an explicit Align view action; selecting a face alone need not move the camera.
-6. A world-plane sketch remains available without a selected face. Indicate the active plane explicitly; never present a ground-plane result as though it were attached to a hovered face.
+6. A world-plane sketch remains available through the opt-in base-XY preference or when no visible support is acquired. Indicate the active plane explicitly; never present a ground-plane result as though it were attached to a hovered face.
 
 The initial support implementation should accept analytically planar faces, including translated, rotated, and scaled planar faces. A curved NURBS face is not a plane. Do not substitute the plane of one display triangle or average its normals. Report curved support as unsupported initially. Tangent-plane sketching and projecting a curve onto a curved surface are separate future operations with different geometry semantics.
 
@@ -77,34 +77,17 @@ Current `.osk` component selection slots are explicitly selection state, not per
 
 A fixed world-plane sketch and an attached face sketch must remain distinguishable after reopening. Save/Load cannot silently detach the profile, replace the support with XY, or recompute the plane from whichever triangle happens to be first.
 
-## Current code gaps and minimum sequence
+## Current implementation and remaining work
 
-Verified by repository inspection:
+- [x] Existing mouse circle gesture uses center plus radius internally; authored `width` remains diameter.
+- [x] Shared selected/visible-face plane capture and plane-local creation for rectangle, circle, line, and semicircle.
+- [x] Elevated/vertical planar faces, orthonormal support frames, fixed-plane preview/cancellation, and explicit edge-on/nonplanar errors.
+- [x] Depth-aware endpoint/midpoint/edge and projected-limit snapping plus plane-local grid/anchor alignment, with target labels and guides.
+- [x] Exact fixed pose persists through position/rotation in `.osk` version 4; preferences and cutting intent also persist.
+- [x] New profiles are independent by default. Optional coplanar cuts remain explicit and do not imply arbitrary solid-face imprint.
+- [ ] Radius inspector/readout conversion and numeric radius entry during creation.
+- [ ] Dedicated selected-support reference-point/center overlay, explicit plane identity, and Align view.
+- [ ] Stable parent/support dependencies that carry the sketch when its parent changes. Current face placement remains independent world-space geometry.
+- [ ] Arbitrary face imprint, Boolean cutting, and exact curved-surface sketching.
 
-- `Body::from_points(Circle, ...)` already computes twice the center-to-cursor distance as the stored diameter. The basic mouse gesture exists.
-- Circle inspector and preview currently display width/diameter, rather than the requested radius.
-- `creation_point` uses `Camera::ground`, so all points are projected onto XY regardless of selected face.
-- Creation does not capture a support face/frame, and `Body::from_points` is XY-specific.
-- Point markers are drawn in Point selection mode, not as contextual references for a selected support face.
-- Evaluated geometry retains face/edge/vertex grouping, but not a reusable planar support frame or stable attached-sketch dependency.
-
-Implement in this order:
-
-1. Reuse the existing circle gesture and correct the Radius inspector/readout through unit conversion, with a compatibility check for old files.
-2. Carry the selected planar face into the creation context; expose its references and derive its local frame from kernel geometry.
-3. Replace the hard-coded ground intersection with support-plane intersection and local-coordinate creation, shared by compatible shape tools.
-4. Add contextual snapping and support feedback, with cancellation and edge-on handling.
-5. Add stable parent/support references and `.osk` migration before shipping attached-profile persistence.
-6. Implement imprint/split or targeted profile operations separately; do not claim that plane placement alone enables a pocket or borer.
-
-## Acceptance cases
-
-- A circle created with a 3-unit center-to-pointer distance shows Radius 3 and evaluates to diameter 6. Changing Radius to 4 gives diameter 8 automatically.
-- Existing saved circles retain their size when the UI changes from Diameter to Radius.
-- Select a raised, rotated planar face, activate Circle, and observe only its relevant points/references. Both clicks and the entire preview remain on that face's plane.
-- Hover across another face during radius definition: the support remains fixed.
-- Snap to a selected face vertex/midpoint/analytic center with visible target feedback; no unintended off-plane displacement occurs.
-- Edge-on or curved support produces an explicit explanation and preserves the current scene.
-- Escape cancels the circle preview without losing the support or adding history; commit and undo/redo operate as one action.
-- Reopen an attached profile, edit the parent's transform, and confirm the profile follows; invalidate its support and receive a dependency error rather than silent reassignment.
-- Coplanar profile placement is visibly distinct from an imprinted region or solid cut.
+The attachment and contextual-display sections above describe the remaining intended behavior, not shipped dependencies. With no explicit selected face, initial visible-face acquisition avoids accidental projection to an extruded object's base. Preferences expose base-XY projection and automatic coplanar cutting separately; both are off by default. Snap can be disabled without changing support-face placement or an already captured plane.

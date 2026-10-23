@@ -118,12 +118,12 @@ impl Project {
             project.selection_mode = SelectionMode::Volume;
             project.selected_element = None;
         }
-        if (1..=3).contains(&project.schema_version) || (1..=3).contains(&project.modeling_version)
-        {
-            // Previous evaluators cut with every later closed profile. Preserve those
-            // existing relationships; new profiles still default to non-cutting.
+        if (1..=3).contains(&project.modeling_version) {
+            // Modeling v1 had independent profiles; v2/v3 automatically partitioned.
+            // Preserve the source evaluator's geometry rather than imposing a new default.
+            let cuts = matches!(project.modeling_version, 2 | 3);
             for body in &mut project.bodies {
-                body.cuts_profiles = true;
+                body.cuts_profiles = cuts;
             }
         }
         project.validate()?;
@@ -201,14 +201,15 @@ mod tests {
         }
         let mut legacy = serde_json::to_value(&project).unwrap();
         legacy["schema_version"] = 1.into();
+        legacy["modeling_version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("drawing");
+        for body in legacy["bodies"].as_array_mut().unwrap() {
+            body.as_object_mut().unwrap().remove("cuts_profiles");
+        }
         legacy.as_object_mut().unwrap().remove("selection_mode");
         legacy.as_object_mut().unwrap().remove("selected_element");
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let mut migrated = project.clone();
-        for body in &mut migrated.bodies {
-            body.cuts_profiles = true;
-        }
-        assert_eq!(Project::load(&path).unwrap(), migrated);
+        assert_eq!(Project::load(&path).unwrap(), project);
         let mut model = Model::from_bodies(restored.bodies);
         let mut edit = model.bodies[0].clone();
         edit.width = 5.;

@@ -177,9 +177,11 @@ pub struct Viewport {
     pub scene: Vec<(u64, Geometry)>,
     state: egui_wgpu::RenderState,
     triangles: wgpu::RenderPipeline,
+    profile_overlay: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
     triangle_count: u32,
+    overlay_start: u32,
     vertex_count: u32,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
@@ -189,6 +191,27 @@ pub struct Viewport {
         egui::TextureId,
         [u32; 2],
     )>,
+}
+
+// Selected standalone profiles need a coplanar display pass, not a change to
+// authored positions. Keep source geometry and picking at their exact depth.
+fn triangle_order(
+    bodies: &[Body],
+    scene: &[(u64, Geometry)],
+    selected: Option<u64>,
+) -> (Vec<usize>, u32) {
+    let overlay = bodies
+        .iter()
+        .find(|b| Some(b.id) == selected && b.extrusion == 0.)
+        .map(|b| b.id);
+    let mut order: Vec<_> = (0..scene.len()).collect();
+    order.sort_by_key(|index| Some(scene[*index].0) == overlay);
+    let start = scene
+        .iter()
+        .filter(|(id, _)| Some(*id) != overlay)
+        .map(|(_, g)| g.triangles.len() as u32 * 3)
+        .sum();
+    (order, start)
 }
 
 fn bytes(values: &[f32]) -> Vec<u8> {
@@ -234,7 +257,7 @@ impl Viewport {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = |topology| {
+        let pipeline = |topology, bias| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Depth-tested viewport"),
                 layout: Some(&pipeline_layout),
@@ -264,11 +287,7 @@ impl Viewport {
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: Default::default(),
                     bias: wgpu::DepthBiasState {
-                        constant: if topology == wgpu::PrimitiveTopology::TriangleList {
-                            2
-                        } else {
-                            0
-                        },
+                        constant: bias,
                         ..Default::default()
                     },
                 }),
@@ -277,8 +296,9 @@ impl Viewport {
                 cache: None,
             })
         };
-        let triangles = pipeline(wgpu::PrimitiveTopology::TriangleList);
-        let lines = pipeline(wgpu::PrimitiveTopology::LineList);
+        let triangles = pipeline(wgpu::PrimitiveTopology::TriangleList, 2);
+        let profile_overlay = pipeline(wgpu::PrimitiveTopology::TriangleList, 0);
+        let lines = pipeline(wgpu::PrimitiveTopology::LineList, 0);
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 24,
@@ -291,9 +311,11 @@ impl Viewport {
             scene: Vec::new(),
             state,
             triangles,
+            profile_overlay,
             lines,
             vertices,
             triangle_count,
+            overlay_start: 0,
             vertex_count,
             uniform,
             bind,
@@ -314,7 +336,9 @@ impl Viewport {
             data.extend([p.x as f32, p.y as f32, p.z as f32]);
             data.extend(c);
         };
-        for (id, g) in &scene {
+        let (order, overlay_start) = triangle_order(bodies, &scene, selected);
+        for index in order {
+            let (id, g) = &scene[index];
             for (index, tri) in g.triangles.iter().enumerate() {
                 let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize();
                 let shade =
@@ -376,6 +400,7 @@ impl Viewport {
         }
         self.vertex_count = (data.len() / 6) as u32;
         self.triangle_count = triangle_count;
+        self.overlay_start = overlay_start;
         self.vertices = self
             .state
             .device
@@ -484,7 +509,9 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.set_pipeline(&self.triangles);
-            pass.draw(0..self.triangle_count, 0..1);
+            pass.draw(0..self.overlay_start, 0..1);
+            pass.set_pipeline(&self.profile_overlay);
+            pass.draw(self.overlay_start..self.triangle_count, 0..1);
             pass.set_pipeline(&self.lines);
             pass.draw(self.triangle_count..self.vertex_count, 0..1);
         }
@@ -501,6 +528,26 @@ mod tests {
     }
     #[test]
     fn presets_have_orthonormal_axes_and_isometric_foreshortening() {
+        let mut solid = Body::new(crate::model::Shape::Rectangle);
+        solid.id = 2;
+        solid.extrusion = 2.;
+        let mut profile = Body::new(crate::model::Shape::Rectangle);
+        profile.id = 1;
+        profile.position[2] = 2.;
+        let bodies = vec![profile, solid];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let (order, start) = triangle_order(&bodies, &scene, Some(1));
+        assert_eq!(order, vec![1, 0]);
+        assert_eq!(start, scene[1].1.triangles.len() as u32 * 3);
+        let (order, start) = triangle_order(&bodies, &scene, Some(2));
+        assert_eq!(order, vec![0, 1]);
+        assert_eq!(
+            start,
+            scene
+                .iter()
+                .map(|(_, g)| g.triangles.len() as u32 * 3)
+                .sum::<u32>()
+        );
         let mut camera = Camera::default();
         for view in [View::Isometric, View::Top, View::Side] {
             camera.preset(view);
