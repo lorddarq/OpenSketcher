@@ -61,6 +61,17 @@ This is confirmed modeling scope; implementation sequencing follows the initial 
 - Retain the selected operation mode, source profile/support reference, target body reference, direction, and total travel as editable feature inputs. Keep the modified target and emerging body identifiable as distinct outputs of that feature, and recompute them together after parameter changes or reopening.
 - Required subtraction and exit-region construction are part of the first milestone's kernel evaluation. Arbitrary path sweeps, general-purpose Boolean tools, and automatic merging with neighboring solids remain deferred. Multiple targets, intervening gaps, and uneven exit surfaces need explicit semantics before extending beyond the initial single-target, planar-exit case.
 
+### Chamfer and bevel modifiers (pending)
+
+- [ ] **Chamfer:** select the face to chamfer, then apply the Chamfer modifier to that face.
+- [ ] **Bevel:** select the face to bevel, then apply the Bevel modifier to that face.
+- [ ] Keep both modifiers parametric: expose editable parameters and regenerate the result when values change automatically.
+- [ ] Allow removing either modifier and regenerate the model without that operation, retaining the underlying source geometry.
+- [ ] Save modifier type, parameters, order, and source-face references in `.osk` so modifiers remain editable and removable after reopening.
+- [ ] Support undo/redo for adding, editing, and removing modifiers; reject invalid results without replacing valid geometry.
+
+These are face-selected operations. The exact affected boundary edges, chamfer distance controls, and bevel profile/segment controls still need definition before implementation. Chamfer and bevel remain separately named modifiers in the UI.
+
 ### Axis snapping
 
 - Infer alignment to the world X, Y, and Z axes from the current operation's anchor.
@@ -169,3 +180,17 @@ Regression checks cover all selection modes for movement/rotation across all fou
 - [x] Per-profile cutting intent and schema/modeling version 4 persistence with legacy cut preservation.
 - [x] Coplanar selected-profile display without model-space offsets; coincident picking favors the newer profile.
 - [ ] Geometry-intersection/analytic-center snapping, full contextual reference overlays, persistent attached-face dependencies, and arbitrary solid-face imprint/Boolean operations.
+
+## Geometry export
+
+- [x] Native export menu/dialogs: STL, GLB, STEP, DXF; atomic destination replacement.
+- [x] Export evaluated scene transforms, partitioned profiles, and component edits.
+- [x] Binary STL with closed-solid checks; GLB faces/lines and body names.
+- [x] Faceted STEP solids/surfaces through Truck; DXF 3DFACEs/LINE entities.
+- [x] Explicit initial unit mapping: one scene unit is one millimeter; GLB uses meters and Y-up.
+- [ ] Exact analytic/NURBS STEP, CAD curves and assemblies.
+- [ ] Additional major interchange formats: 3MF, OBJ, PLY, IGES.
+- [ ] Configurable export units and tessellation tolerance.
+- [ ] External application acceptance: slicers, CAD tools, Blender.
+
+Exports are interchange copies; `.osk` retains parametric editing. Unsupported geometry is rejected where it would otherwise disappear (STL lines/sheets, STEP standalone lines). See README for format limitations.

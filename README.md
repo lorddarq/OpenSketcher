@@ -1,12 +1,20 @@
 # OpenSketcher
 
+[![Desktop build](https://github.com/lorddarq/OpenSketcher/actions/workflows/desktop.yml/badge.svg?branch=main)](https://github.com/lorddarq/OpenSketcher/actions/workflows/desktop.yml)
+[![Rust](https://img.shields.io/badge/language-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#desktop-distribution)
+[![Latest tag](https://img.shields.io/github/v/tag/lorddarq/OpenSketcher?label=version)](https://github.com/lorddarq/OpenSketcher/tags)
+
 A Rust desktop application aiming to offer approachable 3D modeling with functionality overlapping SketchUp. Independent project; no affiliation with SketchUp or Trimble.
+
+Release notes: [Changelog](CHANGELOG.md). Unsigned development builds are available from the [Desktop workflow](https://github.com/lorddarq/OpenSketcher/actions/workflows/desktop.yml).
 
 ## Current state
 
 Native editor with a depth-tested wgpu viewport, ground grid, world axes, and Truck-backed parametric geometry. Create rectangles, circles, lines, and semicircles using two picked points on a selected or visible planar face, with XY fallback. Choose Volume, Face, Edge, or Point selection in the toolbar. Volume selection exposes automatic dimension, extrusion, position, rotation, and scale edits; component modes pick and highlight individual topology elements. Move and Rotate expose constrained gizmos in all four selection modes. Whole-object deletion and undo/redo are supported.
 
-Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Import/export to other formats, solid boring, face-level push/pull, node editing, and a Scale gizmo are not implemented yet. There is no longer a demonstration cube.
+Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Model import, solid boring, face-level push/pull, node editing, and a Scale gizmo are not implemented yet. There is no longer a demonstration cube.
 
 ## Feature checklist
 
@@ -33,6 +41,9 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [ ] Explicit X/Y/Z axis locks and labeled axis-inference feedback during drawing/moving.
 - [ ] Geometry-intersection snapping and analytic center references (endpoints, midpoints, edges, and projected limits are implemented).
 - [ ] Borer-only and generator-plus-borer operations, including pockets, through-cuts, and separate emerging bodies.
+- [ ] Chamfer modifier: select a face, apply chamfer, edit its parameters, or remove it while retaining the source geometry.
+- [ ] Bevel modifier: select a face, apply bevel, edit its parameters, or remove it while retaining the source geometry.
+- [ ] Persist chamfer/bevel modifiers and their face references in `.osk`; support undo/redo for adding, editing, and removing them.
 - [ ] Persistent semantic face/edge references for dependent modeling features.
 - [ ] Whole-face NURBS/deformation-preserving movement and control-node soft selection with falloff, radius, and heatmap.
 
@@ -56,8 +67,26 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [x] macOS/Windows/Linux build and development-package workflow (unsigned executables; macOS app bundle).
 - [x] Native macOS review of core creation/editing, viewport, persistence, and split-extrusion workflows.
 - [ ] Windows and Linux native runtime verification.
-- [ ] Model import/export and SketchUp file compatibility.
+- [x] Export evaluated geometry to binary STL, GLB, faceted STEP, and DXF.
+- [ ] Exact analytic/NURBS STEP export; CAD curve entities and named assemblies.
+- [ ] Additional major 3D interchange formats for printers, CAD tools, and Blender (3MF, OBJ, PLY, IGES).
+- [ ] Model import and SketchUp file compatibility.
 - [ ] Signed/notarized releases, installers, Linux desktop integration, application icons, and release publishing.
+
+## Export
+
+Use **Export…** in the header and choose STL, GLB, STEP, or DXF. Native dialogs choose the destination; exports replace files atomically. The whole committed model is exported with current transforms, profile cuts, and component edits. Finish previews and correct invalid fields first. Export does not change the document or its saved state.
+
+For this first version, **1 scene unit = 1 millimeter**. STL carries numeric millimeter coordinates (STL has no unit metadata); DXF declares millimeters; Truck STEP declares millimeters; GLB converts to meters and maps scene Z-up to glTF Y-up.
+
+| Format | Output and limits |
+| --- | --- |
+| STL | Binary triangle mesh for printing; requires closed solids and rejects standalone lines/sheets. Separate overlapping solids are not unioned; check the result in a slicer. |
+| GLB | glTF 2.0 binary file, one named node per body, triangle faces and boundary lines, neutral double-sided material. Suitable for Blender import. |
+| STEP | Truck-generated boundary representation rebuilt from evaluated triangles: closed solids (including separate connected regions) and open surfaces. Curves are faceted; standalone lines are rejected with guidance to use DXF/GLB. |
+| DXF | ASCII AutoCAD 2000 entities: triangular 3DFACEs and LINE boundaries on per-body layers. Curves are sampled, and faces are not CAD solids. |
+
+All formats use the current viewport tessellation tolerance, not a configurable manufacturing tolerance. Textures, scene cameras, and parametric feature history are not included. Keep `.osk` as the editable source. Exact CAD geometry and further common interchange formats remain on the checklist. File structure and geometry checks run in the Rust suite. Native macOS review verified the export menu, save dialog, and a three-body GLB output without changing the document; acceptance in external slicers/CAD applications and Blender remains pending.
 
 ## Editor layout
 
@@ -172,6 +201,7 @@ Versions below are resolved from Cargo.lock. The full direct/transitive inventor
 | [serde](https://github.com/serde-rs/serde) | 1.0.229 | Scene serialization traits and derives | Erick Tryzelaar, David Tolnay, and Serde contributors | MIT OR Apache-2.0 |
 | [serde_json](https://github.com/serde-rs/json) | 1.0.154 | `.osk` JSON encoding/decoding | serde_json contributors | MIT OR Apache-2.0 |
 | [tempfile](https://github.com/Stebalien/tempfile) | 3.27.0 | Same-directory temporary files for atomic saves | Copyright © 2015 Steven Allen; tempfile contributors | MIT OR Apache-2.0 |
+| [truck-stepio](https://github.com/ricosjp/truck) | 0.3.0 | STEP serialization of evaluated CAD boundaries | RICOS Co. Ltd. and Truck contributors | Apache-2.0 |
 | [truck-modeling](https://github.com/ricosjp/truck) | 0.6.0 | Parametric profiles, topology, transforms, and extrusion | RICOS Co. Ltd. and Truck contributors | Apache-2.0 |
 | [truck-meshalgo](https://github.com/ricosjp/truck) | 0.4.0 | Tessellation for rendering and picking | RICOS Co. Ltd. and Truck contributors | Apache-2.0 |
 

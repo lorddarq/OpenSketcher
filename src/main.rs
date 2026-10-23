@@ -2,6 +2,7 @@
 
 use eframe::egui;
 mod components;
+mod export;
 mod gizmo;
 mod model;
 mod project;
@@ -121,6 +122,57 @@ impl OpenSketcher {
     }
     fn dirty(&self) -> bool {
         self.snapshot() != self.saved
+    }
+    fn export(&mut self, format: export::Format) {
+        if self.transform.is_some()
+            || self.anchor.is_some()
+            || self
+                .draft
+                .as_ref()
+                .is_some_and(|b| !self.model.bodies.contains(b))
+        {
+            self.error = Some(
+                "Finish or cancel the preview and correct invalid properties before exporting."
+                    .into(),
+            );
+            return;
+        }
+        self.model.finish_edit();
+        let extension = format.extension();
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .unwrap_or_else(|| std::ffi::OsStr::new("Untitled"))
+            .to_string_lossy();
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter(format.label(), &[extension])
+            .set_file_name(format!("{name}.{extension}"));
+        if let Some(parent) = self.path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(extension))
+        {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!(".{extension}"));
+            path = PathBuf::from(name);
+            if path.exists()
+                && rfd::MessageDialog::new()
+                    .set_title("Replace export?")
+                    .set_description(format!("Replace {}?", path.display()))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    != rfd::MessageDialogResult::Yes
+            {
+                return;
+            }
+        }
+        self.error = export::save(&self.model.bodies, format, &path).err();
     }
     fn save(&mut self, save_as: bool) -> bool {
         if self.transform.is_some() {
@@ -544,6 +596,15 @@ impl eframe::App for OpenSketcher {
                 if ui.button("Save As…").clicked() {
                     self.save(true);
                 }
+                ui.menu_button("Export…", |ui| {
+                    ui.label("1 scene unit = 1 mm");
+                    for format in export::Format::ALL {
+                        if ui.button(format.label()).clicked() {
+                            ui.close();
+                            self.export(format);
+                        }
+                    }
+                });
                 if ui.button("Preferences").clicked() {
                     self.show_preferences = !self.show_preferences;
                 }

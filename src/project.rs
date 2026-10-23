@@ -138,25 +138,27 @@ impl Project {
         if bytes.len() as u64 > MAX_BYTES {
             return Err("Project exceeds the 16 MiB file limit.".into());
         }
-        // Same-directory temporary files permit atomic replacement on the destination filesystem.
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| format!("Cannot create temporary project: {e}"))?;
-        temporary
-            .write_all(&bytes)
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|e| format!("Cannot write project: {e}"))?;
-        temporary.persist(path).map_err(|e| {
-            format!(
-                "Cannot replace project; previous file preserved: {}",
-                e.error
-            )
-        })?;
-        Ok(())
+        write_atomic(path, &bytes)
     }
+}
+
+/// Replace only after the complete output has been written and synced.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // Same-directory temporary files permit atomic replacement on the destination filesystem.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Cannot create temporary file: {e}"))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| format!("Cannot write file: {e}"))?;
+    temporary
+        .persist(path)
+        .map_err(|e| format!("Cannot replace file; previous file preserved: {}", e.error))?;
+    Ok(())
 }
 
 #[cfg(test)]

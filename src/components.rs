@@ -260,7 +260,7 @@ fn map_geometry(g: &mut Geometry, matrix: Matrix4) {
 
 // Truck tessellates neighboring analytic surfaces independently. Reconcile tiny local-space
 // projection differences against shared boundary samples before and after deformation.
-fn weld_geometry(g: &mut Geometry) {
+pub fn weld_geometry(g: &mut Geometry) {
     let mut buckets: HashMap<[i64; 3], Vec<Point3>> = HashMap::new();
     for p in g
         .points
@@ -293,6 +293,10 @@ fn weld_geometry(g: &mut Geometry) {
 }
 
 fn validate_boundary(g: &Geometry, closed: bool) -> Result<(), String> {
+    boundary_shell(g, closed).map(|_| ())
+}
+
+pub fn boundary_shell(g: &Geometry, closed: bool) -> Result<Shell, String> {
     if g.points
         .iter()
         .chain(g.edges.iter().flatten())
@@ -359,7 +363,7 @@ fn validate_boundary(g: &Geometry, closed: bool) -> Result<(), String> {
                 .map_err(|e| format!("Component transform would open or tear the body: {e}"))?;
         }
     }
-    Ok(())
+    Ok(shell)
 }
 
 #[cfg(test)]
