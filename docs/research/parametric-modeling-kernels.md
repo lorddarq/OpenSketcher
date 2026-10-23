@@ -1,10 +1,10 @@
 # Parametric face modeling: kernel comparison
 
-Research date: 2026-10-23. This is a source review, not a compiled evaluation. No kernel dependency or implementation has been added.
+Research date: 2026-10-23. The comparison below records the initial source review. Implementation update: Truck modeling and tessellation now drive the basic creation/editing controls, with a runnable geometry/history check. Boring and persistent face-reference behavior still require the validation cases below.
 
 ## Decision and research recommendation
 
-The user selected Truck on 2026-10-23. Proceed with Truck; the validation cases below now guide implementation rather than gate a pending product decision. No compiled kernel evaluation has been completed yet. The alternative kernels remain research context, not planned parallel implementations.
+The user selected Truck on 2026-10-23. Proceed with Truck; the validation cases below now guide implementation rather than gate a pending product decision. The basic profile/extrusion evaluator has since been compiled and tested; this does not validate the complete boring milestone. The alternative kernels remain research context, not planned parallel implementations.
 
 Evaluate Truck first for planar profiles, editable dimensions, and the newly confirmed boring behavior below. Keep the authored feature definitions authoritative and regenerate boundary representation (B-rep) and viewport triangles from them. Truck provides extrusion building blocks, but adopting it now also requires proving subtraction and exit-region construction; extrusion alone no longer meets the milestone. Writing another geometry kernel is unnecessary.
 

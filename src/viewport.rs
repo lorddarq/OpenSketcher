@@ -1,9 +1,11 @@
-use eframe::{egui, egui_wgpu, wgpu};
-use wgpu::util::DeviceExt;
 use crate::model::{Body, Geometry, evaluate};
-use truck_modeling::{Point3, Vector3, InnerSpace};
+use eframe::{egui, egui_wgpu, wgpu};
+use serde::{Deserialize, Serialize};
+use truck_modeling::{InnerSpace, Point3, Vector3};
+use wgpu::util::DeviceExt;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum View {
     Isometric,
     Top,
@@ -11,6 +13,8 @@ pub enum View {
     Free,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Camera {
     pub view: View,
     yaw: f32,
@@ -34,6 +38,21 @@ impl Default for Camera {
 }
 
 impl Camera {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self
+            .target
+            .iter()
+            .chain([&self.yaw, &self.pitch, &self.span])
+            .all(|v| v.is_finite())
+            || !(0.05..=1000000.).contains(&self.span)
+            || self.target.iter().any(|v| v.abs() > 1000000.)
+            || self.yaw.abs() > 1000000.
+            || self.pitch.abs() > std::f32::consts::FRAC_PI_2 + 1e-5
+        {
+            return Err("Invalid camera properties.".into());
+        }
+        Ok(())
+    }
     pub fn preset(&mut self, view: View) {
         self.view = view;
         (self.yaw, self.pitch) = match view {
@@ -56,34 +75,73 @@ impl Camera {
         ]
     }
 
-    pub fn ray(&self, point: egui::Pos2, rect: egui::Rect) -> (Point3,Vector3) {
-        let [r,u,b]=self.basis();
-        let x=(point.x-rect.center().x)*self.span/rect.height().max(1.);
-        let y=(rect.center().y-point.y)*self.span/rect.height().max(1.);
-        let p=std::array::from_fn::<_,3,_>(|i| (self.target[i]+r[i]*x+u[i]*y+b[i]*self.span*50.) as f64);
-        (Point3::from(p),-Vector3::from(b.map(f64::from)))
+    pub fn project(&self, p: Point3, rect: egui::Rect) -> (egui::Pos2, f32) {
+        let [r, u, b] = self.basis();
+        let a = [
+            p.x as f32 - self.target[0],
+            p.y as f32 - self.target[1],
+            p.z as f32 - self.target[2],
+        ];
+        let dot = |v: [f32; 3]| a.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        (
+            egui::pos2(
+                rect.center().x + dot(r) * rect.height() / self.span,
+                rect.center().y - dot(u) * rect.height() / self.span,
+            ),
+            dot(b),
+        )
     }
-    pub fn ground(&self, point:egui::Pos2, rect:egui::Rect) -> Option<[f64;3]> {
-        let (o,d)=self.ray(point,rect);
-        if d.z.abs()<1e-5 { return None; }
-        let t=-o.z/d.z;
-        (t>=0.).then(||(o+d*t).into())
+    pub fn ray(&self, point: egui::Pos2, rect: egui::Rect) -> (Point3, Vector3) {
+        let [r, u, b] = self.basis();
+        let x = (point.x - rect.center().x) * self.span / rect.height().max(1.);
+        let y = (rect.center().y - point.y) * self.span / rect.height().max(1.);
+        let p = std::array::from_fn::<_, 3, _>(|i| {
+            (self.target[i] + r[i] * x + u[i] * y + b[i] * self.span * 50.) as f64
+        });
+        (Point3::from(p), -Vector3::from(b.map(f64::from)))
     }
-    pub fn fit(&mut self, scene:&[(u64,Geometry)]) {
-        let points:Vec<_>=scene.iter().flat_map(|(_,g)|g.edges.iter().flatten()).collect();
-        if points.is_empty() { *self=Self::default(); return; }
-        let low=std::array::from_fn::<_,3,_>(|i|points.iter().map(|p|p[i]).fold(f64::INFINITY,f64::min));
-        let high=std::array::from_fn::<_,3,_>(|i|points.iter().map(|p|p[i]).fold(f64::NEG_INFINITY,f64::max));
-        self.target=std::array::from_fn(|i|((low[i]+high[i])/2.) as f32);
-        self.span=(0..3).map(|i|high[i]-low[i]).fold(0.5,f64::max) as f32*2.5;
+    pub fn ground(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
+        let (o, d) = self.ray(point, rect);
+        if d.z.abs() < 1e-5 {
+            return None;
+        }
+        let t = -o.z / d.z;
+        (t >= 0.).then(|| (o + d * t).into())
+    }
+    pub fn fit(&mut self, scene: &[(u64, Geometry)]) {
+        let points: Vec<_> = scene
+            .iter()
+            .flat_map(|(_, g)| g.edges.iter().flatten())
+            .collect();
+        if points.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        let low = std::array::from_fn::<_, 3, _>(|i| {
+            points.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min)
+        });
+        let high = std::array::from_fn::<_, 3, _>(|i| {
+            points
+                .iter()
+                .map(|p| p[i])
+                .fold(f64::NEG_INFINITY, f64::max)
+        });
+        self.target = std::array::from_fn(|i| ((low[i] + high[i]) / 2.) as f32);
+        self.span = (0..3).map(|i| high[i] - low[i]).fold(0.5, f64::max) as f32 * 2.5;
     }
     pub fn interact(&mut self, response: &egui::Response, ui: &egui::Ui, orbit: bool) {
         let delta = ui.input(|i| i.pointer.delta());
-        if orbit && response.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.modifiers.shift) {
+        if orbit
+            && response.dragged_by(egui::PointerButton::Primary)
+            && !ui.input(|i| i.modifiers.shift)
+        {
             self.yaw -= delta.x * 0.008;
             self.pitch = (self.pitch + delta.y * 0.008).clamp(-1.56, 1.56);
             self.view = View::Free;
-        } else if response.dragged_by(egui::PointerButton::Middle) || response.dragged_by(egui::PointerButton::Secondary) || (response.dragged() && ui.input(|i|i.modifiers.shift)) {
+        } else if response.dragged_by(egui::PointerButton::Middle)
+            || response.dragged_by(egui::PointerButton::Secondary)
+            || (response.dragged() && ui.input(|i| i.modifiers.shift))
+        {
             let [right, up, _] = self.basis();
             let scale = self.span / response.rect.height().max(1.0);
             for axis in 0..3 {
@@ -92,13 +150,13 @@ impl Camera {
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.span = (self.span * (-scroll * 0.003).exp()).clamp(0.5, 100.0);
+            self.span = (self.span * (-scroll * 0.003).exp()).clamp(0.05, 100000.0);
         }
     }
 }
 
 pub struct Viewport {
-    pub scene: Vec<(u64,Geometry)>,
+    pub scene: Vec<(u64, Geometry)>,
     state: egui_wgpu::RenderState,
     triangles: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
@@ -203,9 +261,14 @@ impl Viewport {
         };
         let triangles = pipeline(wgpu::PrimitiveTopology::TriangleList);
         let lines = pipeline(wgpu::PrimitiveTopology::LineList);
-        let vertices = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 24, usage: wgpu::BufferUsages::VERTEX, mapped_at_creation: false });
-        let triangle_count=0;
-        let vertex_count=0;
+        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 24,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let triangle_count = 0;
+        let vertex_count = 0;
         Self {
             scene: Vec::new(),
             state,
@@ -220,59 +283,122 @@ impl Viewport {
         }
     }
 
-    pub fn update(&mut self, bodies:&[Body], selected:Option<u64>) -> Result<(),String> {
-        let scene:Vec<_>=bodies.iter().map(|b|evaluate(b).map(|g|(b.id,g))).collect::<Result<_,_>>()?;
-        let mut data=Vec::new();
-        let mut vertex=|p:Point3,c:[f32;3]| { data.extend([p.x as f32,p.y as f32,p.z as f32]);data.extend(c); };
-        for (id,g) in &scene {
+    pub fn update(&mut self, bodies: &[Body], selected: Option<u64>) -> Result<(), String> {
+        let scene: Vec<_> = bodies
+            .iter()
+            .map(|b| evaluate(b).map(|g| (b.id, g)))
+            .collect::<Result<_, _>>()?;
+        let mut data = Vec::new();
+        let mut vertex = |p: Point3, c: [f32; 3]| {
+            data.extend([p.x as f32, p.y as f32, p.z as f32]);
+            data.extend(c);
+        };
+        for (id, g) in &scene {
             for tri in &g.triangles {
-                let n=(tri[1]-tri[0]).cross(tri[2]-tri[0]).normalize();
-                let shade=(0.45+0.4*n.dot(Vector3::new(0.3,-0.4,0.85).normalize()).abs()) as f32;
-                let color=if Some(*id)==selected {[shade*0.55,shade*0.8,shade]} else {[shade*0.88,shade*0.95,shade]};
-                for p in tri { vertex(*p,color); }
+                let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize();
+                let shade =
+                    (0.45 + 0.4 * n.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs()) as f32;
+                let color = if Some(*id) == selected {
+                    [shade * 0.55, shade * 0.8, shade]
+                } else {
+                    [shade * 0.88, shade * 0.95, shade]
+                };
+                for p in tri {
+                    vertex(*p, color);
+                }
             }
         }
-        let triangle_count=(data.len()/6) as u32;
-        let mut vertex=|p:Point3,c:[f32;3]| { data.extend([p.x as f32,p.y as f32,p.z as f32]);data.extend(c); };
+        let triangle_count = (data.len() / 6) as u32;
+        let mut vertex = |p: Point3, c: [f32; 3]| {
+            data.extend([p.x as f32, p.y as f32, p.z as f32]);
+            data.extend(c);
+        };
         for n in -10..=10 {
-            for p in [[n as f64,-10.,0.],[n as f64,10.,0.],[-10.,n as f64,0.],[10.,n as f64,0.]] {vertex(p.into(),[0.20,0.23,0.27]);}
+            for p in [
+                [n as f64, -10., -0.002],
+                [n as f64, 10., -0.002],
+                [-10., n as f64, -0.002],
+                [10., n as f64, -0.002],
+            ] {
+                vertex(p.into(), [0.20, 0.23, 0.27]);
+            }
         }
-        for (end,c) in [([4.,0.,0.],[0.9,0.25,0.25]),([0.,4.,0.],[0.3,0.8,0.4]),([0.,0.,4.],[0.3,0.55,1.])] {vertex(Point3::new(0.,0.,0.),c);vertex(end.into(),c);}
-        for (id,g) in &scene { for edge in &g.edges { for p in edge { vertex(*p,if Some(*id)==selected {[0.35,0.75,1.]} else {[0.55,0.6,0.65]}); } } }
-        self.vertex_count=(data.len()/6) as u32;
-        self.triangle_count=triangle_count;
-        self.vertices=self.state.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {label:Some("Editable model"),contents:&bytes(&data),usage:wgpu::BufferUsages::VERTEX});
-        self.scene=scene;
+        for (end, c) in [
+            ([4., 0., 0.], [0.9, 0.25, 0.25]),
+            ([0., 4., 0.], [0.3, 0.8, 0.4]),
+            ([0., 0., 4.], [0.3, 0.55, 1.]),
+        ] {
+            vertex(Point3::new(0., 0., 0.), c);
+            vertex(end.into(), c);
+        }
+        for (id, g) in &scene {
+            for edge in &g.edges {
+                for p in edge {
+                    vertex(
+                        *p,
+                        if Some(*id) == selected {
+                            [0.35, 0.75, 1.]
+                        } else {
+                            [0.55, 0.6, 0.65]
+                        },
+                    );
+                }
+            }
+        }
+        self.vertex_count = (data.len() / 6) as u32;
+        self.triangle_count = triangle_count;
+        self.vertices = self
+            .state
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Editable model"),
+                contents: &bytes(&data),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.scene = scene;
         Ok(())
     }
 
-    pub fn pick(&self, camera:&Camera, point:egui::Pos2, rect:egui::Rect)->Option<u64> {
-        let (o,d)=camera.ray(point,rect);
-        let mut nearest=f64::INFINITY;
-        let mut hit=None;
-        for (id,g) in &self.scene {
+    pub fn pick(&self, camera: &Camera, point: egui::Pos2, rect: egui::Rect) -> Option<u64> {
+        let (o, d) = camera.ray(point, rect);
+        let mut nearest = f64::INFINITY;
+        let mut hit = None;
+        for (id, g) in &self.scene {
             for tri in &g.triangles {
-                let e1=tri[1]-tri[0]; let e2=tri[2]-tri[0]; let h=d.cross(e2);let det=e1.dot(h);
-                if det.abs()<1e-10 {continue;}
-                let s=o-tri[0];let u=s.dot(h)/det;let q=s.cross(e1);let v=d.dot(q)/det;let t=e2.dot(q)/det;
-                if u>=0. && v>=0. && u+v<=1. && t>=0. && t<nearest {nearest=t;hit=Some(*id);}
+                let e1 = tri[1] - tri[0];
+                let e2 = tri[2] - tri[0];
+                let h = d.cross(e2);
+                let det = e1.dot(h);
+                if det.abs() < 1e-10 {
+                    continue;
+                }
+                let s = o - tri[0];
+                let u = s.dot(h) / det;
+                let q = s.cross(e1);
+                let v = d.dot(q) / det;
+                let t = e2.dot(q) / det;
+                if u >= 0. && v >= 0. && u + v <= 1. && t >= 0. && t < nearest {
+                    nearest = t;
+                    hit = Some(*id);
+                }
             }
         }
         // Lines have no face to intersect: pick their screen-space segment within six pixels,
         // while rejecting segments behind the nearest face.
-        let [r,u,b]=camera.basis();
-        let project=|p:Point3| {
-            let a=[p.x as f32-camera.target[0],p.y as f32-camera.target[1],p.z as f32-camera.target[2]];
-            let dot=|v:[f32;3]|a.iter().zip(v).map(|(a,b)|a*b).sum::<f32>();
-            (egui::pos2(rect.center().x+dot(r)*rect.height()/camera.span,rect.center().y-dot(u)*rect.height()/camera.span),dot(b))
-        };
-        for (id,g) in &self.scene {
-            if !g.triangles.is_empty() {continue;}
-            for [a,bp] in &g.edges {
-                let (a,za)=project(*a);let (b,zb)=project(*bp);let ab=b-a;
-                let t=((point-a).dot(ab)/ab.length_sq().max(1e-8)).clamp(0.,1.);
-                let depth=camera.span as f64*50.-(za+(zb-za)*t) as f64;
-                if point.distance(a+ab*t)<=6. && depth<=nearest+1e-5 {nearest=depth;hit=Some(*id);}
+        for (id, g) in &self.scene {
+            if !g.triangles.is_empty() {
+                continue;
+            }
+            for [a, bp] in &g.edges {
+                let (a, za) = camera.project(*a, rect);
+                let (b, zb) = camera.project(*bp, rect);
+                let ab = b - a;
+                let t = ((point - a).dot(ab) / ab.length_sq().max(1e-8)).clamp(0., 1.);
+                let depth = camera.span as f64 * 50. - (za + (zb - za) * t) as f64;
+                if point.distance(a + ab * t) <= 6. && depth <= nearest + 1e-5 {
+                    nearest = depth;
+                    hit = Some(*id);
+                }
             }
         }
         hit
@@ -391,6 +517,18 @@ mod tests {
             assert!(dot(r, u).abs() < 1e-5 && dot(r, b).abs() < 1e-5 && dot(u, b).abs() < 1e-5);
             if view == View::Isometric {
                 assert!((b[0] - b[1]).abs() < 1e-5 && (b[1] - b[2]).abs() < 1e-5);
+            }
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.));
+            if view == View::Side {
+                assert!(camera.ground(rect.center(), rect).is_none());
+            } else {
+                let point = Point3::new(2., -1., 0.);
+                let projected = camera.project(point, rect).0;
+                let recovered = camera.ground(projected, rect).unwrap();
+                assert!(
+                    (recovered[0] - point.x).abs() < 0.001
+                        && (recovered[1] - point.y).abs() < 0.001
+                );
             }
             if view == View::Top {
                 assert!((b[2] - 1.).abs() < 1e-5);

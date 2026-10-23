@@ -24,7 +24,9 @@ The following are initial implementation assumptions, not a claim that the full 
 
 ### Shapes and editing
 
-- Create lines, rectangles, circles, and regular polygons on a construction plane.
+- Create lines, rectangles, circles, semicircles, and regular polygons on a construction plane. Initial implemented tools cover lines, rectangles, circles, and semicircles; regular polygons remain pending.
+- Define creation by picked points: opposite rectangle corners, line endpoints, circle center/radius, and semicircle diameter endpoints. Show a preview after the first point; commit on the second. Snapping is enabled by default.
+- Numeric property changes apply automatically, with undo/redo instead of Apply or Revert Fields actions. Group one continuous field edit into one undo action.
 - Select geometry, move it, edit dimensions, and delete it.
 - Show a live preview while drawing or editing; Escape cancels without changing committed geometry.
 - Support numeric dimensions as well as pointer input.
@@ -123,7 +125,7 @@ Projects must save to an OpenSketcher-specific native format and reopen with the
 5. Attempt to open corrupt, invalid-reference, and unsupported-version files; confirm that the current project remains intact.
 6. When textures ship, move the project to another machine without the source images and verify that assigned textures still load.
 
-Leave runnable round-trip and failure-path checks with the persistence implementation. The format extension and container encoding remain implementation decisions: choose the smallest versioned representation that satisfies this contract, and document it before writing real project files.
+Leave runnable round-trip and failure-path checks with the persistence implementation. The selected extension is `.osk`. The initial implementation uses versioned UTF-8 JSON; see the [file format](formats/osk.md) for its current schema, included properties, safe-write behavior, and limits.
 
 ## Reference and icons
 
@@ -133,4 +135,4 @@ Use [Tabler Icons](https://tabler.io/icons), outline style, for application icon
 
 ## Current implementation boundary
 
-The repository contains an editor shell, desktop build workflow, and a working depth-tested wgpu viewport with a demonstration cube, grid, axes, camera navigation, and quick view presets. Modeling, picking, and persistence behavior above is not implemented yet. Truck integration is still pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
+The repository contains an editor shell, desktop build workflow, and a depth-tested wgpu viewport with Truck-backed geometry. Implemented controls include two-point XY creation for rectangles/circles/lines/semicircles, grid/axis alignment snapping enabled by default, whole-object picking, automatic numeric dimension/extrusion/position/rotation/scale editing, deletion, and session undo/redo. The model starts empty. GPU geometry is derived from authored parameters. Versioned `.osk` Save/Load preserves all currently implemented scene properties and editable parameters, with native dialogs and unsaved-change protection. Regular polygons, face-level editing, boring, node deformation, and transform gizmos remain pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
