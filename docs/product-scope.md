@@ -61,18 +61,18 @@ This is confirmed modeling scope; implementation sequencing follows the initial 
 - Retain the selected operation mode, source profile/support reference, target body reference, direction, and total travel as editable feature inputs. Keep the modified target and emerging body identifiable as distinct outputs of that feature, and recompute them together after parameter changes or reopening.
 - Required subtraction and exit-region construction are part of the first milestone's kernel evaluation. Arbitrary path sweeps, general-purpose Boolean tools, and automatic merging with neighboring solids remain deferred. Multiple targets, intervening gaps, and uneven exit surfaces need explicit semantics before extending beyond the initial single-target, planar-exit case.
 
-### Chamfer and bevel modifiers (pending)
+### Chamfer and bevel modifiers (initial implementation)
 
-See the [behavior and implementation preparation](specs/face-modifiers.md) for verified integration points, proposed geometry semantics, sequencing, and acceptance checks.
+See [modifier behavior and limitations](specs/face-modifiers.md) for geometry semantics, integration points, and acceptance checks.
 
-- [ ] **Chamfer:** select the face to chamfer, then apply the Chamfer modifier to that face.
-- [ ] **Bevel:** select the face to bevel, then apply the Bevel modifier; let the user choose rounded or flat/segmented style per modifier. Keep the style editable and persist it in `.osk`.
-- [ ] Keep both modifiers parametric: expose editable parameters and regenerate the result when values change automatically.
-- [ ] Allow removing either modifier and regenerate the model without that operation, retaining the underlying source geometry.
-- [ ] Save modifier type, parameters, order, and source-face references in `.osk` so modifiers remain editable and removable after reopening.
-- [ ] Support undo/redo for adding, editing, and removing modifiers; reject invalid results without replacing valid geometry.
+- [x] **Chamfer:** select the face to chamfer, then apply the Chamfer modifier to that face.
+- [x] **Bevel:** select the face to bevel, then apply the Bevel modifier; let the user choose rounded or flat/segmented style per modifier. Keep the style editable and persist it in `.osk`.
+- [x] Keep both modifiers parametric: expose editable parameters and regenerate the result when values change automatically.
+- [x] Allow removing either modifier and regenerate the model without that operation, retaining the underlying source geometry.
+- [x] Save modifier type, parameters, order, and source-face references in `.osk` so modifiers remain editable and removable after reopening.
+- [x] Support undo/redo for adding, editing, and removing modifiers; reject invalid results without replacing valid geometry.
 
-These are face-selected operations. The exact affected boundary edges, chamfer distance controls, and bevel profile/segment controls still need definition before implementation. Chamfer and bevel remain separately named modifiers in the UI.
+Supported faces: all six faces of rectangular solids and top/bottom caps of circular/semicircular extrusions. Circular rims can also be selected in Edge mode. A bevel band and base surface are logical faces; tessellation subdivisions are not displayed or selectable. Cylinder rim geometry uses analytic revolutions; noncircular rounded strips are approximated. Partitioned profiles and component-deformed bodies remain pending.
 
 ### Axis snapping
 
@@ -152,7 +152,7 @@ Use [Tabler Icons](https://tabler.io/icons), outline style, for application icon
 
 ## Current implementation boundary
 
-The repository contains an editor shell, desktop build workflow, and a depth-tested wgpu viewport with Truck-backed geometry. Implemented controls include two-point XY creation for rectangles/circles/lines/semicircles, grid/axis alignment snapping enabled by default, Volume/Face/Edge/Point picking and highlighting, automatic whole-object numeric dimension/extrusion/position/rotation/scale editing, deletion, and session undo/redo. The model starts empty. GPU geometry is derived from authored parameters. Versioned `.osk` Save/Load preserves all currently implemented scene properties and editable parameters, with native dialogs and unsaved-change protection. Move/Rotate gizmos now edit Volume/Face/Edge/Point selections with saved component transforms and guarded topology references. Regular polygons, dedicated push/pull, boring, node deformation, exact curved component reconstruction, and a Scale gizmo remain pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
+The repository contains an editor shell, desktop build workflow, and a depth-tested wgpu viewport with Truck-backed geometry. Implemented controls include two-point XY creation for rectangles/circles/lines/semicircles, grid/axis alignment snapping enabled by default, Volume/Face/Edge/Point picking and highlighting, automatic whole-object numeric dimension/extrusion/position/rotation/scale editing, deletion, and session undo/redo. The model starts empty. GPU geometry is derived from authored parameters. Versioned `.osk` Save/Load preserves all currently implemented scene properties and editable parameters, with native dialogs and unsaved-change protection. Move/Rotate gizmos now edit Volume/Face/Edge/Point selections with saved component transforms and guarded topology references. Attached-profile boring and separate emerging bodies are implemented for supported primitive faces; general face-region push/pull, regular polygons, node deformation, exact curved component reconstruction, and a Scale gizmo remain pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
 
 ### Coplanar region splitting
 
@@ -196,3 +196,23 @@ Regression checks cover all selection modes for movement/rotation across all fou
 - [ ] External application acceptance: slicers, CAD tools, Blender.
 
 Exports are interchange copies; `.osk` retains parametric editing. Unsupported geometry is rejected where it would otherwise disappear (STL lines/sheets, STEP standalone lines). See README for format limitations.
+
+## Multiple selection
+
+- [x] Shift-click toggles visible volumes, faces, edges, or points; plain click replaces and empty plain click clears.
+- [x] Shift-drag remains pan; Shift-click empty space preserves selection.
+- [x] Model-list Shift-click for volumes; count and group delete controls.
+- [x] Group Move/Rotate with a shared pivot, union component transforms, and transactional undo/redo.
+- [x] Version-5 persistence of all picks and union component references; legacy primary selection remains compatible.
+- [ ] Applying face modifiers to multiple selected faces in one action.
+
+## Circle face operations
+
+- [x] Analytic center/rim snapping on intact circular profiles, elevated cylinder caps, and chamfer/bevel rims, including transformed/nonuniformly scaled sources.
+- [ ] Margin-based solid cut interaction, explicit target/depth, and editable subtraction (confirmed gesture: circle center on an existing rim).
+
+See [circle face behavior and reference tools](specs/circle-face-operations.md). Snapping and solid cut intent are separate; current extrusion is still generation.
+
+## Geometric operator roadmap
+
+See [geometric operator research, behavior, and gap checklist](specs/geometric-operators.md). The initial planar Offset face edits supported primitive source dimensions and preserves the opposite plane; it is distinct from general face Move/Rotate, face-region extrusion, and solid boring.

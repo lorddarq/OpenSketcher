@@ -116,6 +116,7 @@ pub struct SnapPoint {
     pub plane: Plane,
     pub label: &'static str,
     pub guide: Option<[Point3; 2]>,
+    pub owner: Option<u64>,
 }
 struct Target {
     point: Point3,
@@ -124,6 +125,39 @@ struct Target {
     priority: u8,
     distance: f32,
 }
+fn on_circle(
+    circle: &crate::model::CircularEdge,
+    camera: &Camera,
+    rect: Rect,
+    pointer: Pos2,
+) -> Point3 {
+    // Orthographic screen projection of an affine circle is an ellipse. Minimize
+    // screen distance on its analytic curve rather than snapping to mesh chords.
+    let center = camera.project(circle.center, rect).0;
+    let u = camera.project(circle.center + circle.u, rect).0 - center;
+    let v = camera.project(circle.center + circle.v, rect).0 - center;
+    let delta = center - pointer;
+    let at = |t: f64| delta + u * (t.cos() as f32) + v * (t.sin() as f32);
+    let mut angle = (0..32)
+        .map(|i| i as f64 * std::f64::consts::TAU / 32.)
+        .min_by(|a, b| at(*a).length_sq().total_cmp(&at(*b).length_sq()))
+        .unwrap();
+    for _ in 0..12 {
+        let tangent = -u * (angle.sin() as f32) + v * (angle.cos() as f32);
+        let second = -u * (angle.cos() as f32) - v * (angle.sin() as f32);
+        let denominator = tangent.length_sq() + at(angle).dot(second);
+        if denominator.abs() < 1e-8 {
+            break;
+        }
+        let step = (at(angle).dot(tangent) / denominator).clamp(-0.25, 0.25) as f64;
+        angle -= step;
+        if step.abs() < 1e-8 {
+            break;
+        }
+    }
+    circle.center + circle.u * angle.cos() + circle.v * angle.sin()
+}
+
 fn targets(
     scene: &[(u64, Geometry)],
     camera: &Camera,
@@ -148,8 +182,18 @@ fn targets(
         }
     };
     for (owner, g) in scene {
+        for circle in &g.circles {
+            add(circle.center, *owner, "Circle center", 0, 10.);
+            add(
+                on_circle(circle, camera, rect, pointer),
+                *owner,
+                "Circle rim",
+                1,
+                8.,
+            );
+        }
         for point in &g.points {
-            add(*point, *owner, "Endpoint", 0, 10.);
+            add(*point, *owner, "Endpoint", 1, 10.);
         }
         let mut lengths = vec![0.; g.edge_count];
         for (edge, group) in g.edges.iter().zip(&g.edge_groups) {
@@ -164,7 +208,7 @@ fn targets(
                     edge[0] + (edge[1] - edge[0]) * ((half - traveled[*group]) / length),
                     *owner,
                     "Midpoint",
-                    1,
+                    2,
                     9.,
                 );
             }
@@ -173,7 +217,7 @@ fn targets(
             let b = camera.project(edge[1], rect).0;
             let ab = b - a;
             let t = ((pointer - a).dot(ab) / ab.length_sq().max(1e-8)).clamp(0., 1.) as f64;
-            add(edge[0] + (edge[1] - edge[0]) * t, *owner, "Edge", 2, 8.);
+            add(edge[0] + (edge[1] - edge[0]) * t, *owner, "Edge", 3, 8.);
         }
     }
     targets.sort_by(|a, b| {
@@ -260,6 +304,7 @@ pub fn point(
             plane,
             label: target.label,
             guide: None,
+            owner: Some(target.owner),
         });
     }
     let raw_uv = plane.coordinates(raw);
@@ -318,6 +363,7 @@ pub fn point(
         plane,
         label,
         guide,
+        owner: None,
     })
 }
 
@@ -550,5 +596,104 @@ mod tests {
         let original = Project::load(&path).unwrap();
         assert!(original.bodies.iter().all(|b| !b.cuts_profiles));
         assert!((area(&evaluate_scene(&original.bodies).unwrap()[0].1) - 15.51).abs() < 1e-6);
+    }
+    #[test]
+    fn circle_centers_and_rims_use_actual_parametric_boundaries() {
+        use truck_modeling::{SquareMatrix, Transform};
+        let mut b = Body::new(Shape::Circle);
+        b.id = 1;
+        b.width = 3.4;
+        b.extrusion = 2.;
+        b.position = [0.2, 0.7, 0.4];
+        b.rotation = [15., 25., 35.];
+        b.scale = [2., 1., 0.6];
+        let mut camera = Camera::default();
+        camera.preset(View::Isometric);
+        let rect = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(800., 600.));
+        for modified in [false, true] {
+            if modified {
+                b.edge_treatments = vec![crate::edge_treatments::Modifier::new(
+                    crate::edge_treatments::Kind::Bevel,
+                    crate::edge_treatments::FaceTarget::Top,
+                    &b,
+                )];
+            }
+            let g = evaluate(&b).unwrap();
+            let circle = g
+                .circles
+                .iter()
+                .find(|c| {
+                    let p = crate::regions::transform(&b)
+                        .invert()
+                        .unwrap()
+                        .transform_point(c.center);
+                    (p.z - b.extrusion).abs() < 1e-6
+                })
+                .unwrap()
+                .clone();
+            let scene = vec![(1, g)];
+            let face = (0..scene[0].1.face_count)
+                .find(|f| Plane::face(&scene[0].1, *f).is_some_and(|p| p.contains(circle.center)))
+                .unwrap();
+            let plane = acquire_plane(
+                &scene,
+                &camera,
+                rect,
+                camera.project(circle.center, rect).0,
+                Some((1, face)),
+                true,
+                false,
+            )
+            .unwrap();
+            let preferences = Preferences::default();
+            let center = point(
+                &scene,
+                &camera,
+                rect,
+                camera.project(circle.center, rect).0 + eframe::egui::vec2(1., 1.),
+                plane,
+                None,
+                &preferences,
+            )
+            .unwrap();
+            assert_eq!(center.label, "Circle center");
+            assert!((center.position - circle.center).magnitude() < 1e-9);
+            let rim = circle.center + circle.u * 0.37f64.cos() + circle.v * 0.37f64.sin();
+            let snapped = point(
+                &scene,
+                &camera,
+                rect,
+                camera.project(rim, rect).0,
+                plane,
+                None,
+                &preferences,
+            )
+            .unwrap();
+            assert_eq!(snapped.label, "Circle rim");
+            assert!((snapped.position - rim).magnitude() < 1e-4);
+            let d = snapped.position - circle.center;
+            let x = d.dot(circle.u) / circle.u.magnitude2();
+            let y = d.dot(circle.v) / circle.v.magnitude2();
+            assert!(
+                (x * x + y * y - 1.).abs() < 1e-10,
+                "rim snapping must stay on the analytic ellipse"
+            );
+            assert!(plane.contains(snapped.position));
+            let off = point(
+                &scene,
+                &camera,
+                rect,
+                camera.project(circle.center, rect).0,
+                plane,
+                None,
+                &Preferences {
+                    geometry: false,
+                    ..preferences
+                },
+            )
+            .unwrap();
+            assert_ne!(off.label, "Circle center");
+            assert!(serde_json::to_value(&b).unwrap().get("circles").is_none());
+        }
     }
 }

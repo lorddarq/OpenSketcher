@@ -31,6 +31,50 @@ impl SelectionMode {
     }
 }
 
+pub type Pick = (u64, Option<usize>);
+
+/// Normal click replaces; Shift-click toggles. Shift-clicking empty space preserves selection.
+pub fn extend(input: &egui::InputState) -> bool {
+    // Shift may be released before this frame is painted; use the click event's modifiers.
+    input
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                modifiers,
+                ..
+            } => Some(modifiers.shift),
+            _ => None,
+        })
+        .unwrap_or(input.modifiers.shift)
+}
+pub fn click(picks: &mut Vec<Pick>, picked: Option<Pick>, extend: bool) {
+    if !extend {
+        picks.clear();
+    }
+    if let Some(pick) = picked {
+        if let Some(index) = picks.iter().position(|p| *p == pick) {
+            picks.remove(index);
+        } else {
+            picks.push(pick);
+        }
+    }
+}
+pub fn valid(pick: Pick, scene: &[(u64, Geometry)], mode: SelectionMode) -> bool {
+    scene
+        .iter()
+        .find(|(id, _)| *id == pick.0)
+        .is_some_and(|(_, g)| {
+            if mode == SelectionMode::Volume {
+                pick.1.is_none()
+            } else {
+                pick.1.is_some_and(|i| i < mode.count(g))
+            }
+        })
+}
+
 fn triangle_hit(o: Point3, d: Vector3, tri: &[Point3; 3]) -> Option<f64> {
     let e1 = tri[1] - tri[0];
     let e2 = tri[2] - tri[0];
@@ -215,5 +259,109 @@ mod tests {
             pick(&scene, &camera, center, rect, SelectionMode::Edge),
             Some((2, Some(0)))
         );
+    }
+    #[test]
+    fn shift_click_and_group_transforms_keep_membership_and_atomic_history() {
+        use crate::{
+            components,
+            model::{Body, Model, Shape, evaluate, evaluate_scene},
+            project::Project,
+            viewport::Camera,
+        };
+        use truck_modeling::{InnerSpace, Matrix4, Vector3};
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.extrusion = 2.;
+        let mut b = a.clone();
+        b.id = 2;
+        b.position[0] = 4.;
+        let bodies = vec![a.clone(), b];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        assert!(
+            extend(&input),
+            "click modifiers survive Shift release before paint"
+        );
+        let mut picks = Vec::new();
+        click(&mut picks, Some((1, None)), false);
+        click(&mut picks, Some((2, None)), true);
+        assert_eq!(picks, vec![(1, None), (2, None)]);
+        click(&mut picks, None, true);
+        assert_eq!(picks.len(), 2);
+        click(&mut picks, Some((1, None)), true);
+        assert_eq!(picks, vec![(2, None)]);
+        click(&mut picks, Some((1, None)), true);
+        let matrix = Matrix4::from_translation(Vector3::new(0., 0., 0.25));
+        let changed =
+            components::transform_selection(&bodies, &scene, SelectionMode::Volume, &picks, matrix)
+                .unwrap();
+        assert!(changed.iter().all(|b| b.position[2] == 0.25));
+        let mut model = Model::from_bodies(bodies.clone());
+        model.commit_changes(&changed).unwrap();
+        model.undo();
+        assert_eq!(model.bodies, bodies);
+        model.redo();
+        assert_eq!(model.bodies, changed);
+        let mut invalid = changed.clone();
+        invalid[1].scale[0] = 0.;
+        assert!(model.commit_changes(&invalid).is_err());
+        assert_eq!(model.bodies, changed);
+        model.delete_many(&[1, 2]).unwrap();
+        assert!(model.bodies.is_empty());
+        model.undo();
+        assert_eq!(model.bodies, changed);
+        let mut project = Project::new(bodies.clone(), Camera::default(), true, Some(1));
+        project.selection = picks.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selection.osk");
+        project.save(&path).unwrap();
+        assert_eq!(Project::load(&path).unwrap().picks(), picks);
+        let geometry = evaluate(&a).unwrap();
+        for mode in [
+            SelectionMode::Face,
+            SelectionMode::Edge,
+            SelectionMode::Point,
+        ] {
+            let picks = vec![(1, Some(0)), (1, Some(1))];
+            let changed = components::transform_selection(
+                std::slice::from_ref(&a),
+                &[(1, geometry.clone())],
+                mode,
+                &picks,
+                matrix,
+            )
+            .unwrap();
+            assert_eq!(changed[0].component_edits.len(), 1);
+            assert_eq!(changed[0].component_edits[0].elements, vec![1]);
+            let g = evaluate(&changed[0]).unwrap();
+            let mut vertices = components::vertices(&geometry, mode, Some(0));
+            vertices.extend(components::vertices(&geometry, mode, Some(1)));
+            vertices.sort_unstable();
+            vertices.dedup();
+            for (index, (before, after)) in geometry.points.iter().zip(&g.points).enumerate() {
+                let expected = *before
+                    + if vertices.contains(&index) {
+                        Vector3::new(0., 0., 0.25)
+                    } else {
+                        Vector3::new(0., 0., 0.)
+                    };
+                assert!(
+                    (*after - expected).magnitude() < 1e-6,
+                    "shared vertices must move once"
+                );
+            }
+            let mut project = Project::new(changed, Camera::default(), true, Some(1));
+            project.selection_mode = mode;
+            project.selected_element = Some(1);
+            project.selection = picks;
+            project.save(&path).unwrap();
+            assert_eq!(Project::load(&path).unwrap(), project);
+        }
     }
 }

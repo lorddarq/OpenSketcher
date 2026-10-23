@@ -5,6 +5,34 @@ use serde::{Deserialize, Serialize};
 use truck_modeling::{InnerSpace, Point3, Vector3};
 use wgpu::util::DeviceExt;
 
+// Smooth render samples within a logical face, retaining sharp authored boundaries.
+fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
+    let key = |face, p: Point3| (face, [p.x, p.y, p.z].map(|v| (v * 1e6).round() as i64));
+    let mut sums = std::collections::HashMap::new();
+    for (t, face) in g.triangles.iter().zip(&g.triangle_faces) {
+        let normal = (t[1] - t[0]).cross(t[2] - t[0]);
+        for p in t {
+            *sums
+                .entry(key(*face, *p))
+                .or_insert(Vector3::new(0., 0., 0.)) += normal;
+        }
+    }
+    g.triangles
+        .iter()
+        .zip(&g.triangle_faces)
+        .map(|(t, face)| {
+            t.map(|p| {
+                let n = sums[&key(*face, p)];
+                if n.magnitude2() > 1e-20 {
+                    n.normalize()
+                } else {
+                    (t[1] - t[0]).cross(t[2] - t[0]).normalize()
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
@@ -198,17 +226,18 @@ pub struct Viewport {
 fn triangle_order(
     bodies: &[Body],
     scene: &[(u64, Geometry)],
-    selected: Option<u64>,
+    selected: &[selection::Pick],
 ) -> (Vec<usize>, u32) {
-    let overlay = bodies
+    let overlay: std::collections::HashSet<_> = bodies
         .iter()
-        .find(|b| Some(b.id) == selected && b.extrusion == 0.)
-        .map(|b| b.id);
+        .filter(|b| b.extrusion == 0. && selected.iter().any(|p| p.0 == b.id))
+        .map(|b| b.id)
+        .collect();
     let mut order: Vec<_> = (0..scene.len()).collect();
-    order.sort_by_key(|index| Some(scene[*index].0) == overlay);
+    order.sort_by_key(|index| overlay.contains(&scene[*index].0));
     let start = scene
         .iter()
-        .filter(|(id, _)| Some(*id) != overlay)
+        .filter(|(id, _)| !overlay.contains(id))
         .map(|(_, g)| g.triangles.len() as u32 * 3)
         .sum();
     (order, start)
@@ -326,34 +355,51 @@ impl Viewport {
     pub fn update(
         &mut self,
         bodies: &[Body],
-        selected: Option<u64>,
+        picks: &[selection::Pick],
         mode: SelectionMode,
-        element: Option<usize>,
     ) -> Result<(), String> {
         let scene = evaluate_scene(bodies)?;
+        self.update_scene(bodies, scene, picks, mode);
+        Ok(())
+    }
+    pub fn update_scene(
+        &mut self,
+        bodies: &[Body],
+        scene: Vec<(u64, Geometry)>,
+        picks: &[selection::Pick],
+        mode: SelectionMode,
+    ) {
         let mut data = Vec::new();
+        let chosen: std::collections::HashSet<_> = picks.iter().copied().collect();
         let mut vertex = |p: Point3, c: [f32; 3]| {
             data.extend([p.x as f32, p.y as f32, p.z as f32]);
             data.extend(c);
         };
-        let (order, overlay_start) = triangle_order(bodies, &scene, selected);
+        let (order, overlay_start) = triangle_order(bodies, &scene, picks);
         for index in order {
             let (id, g) = &scene[index];
+            let normals = surface_normals(g);
             for (index, tri) in g.triangles.iter().enumerate() {
-                let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize();
-                let shade =
-                    (0.45 + 0.4 * n.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs()) as f32;
-                let color = if Some(*id) == selected
-                    && (mode == SelectionMode::Volume
-                        || (mode == SelectionMode::Face
-                            && element == Some(g.triangle_faces[index])))
-                {
-                    [shade * 0.55, shade * 0.8, shade]
-                } else {
-                    [shade * 0.88, shade * 0.95, shade]
-                };
-                for p in tri {
-                    vertex(*p, color);
+                let selected = chosen.contains(&(
+                    *id,
+                    if mode == SelectionMode::Volume {
+                        None
+                    } else {
+                        Some(g.triangle_faces[index])
+                    },
+                ));
+                for (p, n) in tri.iter().zip(&normals[index]) {
+                    let shade = (0.45
+                        + 0.4 * n.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs())
+                        as f32;
+                    vertex(
+                        *p,
+                        if selected {
+                            [shade * 0.55, shade * 0.8, shade]
+                        } else {
+                            [shade * 0.88, shade * 0.95, shade]
+                        },
+                    );
                 }
             }
         }
@@ -385,10 +431,9 @@ impl Viewport {
                 for p in edge {
                     vertex(
                         *p,
-                        if Some(*id) == selected
-                            && (mode == SelectionMode::Volume
-                                || (mode == SelectionMode::Edge
-                                    && element == Some(g.edge_groups[index])))
+                        if (mode == SelectionMode::Volume && chosen.contains(&(*id, None)))
+                            || (mode == SelectionMode::Edge
+                                && chosen.contains(&(*id, Some(g.edge_groups[index]))))
                         {
                             [0.35, 0.75, 1.]
                         } else {
@@ -410,7 +455,6 @@ impl Viewport {
                 usage: wgpu::BufferUsages::VERTEX,
             });
         self.scene = scene;
-        Ok(())
     }
 
     pub fn pick(
@@ -527,6 +571,26 @@ mod tests {
         a.into_iter().zip(b).map(|(a, b)| a * b).sum()
     }
     #[test]
+    fn logical_surfaces_smooth_internal_samples_but_preserve_boundaries() {
+        let a = Point3::new(0., 0., 0.);
+        let b = Point3::new(1., 0., 0.);
+        let mut g = Geometry {
+            triangles: vec![
+                [a, b, Point3::new(0., 1., 0.)],
+                [b, a, Point3::new(0., 0., 1.)],
+            ],
+            triangle_faces: vec![0, 0],
+            ..Default::default()
+        };
+        let normals = surface_normals(&g);
+        assert!((normals[0][0] - normals[1][1]).magnitude() < 1e-8);
+        assert!(normals[0][0].y > 0.5 && normals[0][0].z > 0.5);
+        g.triangle_faces[1] = 1;
+        let normals = surface_normals(&g);
+        assert!((normals[0][0] - Vector3::unit_z()).magnitude() < 1e-8);
+        assert!((normals[1][1] - Vector3::unit_y()).magnitude() < 1e-8);
+    }
+    #[test]
     fn presets_have_orthonormal_axes_and_isometric_foreshortening() {
         let mut solid = Body::new(crate::model::Shape::Rectangle);
         solid.id = 2;
@@ -536,10 +600,10 @@ mod tests {
         profile.position[2] = 2.;
         let bodies = vec![profile, solid];
         let scene = evaluate_scene(&bodies).unwrap();
-        let (order, start) = triangle_order(&bodies, &scene, Some(1));
+        let (order, start) = triangle_order(&bodies, &scene, &[(1, None)]);
         assert_eq!(order, vec![1, 0]);
         assert_eq!(start, scene[1].1.triangles.len() as u32 * 3);
-        let (order, start) = triangle_order(&bodies, &scene, Some(2));
+        let (order, start) = triangle_order(&bodies, &scene, &[(2, None)]);
         assert_eq!(order, vec![0, 1]);
         assert_eq!(
             start,

@@ -22,7 +22,7 @@ pub fn rotation_angles(rotation: Matrix3) -> [f64; 3] {
     };
     [x.to_degrees(), y.to_degrees(), z.to_degrees()]
 }
-fn profile(b: &Body) -> Vec<P> {
+pub(crate) fn profile(b: &Body) -> Vec<P> {
     let r = b.width / 2.;
     if b.shape == Shape::Rectangle {
         return vec![
@@ -133,6 +133,14 @@ pub fn boundaries(body: &Body, bodies: &[Body]) -> Result<Option<Vec<Vec<P>>>, S
         return Ok(None);
     }
     let contains = |p| inside(p, &polygons[0]) && !polygons[1..].iter().any(|poly| inside(p, poly));
+    trace(&polygons, contains).map(Some)
+}
+
+/// Shared planar arrangement: classify each split edge on both sides.
+pub(crate) fn trace(
+    polygons: &[Vec<P>],
+    contains: impl Fn(P) -> bool,
+) -> Result<Vec<Vec<P>>, String> {
     let segments: Vec<_> = polygons
         .iter()
         .flat_map(|p| (0..p.len()).map(|i| [p[i], p[(i + 1) % p.len()]]))
@@ -201,11 +209,25 @@ pub fn boundaries(body: &Body, bodies: &[Body]) -> Result<Option<Vec<Vec<P>>>, S
             };
             end = edges.swap_remove(index)[1];
         }
+        // Intersections with internal tessellation edges must not create extra
+        // selectable side faces when this boundary is swept into a solid.
+        let mut i = 0;
+        while polygon.len() > 3 && i < polygon.len() {
+            let n = polygon.len();
+            let a = sub(polygon[i], polygon[(i + n - 1) % n]);
+            let b = sub(polygon[(i + 1) % n], polygon[i]);
+            if cross(a, b).abs() <= 1e-10 * (dot(a, a) * dot(b, b)).sqrt() && dot(a, b) > 0. {
+                polygon.remove(i);
+                i = i.saturating_sub(1);
+            } else {
+                i += 1;
+            }
+        }
         if polygon.len() >= 3 && area(&polygon).abs() > 1e-9 {
             loops.push(polygon);
         }
     }
-    Ok(Some(loops))
+    Ok(loops)
 }
 
 pub fn contains(p: P, polygon: &[P]) -> bool {

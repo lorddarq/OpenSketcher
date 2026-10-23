@@ -14,7 +14,7 @@ Release notes: [Changelog](CHANGELOG.md). Unsigned development builds are availa
 
 Native editor with a depth-tested wgpu viewport, ground grid, world axes, and Truck-backed parametric geometry. Create rectangles, circles, lines, and semicircles using two picked points on a selected or visible planar face, with XY fallback. Choose Volume, Face, Edge, or Point selection in the toolbar. Volume selection exposes automatic dimension, extrusion, position, rotation, and scale edits; component modes pick and highlight individual topology elements. Move and Rotate expose constrained gizmos in all four selection modes. Whole-object deletion and undo/redo are supported.
 
-Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Model import, solid boring, face-level push/pull, node editing, and a Scale gizmo are not implemented yet. There is no longer a demonstration cube.
+Projects save and load as `.osk` files, preserving editable geometry parameters and scene properties. Attached planar profiles now support solid boring and separate emerging bodies. Model import, general face-region push/pull, node editing, and a Scale gizmo remain pending. Supported primitive faces have a signed numeric Offset face control. There is no longer a demonstration cube.
 
 ## Feature checklist
 
@@ -24,7 +24,7 @@ Checked items are implemented; platform runtime verification is tracked separate
 
 - [x] Canvas creation on selected/visible planar faces or XY: rectangle corners, circle center/radius, line endpoints, semicircle diameter endpoints.
 - [x] Live creation preview and Escape cancellation.
-- [x] Default-on geometry snapping (visible endpoints, edge midpoints, edges, projected limits) plus 0.5-unit grid and anchor alignment on the captured plane.
+- [x] Default-on geometry snapping (visible endpoints, edge midpoints, edges, circle centers/rims, projected limits) plus 0.5-unit grid and anchor alignment on the captured plane.
 - [x] Project drawing preferences; base-XY projection and automatic coplanar cutting are opt-in. Existing cuts retain their saved intent.
 - [x] Automatic numeric dimension, position, Euler rotation, and local scale editing.
 - [x] Straight local +Z extrusion: closed profiles to solids, lines to surfaces.
@@ -36,20 +36,24 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [ ] Circle Radius field and radius preview label (canvas input is already center/radius; properties still display diameter).
 - [ ] Persistent parent-linked sketches, expanded contextual point/center overlays, and an explicit support-plane indicator (fixed placement on selected/elevated faces works).
 - [ ] Open-line face partitioning and exact analytic curved intersections (split curves currently use polygon approximations).
-- [ ] Dedicated face-normal push/pull and component scaling (component movement/rotation are implemented).
+- [x] Signed numeric Offset face for original box faces and circular/semicircular solid caps; preserves the opposite plane, source parameters, circular inference, and existing treatments.
+- [ ] Face-normal canvas handle, general face-region push/pull, and component scaling (component movement/rotation are implemented).
 - [ ] Negative extrusion, mirrored scaling, and a canvas Scale gizmo.
 - [ ] Explicit X/Y/Z axis locks and labeled axis-inference feedback during drawing/moving.
-- [ ] Geometry-intersection snapping and analytic center references (endpoints, midpoints, edges, and projected limits are implemented).
-- [ ] Borer-only and generator-plus-borer operations, including pockets, through-cuts, and separate emerging bodies.
-- [ ] Chamfer modifier: select a face, apply chamfer, edit its parameters, or remove it while retaining the source geometry.
-- [ ] Bevel modifier: select a face, apply bevel, edit its parameters, or remove it while retaining the source geometry.
-- [ ] Persist chamfer/bevel modifiers and their face references in `.osk`; support undo/redo for adding, editing, and removing them.
+- [ ] Geometry-intersection snapping and additional arc/curve references (circle centers/rims, endpoints, midpoints, edges, and projected limits are implemented).
+- [x] Attached-profile Borer-only / Generator + borer: pockets, through-cuts, rim notches, and separate emerging bodies with signed travel; original primitive support faces and planar exit baseline.
+- [ ] General trimmed/deformed-face supports and uneven exit handling.
+- [x] Editable/removable face Chamfer: all six rectangular-solid faces and top/bottom rims of cylinders and semicircular extrusions.
+- [x] Editable/removable Bevel with user-selected rounded or flat style; circular rims can also be selected in Edge mode.
+- [x] Parametric modifier distances/radii, semantic source-face references, `.osk` persistence, and undo/redo for add/edit/remove.
+- [ ] Modifiers on partitioned/concave or component-deformed solids; arbitrary curved-face treatment and exact noncircular blends.
 - [ ] Persistent semantic face/edge references for dependent modeling features.
 - [ ] Whole-face NURBS/deformation-preserving movement and control-node soft selection with falloff, radius, and heatmap.
 
 ### Selection, viewport, and workspace
 
 - [x] Volume, Face, Edge, and Point picking/highlighting, with depth-aware component selection.
+- [x] Shift-click toggles multiple selections in all four modes; group Move/Rotate, volume deletion, atomic undo/redo, and saved selections.
 - [x] Barebones GPU viewport: shaded faces, boundary edges, depth testing, grid, and world axes.
 - [x] Isometric, Top, Side, free orbit, pan, zoom, fit model, and viewport resizing.
 - [x] Floating draggable Tools and Model/properties panels; scrollable properties.
@@ -67,8 +71,9 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [x] macOS/Windows/Linux build and development-package workflow (unsigned executables; macOS app bundle).
 - [x] Native macOS review of core creation/editing, viewport, persistence, and split-extrusion workflows.
 - [ ] Windows and Linux native runtime verification.
-- [x] Export evaluated geometry to binary STL, GLB, faceted STEP, and DXF.
-- [ ] Exact analytic/NURBS STEP export; CAD curve entities and named assemblies.
+- [x] Export evaluated geometry to binary STL, GLB, STEP, and DXF; STEP preserves retained kernel CAD surfaces.
+- [x] STEP export of retained analytic/NURBS source and Boolean boundaries, independent of display triangles.
+- [ ] Analytic reconstruction of mesh-only component/blend outputs and named CAD assemblies.
 - [ ] Additional major 3D interchange formats for printers, CAD tools, and Blender (3MF, OBJ, PLY, IGES).
 - [ ] Model import and SketchUp file compatibility.
 - [ ] Signed/notarized releases, installers, Linux desktop integration, application icons, and release publishing.
@@ -83,7 +88,7 @@ For this first version, **1 scene unit = 1 millimeter**. STL carries numeric mil
 | --- | --- |
 | STL | Binary triangle mesh for printing; requires closed solids and rejects standalone lines/sheets. Separate overlapping solids are not unioned; check the result in a slicer. |
 | GLB | glTF 2.0 binary file, one named node per body, triangle faces and boundary lines, neutral double-sided material. Suitable for Blender import. |
-| STEP | Truck-generated boundary representation rebuilt from evaluated triangles: closed solids (including separate connected regions) and open surfaces. Curves are faceted; standalone lines are rejected with guidance to use DXF/GLB. |
+| STEP | Retained Truck analytic/NURBS boundaries for source solids and Boolean outputs; mesh-only edits use faceted boundaries. Intersection trims are sampled into splines at kernel tolerance. Standalone lines are rejected; use DXF/GLB. |
 | DXF | ASCII AutoCAD 2000 entities: triangular 3DFACEs and LINE boundaries on per-body layers. Curves are sampled, and faces are not CAD solids. |
 
 All formats use the current viewport tessellation tolerance, not a configurable manufacturing tolerance. Textures, scene cameras, and parametric feature history are not included. Keep `.osk` as the editable source. Exact CAD geometry and further common interchange formats remain on the checklist. File structure and geometry checks run in the Rust suite. Native macOS review verified the export menu, save dialog, and a three-body GLB output without changing the document; acceptance in external slicers/CAD applications and Blender remains pending.
@@ -126,7 +131,7 @@ A selected planar face always takes priority. Otherwise the first point uses the
 
 **New profiles cut coplanar regions** is also off by default. It sets cutting intent on new closed profiles only; it does not change existing shapes. Each closed profile exposes **Cut older coplanar profiles** in its inspector for an undoable per-profile change. This is the existing coplanar-profile partition operation, not a general solid Boolean or an imprint on an arbitrary solid face.
 
-The settings and individual `cuts_profiles` flags persist in `.osk` version 4. Modeling versions 2–3 migrate with cutting flags enabled to preserve existing cuts; version 1 keeps its original independent profiles. Newly drawn profiles still default to independent geometry. A profile placed on a face saves its exact position/orientation but does not follow future parent edits as an attached sketch.
+The settings and individual `cuts_profiles` flags persist in `.osk` version 5 (introduced in version 4). Modeling versions 2–3 migrate with cutting flags enabled to preserve existing cuts; version 1 keeps its original independent profiles. Newly drawn profiles still default to independent geometry. New closed profiles on supported original solid faces retain an attachment and explicit operation controls. Legacy independent profiles retain fixed placement.
 
 Selected flat profiles use a separate coplanar display pass to avoid flickering against the supporting face. This leaves saved geometry and picking at the actual surface depth. Coincident picking prefers the newer profile without selecting hidden geometry through the solid.
 
@@ -139,7 +144,11 @@ Selected flat profiles use a separate coplanar display pass to avoid flickering 
 
 Face, Edge, and Point support Move/Rotate gizmos for the selected component; adjacent boundaries rebuild to remain connected. Whole-object numeric properties and deletion remain in Volume mode. Changing mode clears the previous selection but keeps Move/Rotate active. Completed component transforms retain their selection, and undo/redo preserves it when its topology slot still exists. Empty-space clicks clear selection within the current mode. Occluded components are not selectable through opaque faces. Edge/point acquisition uses screen-space tolerances so zoom does not shrink the click target.
 
-`.osk` schema/modeling version 4 preserves drawing preferences and cutting intent alongside component-transform matrices and guarded topology references. Source connectivity must match before replay; an upstream edit that changes it is rejected rather than targeting another component. Files migrated from modeling version 1 reset component selection to Volume because partitioning changes topology slots. This guard is not a general semantic naming system for arbitrary CAD feature histories.
+`.osk` schema/modeling version 5 preserves drawing preferences and cutting intent alongside component-transform matrices and guarded topology references. Source connectivity must match before replay; an upstream edit that changes it is rejected rather than targeting another component. Files migrated from modeling version 1 reset component selection to Volume because partitioning changes topology slots. This guard is not a general semantic naming system for arbitrary CAD feature histories.
+
+**Shift-click** adds/removes items in the current selection mode; an ordinary click replaces the selection, and clicking empty space clears it. Shift-clicking empty space preserves it. Shift-drag still pans. The model list supports Shift-click for volumes. The last selected item is the primary selection; changing mode clears the previous selection. Native macOS review verified additive volume/face selection, toggle removal, saved sets, a constrained two-body Move gesture, and one-step Undo.
+
+Move/Rotate use the whole selection and a shared pivot. Shared component vertices transform once. A failed group edit leaves all bodies unchanged, and each committed gesture or group deletion is one undo step. Multiple volumes expose a count and group actions; numeric source/modifier properties require one body. Treatments accept multiple supported faces/edges in one atomic action; box edges are local and circular rims use their full perimeter. Component matrices replay after edge treatments through the faceted editing path; exact general surface reconstruction remains pending. `.osk` version 5 retains the selection set and union component transforms.
 
 ## Save and open projects
 
@@ -197,6 +206,8 @@ Versions below are resolved from Cargo.lock. The full direct/transitive inventor
 | Direct dependency | Locked version | Used for | Upstream credit | Declared license |
 | --- | --- | --- | --- | --- |
 | [eframe](https://github.com/emilk/egui) | 0.34.3 | Native editor shell, egui UI, wgpu integration, bundled fonts | Emil Ernerfeldt and egui contributors | MIT OR Apache-2.0; embedded fonts have separate terms below |
+| [rayon](https://github.com/rayon-rs/rayon) | 1.12.0 | Bounded background geometry thread pool | Rayon contributors | MIT OR Apache-2.0 |
+| [truck-shapeops](https://github.com/ricosjp/truck) | 0.4.0 | Solid Boolean subtraction | RICOS Co. Ltd. and Truck contributors | Apache-2.0 |
 | [rfd](https://github.com/PolyMeilex/rfd) | 0.17.2 | Native file and confirmation dialogs | Copyright © 2022 Bartłomiej Maryńczak | MIT |
 | [serde](https://github.com/serde-rs/serde) | 1.0.229 | Scene serialization traits and derives | Erick Tryzelaar, David Tolnay, and Serde contributors | MIT OR Apache-2.0 |
 | [serde_json](https://github.com/serde-rs/json) | 1.0.154 | `.osk` JSON encoding/decoding | serde_json contributors | MIT OR Apache-2.0 |
@@ -236,6 +247,22 @@ OpenSketcher is licensed under the [Apache License 2.0](LICENSE). Redistribution
 
 Dependencies and third-party assets retain their own licenses.
 
+## Circle face snapping and cut intent
+
+Drawing tools snap to **Circle center** and **Circle rim** on intact circular faces and cylinder rims, including elevated, rotated, nonuniformly scaled, and beveled cases. These use the actual parametric boundaries, not the nearest tessellation chord. Existing Snap / geometry preferences control them; hidden and off-plane references are excluded. Circles altered by component edits or profile partitioning do not expose a falsely complete circular rim.
+
+Center/rim inference is implemented. Automatic rim-start solid cutting is not implemented yet; current numeric extrusion still generates geometry. The [face-operation behavior notes](docs/specs/circle-face-operations.md) distinguish placement, support, and cut intent and record the remaining interaction clarification.
+
+## Chamfer and bevel
+
+Select **Face** and pick an original face of an extruded rectangle, or the top/bottom cap of a cylinder or semicircular extrusion. Choose **Add Chamfer** or **Add Bevel** in Model & properties. For cylinders and semicircular extrusions, **Edge** mode also accepts rim edges and treats the entire corresponding perimeter.
+
+The editor switches to the owning body so its modifier list is immediately editable. Change **Distance** for Chamfer/flat Bevel, or **Radius** for rounded Bevel. Bevel offers **Rounded** and **Flat / segmented** styles; flat is a straight cross-section, equivalent to equal-distance chamfering. Noncircular rounded treatments expose 2–16 approximation segments. Values update automatically; Remove restores geometry without that operation. Add, edit, style changes, and removal support undo/redo. Source dimensions and placement remain editable.
+
+Cylinder treatments regenerate analytic circular profiles and revolved surfaces. Noncircular treatments currently use convex clipping with grouped transition strips. Render subdivisions and kernel patch seams within a surface are hidden and are not selectable faces: the base face and bevel surface remain distinct. Distances/radii use source-local units; nonuniform scale scales the result. Only one modifier per source face is accepted, with conservative size limits that preserve the solid. Partitioned profiles, cutting-dependent profiles, and mixing modifiers with component edits are explicitly rejected for now.
+
+`.osk` schema/modeling version 5 stores the modifier inputs and source-face roles, never viewport triangles. Versions 1–4 migrate without adding modifiers or changing their geometry. All export formats use the same evaluated modified shape; STEP preserves retained analytic surfaces; approximated noncircular blends remain faceted. See [modifier behavior](docs/specs/face-modifiers.md).
+
 ## Canvas Move and Rotate
 
 Select a Volume, Face, Edge, or Point, then choose **Move** or **Rotate**. You can also select geometry while either tool is active. Drag a colored handle and release to commit one undoable action; Escape cancels the preview. Switching tools or views and losing window focus also cancels an unfinished drag.
@@ -251,3 +278,23 @@ Component edits retain the source profile plus ordered local transform matrices 
 Component edits on a profile that cuts another region are currently rejected; Volume transforms of that cutting profile remain available. Topology-changing edits and deletions that invalidate saved component references are rejected without replacing the last valid scene. General semantic CAD feature references and exact curved-surface reconstruction remain pending.
 
 Closed profiles with **Cut older coplanar profiles** enabled split older coplanar regions. New profiles leave this off by default. Extruding the surrounding profile excludes the newer regions and creates walls along their boundaries; those inner regions retain their own height. This supports holes, boundary notches, and cuts that divide a profile. Open-line splitting and persistent attached-face dependencies remain pending; fixed sketches on elevated planar faces work. See the [.osk modeling rules](docs/formats/osk.md#coplanar-region-evaluation-modeling-version-2), including curved-boundary approximation and older-file migration.
+
+Geometric operator specifications and researched gaps: [face editing, offset, extrusion, and Boolean roadmap](docs/specs/geometric-operators.md).
+
+Geometric edits and project reevaluation use a background worker capped at two geometry threads. Repeated input is coalesced; the last valid scene remains visible. Escape discards pending results, while an already executing kernel call finishes in the background. Use a release build for interactive modeling performance.
+
+Ordered Boolean tools: Shift-select two volumes or coplanar faces, then choose **Union**, **Subtract**, or **Intersect** in Model & properties. Subtract removes the second selection from the first; **Swap target / tool** reverses it. Results retain editable source operands and support undo/redo, `.osk` persistence, and **Keep tools**. Face operations produce planar sheets; curved/crossing face trimming remains pending. See the [Boolean operator specification](docs/specs/boolean-operators.md).
+
+Chamfer supports **Equal distance**, **Two distances**, and **Distance and angle**, plus **Reverse direction**, on supported box faces and circular/semicircular cap perimeters. Distances are source-local; cylinder caps use radial and axial setbacks. These controls update automatically and persist in `.osk` version 8.
+
+Edge-local box chamfers/bevels: select **Edge**, Shift-select the desired source edges, then **Chamfer** or **Bevel**. Each box edge is treated independently; face selections treat their full perimeters. Supported multi-selection across bodies applies in one undo step. These semantic edge targets persist in `.osk` version 9. Concave/Boolean-result edges and general tangent-chain propagation remain pending.
+
+Rejected operator values remain visible with **Input not applied** while geometry and Save/Export retain the last accepted model. Errors identify the object, operation, and relevant source/target reference. Correct the value or press **Escape** after leaving the field to discard the rejected draft; no Apply/Revert controls are required.
+
+Attached sweeps now offer **Through all**, **Up to next**, and **Up to face**, alongside manual Distance. Through all cuts only the attached target. Parallel-planar termination supports explicit end bodies and source-face roles; Up to next requires full-profile coverage. Targets regenerate the sweep when edited. These options persist in `.osk` version 10. Angled/curved termination and multiple-body Through all remain pending.
+
+Select a planar face in Face mode and use **Extrude face → Distance** to extend its current trimmed boundary, including caps after chamfer or bevel. The existing treatment stays in place. **Offset source** remains available separately to resize the original primitive. Outward planar face sweeps persist in `.osk` v11 and support undo/redo. `.osk` v13 adds negative travel for blind recesses in fully chamfered/beveled caps; through-cuts and arbitrary curved/Boolean-result face sweeps remain pending.
+
+Edge/face/point gizmo edits now operate on the evaluated geometry of bored and Boolean solids. Newly authored edits replay after those construction operations, with multiselection, undo/redo and `.osk` v12 persistence. Upstream topology changes reject stale references safely. Curved component deformation still uses the existing faceted boundary reconstruction; exact analytic retrimming remains pending.
+
+For a fully treated planar cap, **Extrude face → Distance** accepts a negative value to form a blind recess, preserving the chamfer/bevel. Consecutive reversal retracts the previous sweep. Opposing-wall collision and intersecting unsupported sweeps are rejected without replacing the accepted scene. Untreated-face retraction uses **Offset source**; through-cuts use **Borer**.

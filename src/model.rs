@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use truck_meshalgo::tessellation::MeshableShape;
-use truck_modeling::{Point3, Rad, Shell, Solid, Vector3, Wire, builder};
+use truck_modeling::{Point3, Rad, Shell, Solid, Transform, Vector3, Wire, builder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,7 +35,15 @@ pub struct Body {
     pub rotation: [f64; 3],
     pub scale: [f64; 3],
     #[serde(default)]
+    pub face_extrusions: Vec<crate::face_extrusions::Extrusion>,
+    #[serde(default)]
     pub component_edits: Vec<crate::components::ComponentEdit>,
+    #[serde(default, alias = "modifiers")]
+    pub edge_treatments: Vec<crate::edge_treatments::Modifier>,
+    #[serde(default)]
+    pub bore: Option<crate::operators::Bore>,
+    #[serde(default)]
+    pub boolean: Option<crate::booleans::Boolean>,
 }
 impl Body {
     pub fn new(shape: Shape) -> Self {
@@ -49,7 +57,11 @@ impl Body {
             position: [0.; 3],
             rotation: [0.; 3],
             scale: [1.; 3],
+            face_extrusions: Vec::new(),
             component_edits: Vec::new(),
+            edge_treatments: Vec::new(),
+            bore: None,
+            boolean: None,
         }
     }
     pub fn from_points(shape: Shape, a: [f64; 3], b: [f64; 3]) -> Result<Self, String> {
@@ -74,32 +86,76 @@ impl Body {
         body.validate()?;
         Ok(body)
     }
-    pub fn validate(&self) -> Result<(), String> {
-        crate::components::validate(&self.component_edits)?;
-        if ![self.width, self.depth, self.extrusion]
-            .into_iter()
-            .chain(self.position)
-            .chain(self.rotation)
-            .chain(self.scale)
-            .all(f64::is_finite)
-        {
-            return Err("Parameters must be finite numbers.".into());
+    pub fn label(&self) -> String {
+        let name = self
+            .boolean
+            .as_ref()
+            .map_or(self.shape.label(), |op| op.kind.label());
+        if self.id == 0 {
+            format!("New {name}")
+        } else {
+            format!("{name} {}", self.id)
         }
-        if !(0.01..=100.).contains(&self.width)
-            || !(0.01..=100.).contains(&self.depth)
-            || !(0.0..=100.).contains(&self.extrusion)
-            || (self.extrusion > 0. && self.extrusion < 0.01)
-        {
-            return Err("Dimensions must be 0.01–100 units; extrusion may also be zero.".into());
-        }
-        if self.scale.iter().any(|v| !(0.01..=100.).contains(v))
-            || self.position.iter().any(|v| v.abs() > 1000.)
-            || self.rotation.iter().any(|v| v.abs() > 36000.)
-        {
-            return Err("Scale must be 0.01–100; position ±1000; rotation ±36000°.".into());
-        }
-        Ok(())
     }
+    pub(crate) fn error(&self, reason: impl std::fmt::Display) -> String {
+        format!("{}: {reason}", self.label())
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        (|| {
+            if let Some(operation) = &self.boolean {
+                operation
+                    .validate(self)
+                    .map_err(|e| format!("{}: {e}", operation.references()))?;
+            }
+            if let Some(bore) = &self.bore {
+                bore.validate(self).map_err(|e| {
+                    format!(
+                        "{} · target body {} / {}: {e}",
+                        bore.mode.label(),
+                        bore.target,
+                        bore.face.label()
+                    )
+                })?;
+            }
+            crate::face_extrusions::validate(self)?;
+            crate::components::validate(&self.component_edits)?;
+            crate::edge_treatments::validate(self)?;
+            if ![self.width, self.depth, self.extrusion]
+                .into_iter()
+                .chain(self.position)
+                .chain(self.rotation)
+                .chain(self.scale)
+                .all(f64::is_finite)
+            {
+                return Err("Parameters must be finite numbers.".into());
+            }
+            if !(0.01..=100.).contains(&self.width)
+                || !(0.01..=100.).contains(&self.depth)
+                || !(0.0..=100.).contains(&self.extrusion)
+                || (self.extrusion > 0. && self.extrusion < 0.01)
+            {
+                return Err(
+                    "Dimensions must be 0.01–100 units; extrusion may also be zero.".into(),
+                );
+            }
+            if self.scale.iter().any(|v| !(0.01..=100.).contains(v))
+                || self.position.iter().any(|v| v.abs() > 1000.)
+                || self.rotation.iter().any(|v| v.abs() > 36000.)
+            {
+                return Err("Scale must be 0.01–100; position ±1000; rotation ±36000°.".into());
+            }
+            Ok(())
+        })()
+        .map_err(|reason: String| self.error(reason))
+    }
+}
+
+/// Exact circular source boundary after placement (an ellipse under nonuniform scale).
+#[derive(Clone, Debug)]
+pub struct CircularEdge {
+    pub center: Point3,
+    pub u: Vector3,
+    pub v: Vector3,
 }
 
 #[derive(Clone, Default)]
@@ -112,76 +168,147 @@ pub struct Geometry {
     pub face_count: usize,
     pub edge_count: usize,
     pub topology: crate::components::Topology,
+    pub circles: Vec<CircularEdge>,
+    pub shell: Option<Shell>,
+    pub surface_roles: Vec<usize>,
+    pub is_solid: bool,
 }
 
 pub fn evaluate(body: &Body) -> Result<Geometry, String> {
     body.validate()?;
-    // The kernel is never called with unchecked UI values. Its panic must not discard the document.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body, None)))
-        .map_err(|_| "The geometry kernel could not evaluate these parameters.".to_owned())?
+    let mut geometry = build_checked(body, None)?;
+    crate::components::apply_evaluated(body, &mut geometry).map_err(|e| body.error(e))?;
+    Ok(geometry)
+}
+fn build_checked(body: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
+    // One error boundary for standalone, preview, save/load, and scene evaluation.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body, loops)))
+        .map_err(|_| body.error("The geometry kernel could not evaluate these parameters."))?
+        .map_err(|reason| body.error(reason))
+}
+// Validation and viewport upload request the same scene consecutively. Keep only the
+// latest successful result; exact parameter equality also covers edits and undo.
+#[derive(Default)]
+struct SceneCache {
+    bodies: Vec<Body>,
+    geometry: Vec<(u64, Geometry)>,
+}
+thread_local! {
+    static SCENE_CACHE: std::cell::RefCell<Option<SceneCache>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn cache_scene(bodies: &[Body], geometry: &[(u64, Geometry)]) {
+    SCENE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(SceneCache {
+            bodies: bodies.to_vec(),
+            geometry: geometry.to_vec(),
+        })
+    });
 }
 pub fn evaluate_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
+    if let Some(geometry) = SCENE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.bodies == bodies)
+            .map(|c| c.geometry.clone())
+    }) {
+        return Ok(geometry);
+    }
+    let geometry = build_scene(bodies)?;
+    SCENE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(SceneCache {
+            bodies: bodies.to_vec(),
+            geometry: geometry.clone(),
+        })
+    });
+    Ok(geometry)
+}
+fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
     for body in bodies {
         body.validate()?;
     }
     for cutter in bodies
         .iter()
-        .filter(|body| !body.component_edits.is_empty())
+        .filter(|body| !body.component_edits.is_empty() || !body.edge_treatments.is_empty())
     {
         for target in bodies
             .iter()
             .filter(|body| body.id < cutter.id && body.shape != Shape::Line)
         {
-            if crate::regions::boundaries(target, &[target.clone(), cutter.clone()])?.is_some() {
-                return Err("Component edits on a profile cutting another region are not supported yet. Use Volume transforms for that profile.".into());
+            if crate::regions::boundaries(target, &[target.clone(), cutter.clone()])
+                .map_err(|e| cutter.error(format!("Partition against body {}: {e}", target.id)))?
+                .is_some()
+            {
+                return Err(cutter.error(format!("Profile partition against body {} cannot replay component edits or edge treatments. Disable its cutting flag or use Volume transforms.",target.id)));
             }
         }
     }
-    bodies
+    let mut scene: Vec<_> = bodies
         .iter()
         .map(|body| {
-            let loops = crate::regions::boundaries(body, bodies)?;
-            let geometry =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body, loops)))
-                    .map_err(|_| {
-                        "The geometry kernel could not build a split face.".to_owned()
-                    })??;
+            if body.boolean.is_some() {
+                return Ok((body.id, Geometry::default()));
+            }
+            let loops = crate::regions::boundaries(body, bodies).map_err(|e| body.error(e))?;
+            let geometry = build_checked(body, loops)?;
             Ok((body.id, geometry))
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    crate::operators::apply_bores(bodies, &mut scene)?;
+    for (body, (_, geometry)) in bodies.iter().zip(&mut scene) {
+        if body.boolean.is_none() {
+            crate::components::apply_evaluated(body, geometry).map_err(|e| body.error(e))?;
+        }
+    }
+    crate::booleans::apply(bodies, &mut scene)?;
+    Ok(scene)
 }
-fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
-    let r = b.width / 2.;
+pub(crate) fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
+    let intact_circle = b.shape == Shape::Circle && loops.is_none();
+    let mut g = build_geometry(b, loops)?;
+    if intact_circle {
+        let transform = crate::regions::transform(b);
+        let radius = b.width / 2.;
+        let mut rings = vec![(radius, 0.)];
+        if b.extrusion > 0. {
+            rings.push((radius, b.extrusion));
+        }
+        for modifier in &b.edge_treatments {
+            let (radial, height) = modifier.setbacks();
+            if modifier.face == crate::edge_treatments::FaceTarget::Top {
+                rings.retain(|(_, z)| *z != b.extrusion);
+                rings.extend([
+                    (radius - radial, b.extrusion),
+                    (radius, b.extrusion - height),
+                ]);
+            } else if modifier.face == crate::edge_treatments::FaceTarget::Bottom {
+                rings.retain(|(_, z)| *z != 0.);
+                rings.extend([(radius - radial, 0.), (radius, height)]);
+            }
+        }
+        g.circles = rings
+            .into_iter()
+            .map(|(r, z)| CircularEdge {
+                center: transform.transform_point(Point3::new(0., 0., z)),
+                u: transform.transform_vector(Vector3::unit_x() * r),
+                v: transform.transform_vector(Vector3::unit_y() * r),
+            })
+            .collect();
+    }
+    crate::face_extrusions::apply(b, &mut g)?;
+    crate::components::apply(b, &mut g)?;
+    g.is_solid = b.extrusion > 0. && b.shape != Shape::Line;
+    Ok(g)
+}
+fn build_geometry(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
+    if !b.edge_treatments.is_empty() {
+        return crate::edge_treatments::evaluate(b, loops.is_some());
+    }
+    if b.shape != Shape::Line && b.extrusion > 0. && loops.is_none() {
+        return tessellate(&primitive_shell(b)?);
+    }
+    let wire = profile_wire(b);
     let v = |x, y| builder::vertex(Point3::new(x, y, 0.));
-    let wire: Wire = match b.shape {
-        Shape::Rectangle => {
-            let points = [
-                v(-r, -b.depth / 2.),
-                v(r, -b.depth / 2.),
-                v(r, b.depth / 2.),
-                v(-r, b.depth / 2.),
-            ];
-            (0..4)
-                .map(|i| builder::line(&points[i], &points[(i + 1) % 4]))
-                .collect()
-        }
-        Shape::Line => vec![builder::line(&v(-r, 0.), &v(r, 0.))].into(),
-        Shape::Circle => builder::rsweep(
-            &v(r, 0.),
-            Point3::new(0., 0., 0.),
-            Vector3::unit_z(),
-            Rad(std::f64::consts::TAU),
-        ),
-        Shape::Semicircle => {
-            let a = v(r, 0.);
-            let z = v(-r, 0.);
-            vec![
-                builder::circle_arc(&a, &z, Point3::new(0., r, 0.)),
-                builder::line(&z, &a),
-            ]
-            .into()
-        }
-    };
     let transform = crate::regions::transform(b);
     let mut geometry = Geometry::default();
     let shell: Shell = if b.shape == Shape::Line {
@@ -196,14 +323,12 @@ fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String
             geometry
                 .points
                 .extend([edge.front().point(), edge.back().point()]);
-            crate::components::apply(b, &mut geometry)?;
             return Ok(geometry);
         }
         vec![builder::tsweep(&wire[0], Vector3::unit_z() * b.extrusion)].into()
     } else {
         let faces = if let Some(loops) = loops {
             if loops.is_empty() {
-                crate::components::apply(b, &mut geometry)?;
                 return Ok(geometry);
             }
             let wires: Vec<Wire> = loops
@@ -242,22 +367,76 @@ fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String
             if b.extrusion == 0. {
                 shell.push(face);
             } else {
-                let solid: Solid = builder::tsweep(&face, Vector3::unit_z() * b.extrusion);
-                if !solid.is_geometric_consistent() {
-                    return Err("Extrusion is not geometrically consistent.".into());
-                }
-                shell.extend(solid.boundaries()[0].clone());
+                shell.extend(extrude_face(&face, b.extrusion)?);
             }
         }
         shell
     };
     let shell = builder::transformed(&shell, transform);
+    let geometry = tessellate(&shell)?;
+    Ok(geometry)
+}
+
+pub(crate) fn profile_wire(b: &Body) -> Wire {
+    let r = b.width / 2.;
+    let v = |x, y| builder::vertex(Point3::new(x, y, 0.));
+    match b.shape {
+        Shape::Rectangle => {
+            let points = [
+                v(-r, -b.depth / 2.),
+                v(r, -b.depth / 2.),
+                v(r, b.depth / 2.),
+                v(-r, b.depth / 2.),
+            ];
+            (0..4)
+                .map(|i| builder::line(&points[i], &points[(i + 1) % 4]))
+                .collect()
+        }
+        Shape::Line => vec![builder::line(&v(-r, 0.), &v(r, 0.))].into(),
+        Shape::Circle => builder::rsweep(
+            &v(r, 0.),
+            Point3::new(0., 0., 0.),
+            Vector3::unit_z(),
+            Rad(std::f64::consts::TAU),
+        ),
+        Shape::Semicircle => {
+            let a = v(r, 0.);
+            let z = v(-r, 0.);
+            vec![
+                builder::circle_arc(&a, &z, Point3::new(0., r, 0.)),
+                builder::line(&z, &a),
+            ]
+            .into()
+        }
+    }
+}
+pub(crate) fn extrude_face(face: &truck_modeling::Face, depth: f64) -> Result<Shell, String> {
+    let solid: Solid = builder::tsweep(face, Vector3::unit_z() * depth);
+    if !solid.is_geometric_consistent() {
+        return Err("Extrusion is not geometrically consistent.".into());
+    }
+    Ok(solid.boundaries()[0].clone())
+}
+pub(crate) fn primitive_shell(b: &Body) -> Result<Shell, String> {
+    let face = builder::try_attach_plane(&[profile_wire(b)]).map_err(|e| e.to_string())?;
+    Ok(builder::transformed(
+        &extrude_face(&face, b.extrusion)?,
+        crate::regions::transform(b),
+    ))
+}
+
+pub fn tessellate(shell: &Shell) -> Result<Geometry, String> {
+    let mut geometry = Geometry {
+        shell: Some(shell.clone()),
+        ..Default::default()
+    };
     let meshed = shell.triangulation(0.01);
     // Preserve face-level output until all faces have successfully tessellated.
     let mut edges = std::collections::HashMap::new();
     let mut vertices = std::collections::HashMap::new();
     for (face_index, face) in meshed.face_iter().enumerate() {
         geometry.face_count += 1;
+        geometry.surface_roles.push(face_index);
         let mesh = face.surface();
         let mesh = mesh.as_ref().ok_or("A face could not be tessellated.")?;
         geometry.topology.faces.push(Vec::new());
@@ -300,11 +479,10 @@ fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String
     if geometry.triangles.is_empty() {
         return Err("No displayable faces were generated.".into());
     }
-    crate::components::apply(b, &mut geometry)?;
     Ok(geometry)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Model {
     pub bodies: Vec<Body>,
     undo: Vec<Vec<Body>>,
@@ -354,17 +532,35 @@ impl Model {
         } else {
             candidate.push(body.clone());
         }
+        self.replace_scene(candidate, live)?;
+        Ok(id)
+    }
+    fn replace_scene(&mut self, candidate: Vec<Body>, live: bool) -> Result<(), String> {
+        if candidate == self.bodies {
+            return Ok(());
+        }
         evaluate_scene(&candidate)?;
         if !live || !self.editing {
             self.checkpoint();
         }
         self.editing = live;
-        if let Some(old) = self.bodies.iter_mut().find(|b| b.id == id) {
-            *old = body;
-        } else {
-            self.bodies.push(body);
+        self.bodies = candidate;
+        Ok(())
+    }
+    pub fn commit_changes(&mut self, changes: &[Body]) -> Result<(), String> {
+        let mut candidate = self.bodies.clone();
+        for change in changes {
+            *candidate
+                .iter_mut()
+                .find(|b| b.id == change.id)
+                .ok_or("Changed body no longer exists.")? = change.clone();
         }
-        Ok(id)
+        self.replace_scene(candidate, false)
+    }
+    pub fn delete_many(&mut self, ids: &[u64]) -> Result<(), String> {
+        let mut candidate = self.bodies.clone();
+        candidate.retain(|b| !ids.contains(&b.id));
+        self.replace_scene(candidate, false)
     }
     fn checkpoint(&mut self) {
         self.undo.push(self.bodies.clone());
@@ -374,15 +570,7 @@ impl Model {
         self.redo.clear();
     }
     pub fn delete(&mut self, id: u64) -> Result<(), String> {
-        self.finish_edit();
-        if self.bodies.iter().any(|b| b.id == id) {
-            let mut candidate = self.bodies.clone();
-            candidate.retain(|body| body.id != id);
-            evaluate_scene(&candidate)?;
-            self.checkpoint();
-            self.bodies = candidate;
-        }
-        Ok(())
+        self.delete_many(&[id])
     }
     pub fn undo(&mut self) {
         self.finish_edit();
@@ -563,6 +751,72 @@ mod tests {
             assert!(model.bodies.is_empty());
             model.undo();
             assert_eq!(model.bodies, before);
+        }
+    }
+    #[test]
+    fn scene_cache_tracks_parameters_and_preserves_validation() {
+        let mut b = Body::new(Shape::Circle);
+        b.id = 1;
+        b.extrusion = 2.;
+        let first = evaluate_scene(&[b.clone()]).unwrap();
+        let cached = evaluate_scene(&[b.clone()]).unwrap();
+        assert_eq!(first[0].1.triangles, cached[0].1.triangles);
+        // A hit must not replace the cached kernel shape with a rebuilt one.
+        SCENE_CACHE.with(|c| {
+            assert_eq!(
+                c.borrow().as_ref().unwrap().geometry[0]
+                    .1
+                    .shell
+                    .as_ref()
+                    .unwrap()[0]
+                    .id(),
+                cached[0].1.shell.as_ref().unwrap()[0].id()
+            )
+        });
+        b.extrusion = 5.;
+        let changed = evaluate_scene(&[b.clone()]).unwrap();
+        assert!(
+            changed[0]
+                .1
+                .triangles
+                .iter()
+                .flatten()
+                .any(|p| (p.z - 5.).abs() < 1e-6)
+        );
+        b.width = f64::NAN;
+        assert!(evaluate_scene(&[b]).is_err());
+        assert!(evaluate_scene(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual geometry timing: cargo test circle_update_timings -- --ignored --nocapture"]
+    fn circle_update_timings() {
+        for treated in [false, true] {
+            for width in [2., 4., 20., 100.] {
+                let mut body = Body::new(Shape::Circle);
+                body.id = 1;
+                body.width = width;
+                body.extrusion = 3.;
+                if treated {
+                    body.edge_treatments
+                        .push(crate::edge_treatments::Modifier::new(
+                            crate::edge_treatments::Kind::Bevel,
+                            crate::edge_treatments::FaceTarget::Top,
+                            &body,
+                        ));
+                }
+                let start = std::time::Instant::now();
+                let g = evaluate_scene(&[body.clone()]).unwrap().remove(0).1;
+                let build_time = start.elapsed();
+                let start = std::time::Instant::now();
+                evaluate_scene(&[body]).unwrap();
+                eprintln!(
+                    "circle width={width} treated={treated}: build {build_time:?}, reuse {:?}, {} triangles, {} boundary samples",
+                    start.elapsed(),
+                    g.triangles.len(),
+                    g.edges.len()
+                );
+            }
         }
     }
 }

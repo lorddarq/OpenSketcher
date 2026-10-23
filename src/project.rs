@@ -29,13 +29,15 @@ pub struct Project {
     pub selection_mode: SelectionMode,
     #[serde(default)]
     pub selected_element: Option<usize>,
+    #[serde(default)]
+    pub selection: Vec<crate::selection::Pick>,
 }
 impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 4,
-            modeling_version: 4,
+            schema_version: 13,
+            modeling_version: 13,
             bodies,
             camera,
             snapping,
@@ -43,20 +45,90 @@ impl Project {
             selected,
             selection_mode: SelectionMode::Volume,
             selected_element: None,
+            selection: Vec::new(),
+        }
+    }
+    pub fn picks(&self) -> Vec<crate::selection::Pick> {
+        if self.selection.is_empty() {
+            self.selected
+                .map(|id| vec![(id, self.selected_element)])
+                .unwrap_or_default()
+        } else {
+            self.selection.clone()
         }
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=4) || !matches!(self.modeling_version, 1..=4) {
+        if !matches!(self.schema_version, 1..=13) || !matches!(self.modeling_version, 1..=13) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–4 and modeling versions 1–4."
+                "Unsupported .osk version. This application supports schema versions 1–13 and modeling versions 1–13."
                     .into(),
             );
         }
+        if (self.schema_version < 13 || self.modeling_version < 13)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.face_extrusions.iter().any(|e| e.distance < 0.))
+        {
+            return Err("Inward face extrusions require .osk version 13.".into());
+        }
+        if (self.schema_version < 12 || self.modeling_version < 12)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.evaluated))
+        {
+            return Err("Evaluated component edits require .osk version 12.".into());
+        }
+        if (self.schema_version < 11 || self.modeling_version < 11)
+            && self.bodies.iter().any(|b| !b.face_extrusions.is_empty())
+        {
+            return Err("Face extrusions require .osk version 11.".into());
+        }
+        if (self.schema_version < 7 || self.modeling_version < 7)
+            && self.bodies.iter().any(|b| b.boolean.is_some())
+        {
+            return Err("Boolean features require .osk version 7.".into());
+        }
+        if (self.schema_version < 8 || self.modeling_version < 8)
+            && self
+                .bodies
+                .iter()
+                .flat_map(|b| &b.edge_treatments)
+                .any(|m| m.chamfer != crate::edge_treatments::ChamferDefinition::Equal || m.reverse)
+        {
+            return Err("Asymmetric chamfers require .osk schema/modeling version 8.".into());
+        }
+        if (self.schema_version < 9 || self.modeling_version < 9)
+            && self
+                .bodies
+                .iter()
+                .flat_map(|b| &b.edge_treatments)
+                .any(|m| m.edge.is_some())
+        {
+            return Err("Selected-edge treatments require .osk schema/modeling version 9.".into());
+        }
+        if (self.schema_version < 10 || self.modeling_version < 10)
+            && self
+                .bodies
+                .iter()
+                .filter_map(|b| b.bore.as_ref())
+                .any(|b| b.extent != crate::operators::Extent::Distance)
+        {
+            return Err("Automatic sweep extents require .osk schema/modeling version 10.".into());
+        }
         if self.bodies.len() > 1000 {
             return Err("Project exceeds the current 1,000-object limit.".into());
+        }
+        if (self.schema_version < 6 || self.modeling_version < 6)
+            && self.bodies.iter().any(|b| b.bore.is_some())
+        {
+            return Err(
+                "Attached profile sweeps and boring require .osk schema/modeling version 6.".into(),
+            );
         }
         if (self.schema_version < 3 || self.modeling_version < 3)
             && self
@@ -65,6 +137,18 @@ impl Project {
                 .any(|body| !body.component_edits.is_empty())
         {
             return Err("Component edits require .osk schema/modeling version 3.".into());
+        }
+        if (self.schema_version < 5 || self.modeling_version < 5)
+            && (self.selection.len() > 1
+                || self.bodies.iter().any(|b| {
+                    !b.edge_treatments.is_empty()
+                        || b.component_edits.iter().any(|e| !e.elements.is_empty())
+                }))
+        {
+            return Err(
+                "Face modifiers and multiple selection require .osk schema/modeling version 5."
+                    .into(),
+            );
         }
         self.camera.validate()?;
         let mut ids = HashSet::new();
@@ -86,6 +170,19 @@ impl Project {
             if triangles > 1_000_000 {
                 return Err("Project exceeds the current geometry budget.".into());
             }
+        }
+        let mut picks = HashSet::new();
+        if self.selection.len() > 32768
+            || self.picks().iter().any(|p| {
+                !picks.insert(*p) || !crate::selection::valid(*p, &scene, self.selection_mode)
+            })
+        {
+            return Err("Invalid, duplicate, or excessive selection references.".into());
+        }
+        if !self.selection.is_empty()
+            && self.selection.last().copied() != self.selected.map(|id| (id, self.selected_element))
+        {
+            return Err("Primary selection must be the last selected item.".into());
         }
         if self.selected.is_some_and(|id| !ids.contains(&id)) {
             return Err("Selected object reference does not exist.".into());
@@ -127,8 +224,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 4;
-        project.modeling_version = 4;
+        project.schema_version = 13;
+        project.modeling_version = 13;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
