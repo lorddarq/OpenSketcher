@@ -63,8 +63,10 @@ This is confirmed modeling scope; implementation sequencing follows the initial 
 
 ### Chamfer and bevel modifiers (pending)
 
+See the [behavior and implementation preparation](specs/face-modifiers.md) for verified integration points, proposed geometry semantics, sequencing, and acceptance checks.
+
 - [ ] **Chamfer:** select the face to chamfer, then apply the Chamfer modifier to that face.
-- [ ] **Bevel:** select the face to bevel, then apply the Bevel modifier to that face.
+- [ ] **Bevel:** select the face to bevel, then apply the Bevel modifier; let the user choose rounded or flat/segmented style per modifier. Keep the style editable and persist it in `.osk`.
 - [ ] Keep both modifiers parametric: expose editable parameters and regenerate the result when values change automatically.
 - [ ] Allow removing either modifier and regenerate the model without that operation, retaining the underlying source geometry.
 - [ ] Save modifier type, parameters, order, and source-face references in `.osk` so modifiers remain editable and removable after reopening.
