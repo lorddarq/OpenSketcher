@@ -1,12 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use eframe::egui;
+mod components;
+mod gizmo;
 mod model;
 mod project;
+mod regions;
+mod selection;
 use project::Project;
+use selection::SelectionMode;
 use std::path::PathBuf;
 mod viewport;
 use model::{Body, Model, Shape};
+use truck_modeling::{Point3, Transform};
 use viewport::{Camera, View, Viewport};
 
 fn main() -> eframe::Result {
@@ -25,15 +31,21 @@ fn main() -> eframe::Result {
                 .clone()
                 .expect("wgpu renderer required");
             let mut viewport = Viewport::new(state);
-            viewport.update(&[], None).expect("empty scene");
+            viewport
+                .update(&[], None, SelectionMode::Volume, None)
+                .expect("empty scene");
             Ok(Box::new(OpenSketcher {
                 camera: Camera::default(),
                 viewport,
                 model: Model::default(),
                 selected: None,
+                selection_mode: SelectionMode::Volume,
+                selected_element: None,
                 draft: None,
                 anchor: None,
                 tool: Tool::Select,
+                transform: None,
+                pivot: None,
                 snap: true,
                 error: None,
                 path: None,
@@ -49,6 +61,8 @@ fn main() -> eframe::Result {
 enum Tool {
     Select,
     Orbit,
+    Move,
+    Rotate,
     Create(Shape),
 }
 #[derive(Clone, Copy)]
@@ -58,14 +72,26 @@ enum FileAction {
     Close,
 }
 
+struct TransformGesture {
+    body: Body,
+    geometry: model::Geometry,
+    drag: gizmo::Drag,
+    preview: Body,
+    valid: bool,
+}
+
 struct OpenSketcher {
     camera: Camera,
     viewport: Viewport,
     model: Model,
     selected: Option<u64>,
+    selection_mode: SelectionMode,
+    selected_element: Option<usize>,
     draft: Option<Body>,
     anchor: Option<[f64; 3]>,
     tool: Tool,
+    transform: Option<TransformGesture>,
+    pivot: Option<Point3>,
     snap: bool,
     error: Option<String>,
     path: Option<PathBuf>,
@@ -75,17 +101,24 @@ struct OpenSketcher {
 }
 impl OpenSketcher {
     fn snapshot(&self) -> Project {
-        Project::new(
+        let mut project = Project::new(
             self.model.bodies.clone(),
             self.camera.clone(),
             self.snap,
             self.selected,
-        )
+        );
+        project.selection_mode = self.selection_mode;
+        project.selected_element = self.selected_element;
+        project
     }
     fn dirty(&self) -> bool {
         self.snapshot() != self.saved
     }
     fn save(&mut self, save_as: bool) -> bool {
+        if self.transform.is_some() {
+            self.error = Some("Finish or cancel the transform before saving.".into());
+            return false;
+        }
         if self.anchor.is_some() {
             self.error = Some("Finish or cancel the shape preview before saving.".into());
             return false;
@@ -166,14 +199,18 @@ impl OpenSketcher {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             FileAction::New => {
-                if let Err(e) = self.viewport.update(&[], None) {
+                if let Err(e) = self.viewport.update(&[], None, SelectionMode::Volume, None) {
                     self.error = Some(e);
                     return;
                 }
+                self.transform = None;
+                self.pivot = None;
                 self.model = Model::default();
                 self.camera = Camera::default();
                 self.snap = true;
                 self.selected = None;
+                self.selection_mode = SelectionMode::Volume;
+                self.selected_element = None;
                 self.draft = None;
                 self.anchor = None;
                 self.tool = Tool::Select;
@@ -188,19 +225,29 @@ impl OpenSketcher {
                 else {
                     return;
                 };
-                let loaded = Project::load(&path)
-                    .and_then(|p| self.viewport.update(&p.bodies, p.selected).map(|()| p));
+                let loaded = Project::load(&path).and_then(|p| {
+                    self.viewport
+                        .update(&p.bodies, p.selected, p.selection_mode, p.selected_element)
+                        .map(|()| p)
+                });
                 match loaded {
                     Ok(p) => {
+                        self.transform = None;
+                        self.pivot = None;
                         self.model = Model::from_bodies(p.bodies.clone());
                         self.camera = p.camera.clone();
                         self.snap = p.snapping;
                         self.selected = p.selected;
+                        self.selection_mode = p.selection_mode;
+                        self.selected_element = p.selected_element;
                         self.draft = self
                             .model
                             .bodies
                             .iter()
-                            .find(|b| Some(b.id) == self.selected)
+                            .find(|b| {
+                                Some(b.id) == self.selected
+                                    && self.selection_mode == SelectionMode::Volume
+                            })
                             .cloned();
                         self.anchor = None;
                         self.tool = Tool::Select;
@@ -214,15 +261,41 @@ impl OpenSketcher {
         }
     }
     fn refresh(&mut self) {
-        if let Err(e) = self.viewport.update(&self.model.bodies, self.selected) {
+        if let Err(e) = self.viewport.update(
+            &self.model.bodies,
+            self.selected,
+            self.selection_mode,
+            self.selected_element,
+        ) {
             self.error = Some(e);
         }
     }
     fn select(&mut self, id: Option<u64>) {
+        self.set_selection(id, SelectionMode::Volume, None);
+    }
+    fn set_selection(&mut self, id: Option<u64>, mode: SelectionMode, element: Option<usize>) {
+        self.transform = None;
+        self.pivot = None;
         self.model.finish_edit();
         self.selected = id;
-        self.draft = self.model.bodies.iter().find(|b| Some(b.id) == id).cloned();
+        self.selection_mode = mode;
+        self.selected_element = element;
+        self.draft = if mode == SelectionMode::Volume {
+            self.model.bodies.iter().find(|b| Some(b.id) == id).cloned()
+        } else {
+            None
+        };
         self.refresh();
+    }
+    fn gizmo_pivot(&self) -> Option<Point3> {
+        self.pivot.or_else(|| {
+            let (_, geometry) = self
+                .viewport
+                .scene
+                .iter()
+                .find(|(id, _)| Some(*id) == self.selected)?;
+            components::pivot(geometry, self.selection_mode, self.selected_element)
+        })
     }
     fn commit(&mut self, body: Body) {
         match self.model.commit(body) {
@@ -233,7 +306,22 @@ impl OpenSketcher {
             Err(e) => self.error = Some(e),
         }
     }
+    fn delete_selected(&mut self) {
+        if let Some(id) = self.selected {
+            match self.model.delete(id) {
+                Ok(()) => {
+                    self.error = None;
+                    self.select(None);
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
     fn history(&mut self, redo: bool) {
+        if self.transform.take().is_some() {
+            self.refresh();
+            return;
+        }
         if self.anchor.take().is_some() {
             return;
         }
@@ -245,7 +333,22 @@ impl OpenSketcher {
         let id = self
             .selected
             .filter(|id| self.model.bodies.iter().any(|b| b.id == *id));
-        self.select(id);
+        self.refresh();
+        let valid = id.is_some_and(|id| {
+            self.viewport.scene.iter().any(|(owner, g)| {
+                *owner == id
+                    && self
+                        .selected_element
+                        .is_some_and(|element| element < self.selection_mode.count(g))
+            })
+        });
+        if self.selection_mode == SelectionMode::Volume {
+            self.select(id);
+        } else if valid {
+            self.set_selection(id, self.selection_mode, self.selected_element);
+        } else {
+            self.set_selection(None, self.selection_mode, None);
+        }
     }
     fn creation_point(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
         let mut p = self.camera.ground(point, rect)?;
@@ -372,16 +475,16 @@ impl eframe::App for OpenSketcher {
                 self.history(true);
             }
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if self.anchor.take().is_none() {
+                if self.transform.take().is_some() {
+                    self.refresh();
+                } else if self.anchor.take().is_none() {
                     self.tool = Tool::Select;
                 }
-                self.select(self.selected);
             }
             if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
-                && let Some(id) = self.selected
+                && self.selection_mode == SelectionMode::Volume
             {
-                self.model.delete(id);
-                self.select(None);
+                self.delete_selected();
             }
         }
         egui::Panel::top("header").show_inside(ui, |ui| {
@@ -425,37 +528,118 @@ impl eframe::App for OpenSketcher {
                     self.history(true);
                 }
             });
-            ui.horizontal_wrapped(|ui| {
-                for (tool, label) in [
-                    (Tool::Select, "Select"),
-                    (Tool::Orbit, "Orbit"),
-                    (Tool::Create(Shape::Rectangle), "Rectangle"),
-                    (Tool::Create(Shape::Circle), "Circle"),
-                    (Tool::Create(Shape::Line), "Line"),
-                    (Tool::Create(Shape::Semicircle), "Semicircle"),
-                ] {
-                    if ui.selectable_label(self.tool == tool, label).clicked() {
-                        self.tool = tool;
-                        self.anchor = None;
-                        self.model.finish_edit();
-                    }
-                }
-                ui.separator();
-                ui.checkbox(&mut self.snap, "Snap").on_hover_text(
-                    "Enabled by default: 0.5-unit grid and X/Y alignment to the first point",
-                );
-            });
         });
         egui::Panel::bottom("status").show_inside(ui,|ui| {
             if let Some(e)=&self.error {ui.colored_label(egui::Color32::LIGHT_RED,e);}
             ui.label(match self.tool {
-                Tool::Select=>"Click geometry to select · Values update automatically · Shift-drag / right / middle to pan · Scroll to zoom",
+                Tool::Select=>match self.selection_mode {
+                    SelectionMode::Volume=>"Volume selection · Click an object · Properties update automatically · Shift-drag / right / middle to pan",
+                    SelectionMode::Face=>"Face selection · Click a visible face · Move/Rotate handles edit the selected face",
+                    SelectionMode::Edge=>"Edge selection · Click near a visible boundary edge · Move/Rotate handles edit the selected edge",
+                    SelectionMode::Point=>"Point selection · Click a visible topology vertex · Control-node editing is separate",
+                },
+                Tool::Move=>"Move · Select geometry, then drag an axis arrow or plane handle · Snap: 0.5 units · Escape cancels · Alt-click sets pivot",
+                Tool::Rotate=>"Rotate · Select geometry, then drag an axis ring · Snap: 15° · Alt-click sets pivot (needed for a single point) · Escape cancels",
                 Tool::Orbit=>"Drag to orbit · Shift-drag / right / middle to pan · Scroll to zoom",
                 Tool::Create(_)=>"Pick two points on the XY plane · Escape cancels the preview · Snap is on by default",
             });
         });
-        egui::Panel::right("inspector").default_size(330.).show_inside(ui,|ui| {
-            egui::ScrollArea::vertical().show(ui,|ui| {
+        let canvas = ui.available_rect_before_wrap();
+        let panel_height = (canvas.height() - 24.).max(100.);
+        egui::Window::new("Tools")
+            .default_pos(canvas.left_top() + egui::vec2(12., 12.))
+            .constrain_to(canvas)
+            .default_width(135.)
+            .resizable(false)
+            .collapsible(false)
+            .enabled(self.pending.is_none())
+            .show(&ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((panel_height - 36.).max(64.))
+                    .show(ui, |ui| {
+                        for (tool, label) in [
+                            (Tool::Select, "Select"),
+                            (Tool::Orbit, "Orbit"),
+                            (Tool::Move, "Move"),
+                            (Tool::Rotate, "Rotate"),
+                            (Tool::Create(Shape::Rectangle), "Rectangle"),
+                            (Tool::Create(Shape::Circle), "Circle"),
+                            (Tool::Create(Shape::Line), "Line"),
+                            (Tool::Create(Shape::Semicircle), "Semicircle"),
+                        ] {
+                            if ui.selectable_label(self.tool == tool, label).clicked() {
+                                self.transform = None;
+                                self.refresh();
+                                self.tool = tool;
+                                self.anchor = None;
+                                self.model.finish_edit();
+                            }
+                        }
+
+                        ui.separator();
+                        if matches!(self.tool, Tool::Move | Tool::Rotate) {
+                            ui.weak("Drag colored handles. X / Y / Z are world axes.");
+                            ui.weak("Alt-click canvas to set pivot on a view-aligned plane.");
+                            if ui.button("Reset pivot").clicked() {
+                                self.transform = None;
+                                self.pivot = None;
+                                self.refresh();
+                            }
+                        }
+                        ui.checkbox(&mut self.snap, "Snap")
+                            .on_hover_text("Creation: 0.5-unit grid and X/Y alignment. Move: 0.5-unit offsets. Rotate: 15° offsets.");
+                        ui.separator();
+                        ui.label("Selection");
+                        for mode in [
+                            SelectionMode::Volume,
+                            SelectionMode::Face,
+                            SelectionMode::Edge,
+                            SelectionMode::Point,
+                        ] {
+                            if ui
+                                .selectable_label(self.selection_mode == mode, mode.label())
+                                .clicked()
+                            {
+                                self.select(None);
+                                self.selection_mode = mode;
+                                if !matches!(self.tool, Tool::Move | Tool::Rotate) {
+                                    self.tool = Tool::Select;
+                                }
+                                self.anchor = None;
+                                self.refresh();
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label("View");
+                        for (view, label) in [
+                            (View::Isometric, "Isometric"),
+                            (View::Top, "Top"),
+                            (View::Side, "Side"),
+                        ] {
+                            if ui
+                                .selectable_label(self.camera.view == view, label)
+                                .clicked()
+                            {
+                                self.transform = None;
+                                self.refresh();
+                                self.camera.preset(view);
+                            }
+                        }
+
+                        if self.camera.view == View::Free {
+                            ui.weak("Free orbit");
+                        }
+                    });
+            });
+        egui::Window::new("Model & properties")
+            .default_pos(egui::pos2(canvas.right()-342.,canvas.top()+12.))
+            .constrain_to(canvas)
+            .default_width(330.).max_height(panel_height)
+            .resizable(false).collapsible(false)
+            .enabled(self.pending.is_none() && self.transform.is_none())
+            .show(&ctx,|ui| {
+            egui::ScrollArea::vertical().auto_shrink([false,true]).max_height((panel_height-36.).max(64.)).show(ui,|ui| {
                 if let Tool::Create(shape)=self.tool {
                     ui.heading(format!("Create {}",shape.label()));
                     ui.label(match shape { Shape::Rectangle=>"Pick opposite corners on the XY plane.", Shape::Circle=>"Pick center, then a point on the radius.", Shape::Line=>"Pick the start and end points.", Shape::Semicircle=>"Pick the two diameter endpoints." });
@@ -470,9 +654,23 @@ impl eframe::App for OpenSketcher {
                     if ui.selectable_label(self.selected==Some(body.id),format!("{} {}",body.shape.label(),body.id)).clicked(){next=Some(body.id);}
                 }
                 if let Some(id)=next {self.select(Some(id));}
+                if self.selection_mode!=SelectionMode::Volume {
+                    ui.separator();
+                    if let (Some(id),Some(element))=(self.selected,self.selected_element) {
+                        ui.label(format!("{} {} · Object {}",self.selection_mode.label(),element+1,id));
+                    }else{ui.label(format!("Pick a {} in the viewport.",self.selection_mode.label().to_lowercase()));}
+                    ui.weak("Choose Move or Rotate and drag the gizmo to edit this component. Adjacent boundaries rebuild together.");
+                    if self.selection_mode==SelectionMode::Point { ui.weak("Rotation around a point itself has no effect. Alt-click to place an offset pivot."); }
+                    if self.selection_mode==SelectionMode::Point {ui.weak("Points are topology vertices; deformation control nodes are separate future editing tools.");}
+                }
                 if let Some(mut draft)=self.draft.take() {
                     ui.separator();ui.heading(format!("{} {}",draft.shape.label(),draft.id));
                     let before=draft.clone();
+                    if !draft.component_edits.is_empty() {
+                        ui.label(format!("Component edits: {}",draft.component_edits.len()));
+                        ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
+                        if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
+                    }
                     let mut finished=dimensions(ui,&mut draft);
                     ui.add_space(8.);finished |= vector(ui,"Position · world units",&mut draft.position,-1000.0..=1000.0);
                     finished |= vector(ui,"Rotation · degrees · local X, Y, Z order",&mut draft.rotation,-36000.0..=36000.0);
@@ -487,7 +685,7 @@ impl eframe::App for OpenSketcher {
                     }
                     if finished {self.model.finish_edit();}
                     self.draft=Some(draft);
-                    if delete {if let Some(id) = self.selected { self.model.delete(id); }self.select(None);}
+                    if delete {self.delete_selected();}
                 }
                 ui.separator();
                 if ui.button("Fit model").clicked(){self.camera.fit(&self.viewport.scene);}
@@ -495,118 +693,267 @@ impl eframe::App for OpenSketcher {
         });
         if !ui.input(|i| i.focused) {
             self.model.finish_edit();
+            if self.transform.take().is_some() {
+                self.refresh();
+            }
         }
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (view, label) in [
-                    (View::Isometric, "Isometric"),
-                    (View::Top, "Top"),
-                    (View::Side, "Side"),
-                ] {
-                    if ui
-                        .selectable_label(self.camera.view == view, label)
-                        .clicked()
-                    {
-                        self.camera.preset(view);
-                    }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                let size = ui.available_size();
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let transform_tool = matches!(self.tool, Tool::Move | Tool::Rotate);
+                let rotate = self.tool == Tool::Rotate;
+                let mut gizmo_handled = self.transform.is_some();
+                if self.transform.is_none() {
+                    self.camera
+                        .interact(&response, ui, self.tool == Tool::Orbit);
                 }
-                if self.camera.view == View::Free {
-                    ui.weak("Free orbit");
+                if transform_tool
+                    && self.pending.is_none()
+                    && response.hovered()
+                    && !ui.input(|i| i.modifiers.shift || i.modifiers.alt)
+                    && ui.input(|i| i.pointer.primary_pressed())
+                    && let (Some(point), Some(pivot)) = (
+                        ui.input(|i| gizmo::press_origin(&i.events)),
+                        self.gizmo_pivot(),
+                    )
+                    && let Some(handle) = gizmo::hit(&self.camera, rect, pivot, rotate, point)
+                    && let Some(body) = self
+                        .model
+                        .bodies
+                        .iter()
+                        .find(|b| Some(b.id) == self.selected)
+                        .cloned()
+                    && let Some((_, geometry)) =
+                        self.viewport.scene.iter().find(|(id, _)| *id == body.id)
+                {
+                    self.model.finish_edit();
+                    self.transform = Some(TransformGesture {
+                        preview: body.clone(),
+                        body,
+                        geometry: geometry.clone(),
+                        drag: gizmo::Drag::new(handle, point, pivot),
+                        valid: true,
+                    });
+                    self.error = None;
+                    gizmo_handled = true;
                 }
-                ui.separator();
-                ui.weak("Orthographic · X red / Y green / Z blue");
-            });
-            let size = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-            self.camera
-                .interact(&response, ui, self.tool == Tool::Orbit);
-            if response.clicked()
-                && !ui.input(|i| i.modifiers.shift)
-                && let Some(point) = response.interact_pointer_pos()
-            {
-                match self.tool {
-                    Tool::Select => {
-                        let id = self.viewport.pick(&self.camera, point, rect);
-                        self.select(id);
-                    }
-                    Tool::Create(shape) => {
-                        if let Some(p) = self.creation_point(point, rect) {
-                            if let Some(a) = self.anchor {
-                                match Body::from_points(shape, a, p) {
-                                    Ok(body) => {
-                                        self.commit(body);
-                                        self.anchor = None;
-                                    }
-                                    Err(e) => self.error = Some(e),
-                                }
-                            } else {
-                                self.anchor = Some(p);
+                if let Some(mut gesture) = self.transform.take() {
+                    if let Some(point) = ui.input(|i| i.pointer.interact_pos()) {
+                        gesture.drag.update(&self.camera, point, rect, self.snap);
+                        let result = components::transformed(
+                            &gesture.body,
+                            &gesture.geometry,
+                            self.selection_mode,
+                            self.selected_element,
+                            gesture.drag.matrix,
+                        )
+                        .and_then(|preview| {
+                            let mut bodies = self.model.bodies.clone();
+                            if let Some(body) = bodies.iter_mut().find(|b| b.id == preview.id) {
+                                *body = preview.clone();
+                            }
+                            self.viewport.update(
+                                &bodies,
+                                self.selected,
+                                self.selection_mode,
+                                self.selected_element,
+                            )?;
+                            Ok(preview)
+                        });
+                        match result {
+                            Ok(preview) => {
+                                gesture.preview = preview;
+                                gesture.valid = true;
                                 self.error = None;
                             }
-                        } else {
-                            self.error = Some(
-                                "The XY plane is edge-on. Switch to Top or Isometric to draw."
-                                    .into(),
-                            );
+                            Err(error) => {
+                                gesture.valid = false;
+                                self.error = Some(error);
+                            }
                         }
                     }
-                    _ => {}
+                    if ui.input(|i| i.pointer.primary_released()) {
+                        if gesture.valid {
+                            match self.model.commit(gesture.preview) {
+                                Ok(id) => {
+                                    let pivot = self.pivot;
+                                    self.set_selection(
+                                        Some(id),
+                                        self.selection_mode,
+                                        self.selected_element,
+                                    );
+                                    self.pivot = pivot;
+                                    self.error = None;
+                                }
+                                Err(error) => {
+                                    self.error = Some(error);
+                                    self.refresh();
+                                }
+                            }
+                        } else {
+                            self.refresh();
+                        }
+                    } else {
+                        self.transform = Some(gesture);
+                    }
                 }
-            }
-            let pixels = ui.ctx().pixels_per_point();
-            let id = self.viewport.render(
-                [(size.x * pixels) as u32, (size.y * pixels) as u32],
-                &self.camera,
-            );
-            ui.painter().image(
-                id,
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
-                egui::Color32::WHITE,
-            );
-            if let Tool::Create(shape) = self.tool
-                && let Some(pointer) = response.hover_pos()
-                && let Some(p) = self.creation_point(pointer, rect)
-            {
-                let screen = self.camera.project(p.into(), rect).0;
-                ui.painter().circle_stroke(
-                    screen,
-                    4.,
-                    egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
-                );
-                if let Some(a) = self.anchor {
-                    if let Ok(body) = Body::from_points(shape, a, p) {
-                        if let Ok(g) = model::evaluate(&body) {
-                            for edge in g.edges {
-                                ui.painter().line_segment(
-                                    edge.map(|p| self.camera.project(p, rect).0),
-                                    egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+                if response.clicked()
+                    && !gizmo_handled
+                    && !ui.input(|i| i.modifiers.shift)
+                    && let Some(point) = response.interact_pointer_pos()
+                {
+                    match self.tool {
+                        Tool::Select | Tool::Move | Tool::Rotate => {
+                            if transform_tool && ui.input(|i| i.modifiers.alt) {
+                                if let Some(pivot) = self.gizmo_pivot() {
+                                    self.pivot = self.camera.screen_plane(point, rect, pivot);
+                                }
+                            } else {
+                                let mode = self.selection_mode;
+                                let picked = self.viewport.pick(&self.camera, point, rect, mode);
+                                self.set_selection(
+                                    picked.map(|p| p.0),
+                                    mode,
+                                    picked.and_then(|p| p.1),
                                 );
                             }
                         }
-                        ui.painter().text(
-                            screen + egui::vec2(12., -12.),
-                            egui::Align2::LEFT_BOTTOM,
-                            format!(
-                                "{:.2}{}",
-                                body.width,
-                                if shape == Shape::Rectangle {
-                                    format!(" × {:.2}", body.depth)
+                        Tool::Create(shape) => {
+                            if let Some(p) = self.creation_point(point, rect) {
+                                if let Some(a) = self.anchor {
+                                    match Body::from_points(shape, a, p) {
+                                        Ok(body) => {
+                                            self.commit(body);
+                                            self.anchor = None;
+                                        }
+                                        Err(e) => self.error = Some(e),
+                                    }
                                 } else {
-                                    String::new()
+                                    self.anchor = Some(p);
+                                    self.error = None;
                                 }
-                            ),
-                            egui::FontId::monospace(12.),
+                            } else {
+                                self.error = Some(
+                                    "The XY plane is edge-on. Switch to Top or Isometric to draw."
+                                        .into(),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let pixels = ui.ctx().pixels_per_point();
+                let id = self.viewport.render(
+                    [(size.x * pixels) as u32, (size.y * pixels) as u32],
+                    &self.camera,
+                );
+                ui.painter().image(
+                    id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
+                    egui::Color32::WHITE,
+                );
+                if self.selection_mode == SelectionMode::Point {
+                    let painter = ui.painter().with_clip_rect(rect);
+                    for (id, g) in &self.viewport.scene {
+                        for (index, p) in g.points.iter().enumerate() {
+                            if selection::visible(&self.viewport.scene, &self.camera, *p, rect) {
+                                let chosen = self.selected == Some(*id)
+                                    && self.selected_element == Some(index);
+                                let point = self.camera.project(*p, rect).0;
+                                painter.circle_filled(
+                                    point,
+                                    if chosen { 5. } else { 3.5 },
+                                    if chosen {
+                                        egui::Color32::LIGHT_BLUE
+                                    } else {
+                                        egui::Color32::WHITE
+                                    },
+                                );
+                                painter.circle_stroke(
+                                    point,
+                                    if chosen { 6. } else { 4. },
+                                    egui::Stroke::new(1., egui::Color32::BLACK),
+                                );
+                            }
+                        }
+                    }
+                }
+                if transform_tool && let Some(pivot) = self.gizmo_pivot() {
+                    let (pivot, active) = if let Some(gesture) = &self.transform {
+                        let p = if rotate {
+                            gesture.drag.pivot
+                        } else {
+                            gesture.drag.matrix.transform_point(gesture.drag.pivot)
+                        };
+                        (p, Some(gesture.drag.handle))
+                    } else {
+                        (pivot, None)
+                    };
+                    gizmo::draw(
+                        ui.painter(),
+                        &self.camera,
+                        rect,
+                        pivot,
+                        rotate,
+                        active,
+                        response.hover_pos(),
+                    );
+                    if let Some(gesture) = &self.transform {
+                        ui.painter().text(
+                            self.camera.project(pivot, rect).0 + egui::vec2(12., 22.),
+                            egui::Align2::LEFT_TOP,
+                            &gesture.drag.value,
+                            egui::FontId::monospace(13.),
                             egui::Color32::WHITE,
                         );
                     }
-                    ui.painter().circle_filled(
-                        self.camera.project(a.into(), rect).0,
-                        4.,
-                        egui::Color32::LIGHT_GREEN,
-                    );
                 }
-            }
-        });
+                if let Tool::Create(shape) = self.tool
+                    && let Some(pointer) = response.hover_pos()
+                    && let Some(p) = self.creation_point(pointer, rect)
+                {
+                    let screen = self.camera.project(p.into(), rect).0;
+                    ui.painter().circle_stroke(
+                        screen,
+                        4.,
+                        egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+                    );
+                    if let Some(a) = self.anchor {
+                        if let Ok(body) = Body::from_points(shape, a, p) {
+                            if let Ok(g) = model::evaluate(&body) {
+                                for edge in g.edges {
+                                    ui.painter().line_segment(
+                                        edge.map(|p| self.camera.project(p, rect).0),
+                                        egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+                                    );
+                                }
+                            }
+                            ui.painter().text(
+                                screen + egui::vec2(12., -12.),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!(
+                                    "{:.2}{}",
+                                    body.width,
+                                    if shape == Shape::Rectangle {
+                                        format!(" × {:.2}", body.depth)
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                                egui::FontId::monospace(12.),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        ui.painter().circle_filled(
+                            self.camera.project(a.into(), rect).0,
+                            4.,
+                            egui::Color32::LIGHT_GREEN,
+                        );
+                    }
+                }
+            });
     }
 }

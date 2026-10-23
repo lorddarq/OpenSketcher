@@ -26,8 +26,10 @@ The following are initial implementation assumptions, not a claim that the full 
 
 - Create lines, rectangles, circles, semicircles, and regular polygons on a construction plane. Initial implemented tools cover lines, rectangles, circles, and semicircles; regular polygons remain pending.
 - Define creation by picked points: opposite rectangle corners, line endpoints, circle center/radius, and semicircle diameter endpoints. Show a preview after the first point; commit on the second. Snapping is enabled by default.
+- Circle interaction uses a canvas-picked center and mouse-defined radius, with Radius as the displayed measurement. Drawing on existing geometry requires prior face selection, exposing that face's relevant points and boundary references. Capture its support plane rather than switching planes on hover. The [face-first sketching specification](specs/face-sketching.md) records the behavior, current code gaps, and implementation sequence; this is not implemented yet.
 - Numeric property changes apply automatically, with undo/redo instead of Apply or Revert Fields actions. Group one continuous field edit into one undo action.
-- Select geometry, move it, edit dimensions, and delete it.
+- Distinguish Volume, Face, Edge, and Point selection. Volume selects an entire object; Face/Edge/Point select individual topology elements and highlight only that component. Point selection is distinct from deformation control-node editing.
+- Whole-object movement, dimension editing, and deletion are available in Volume mode. Component modes support constrained Move/Rotate gizmos; they must never silently transform or delete the owner. Component scaling remains pending.
 - Show a live preview while drawing or editing; Escape cancels without changing committed geometry.
 - Support numeric dimensions as well as pointer input.
 - Undo and redo each committed modeling operation as one action.
@@ -68,6 +70,8 @@ This is confirmed modeling scope; implementation sequencing follows the initial 
 - Endpoint, midpoint, face, and intersection snapping are separate future scope.
 
 ### Viewport needed for modeling
+
+- Keep the canvas behind floating overlays: tool controls on the left and model/properties on the right. Panels are draggable within canvas bounds, properties scroll, and panel pointer/scroll events must not activate canvas tools or camera zoom.
 
 - Orbit, pan, and zoom with quick Isometric, Top, and Side presets. The initial implementation uses orthographic projection including free orbit; perspective is a subsequent addition.
 - World axes, a construction grid, basic shaded faces, and visible edges.
@@ -135,4 +139,23 @@ Use [Tabler Icons](https://tabler.io/icons), outline style, for application icon
 
 ## Current implementation boundary
 
-The repository contains an editor shell, desktop build workflow, and a depth-tested wgpu viewport with Truck-backed geometry. Implemented controls include two-point XY creation for rectangles/circles/lines/semicircles, grid/axis alignment snapping enabled by default, whole-object picking, automatic numeric dimension/extrusion/position/rotation/scale editing, deletion, and session undo/redo. The model starts empty. GPU geometry is derived from authored parameters. Versioned `.osk` Save/Load preserves all currently implemented scene properties and editable parameters, with native dialogs and unsaved-change protection. Regular polygons, face-level editing, boring, node deformation, and transform gizmos remain pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
+The repository contains an editor shell, desktop build workflow, and a depth-tested wgpu viewport with Truck-backed geometry. Implemented controls include two-point XY creation for rectangles/circles/lines/semicircles, grid/axis alignment snapping enabled by default, Volume/Face/Edge/Point picking and highlighting, automatic whole-object numeric dimension/extrusion/position/rotation/scale editing, deletion, and session undo/redo. The model starts empty. GPU geometry is derived from authored parameters. Versioned `.osk` Save/Load preserves all currently implemented scene properties and editable parameters, with native dialogs and unsaved-change protection. Move/Rotate gizmos now edit Volume/Face/Edge/Point selections with saved component transforms and guarded topology references. Regular polygons, dedicated push/pull, boring, node deformation, exact curved component reconstruction, and a Scale gizmo remain pending. Keep geometry/document data independent of egui and GPU resources; introduce modules as implementation requires them rather than scaffolding a speculative engine.
+
+### Coplanar region splitting
+
+Closed profiles drawn over older coplanar profiles now partition their regions before extrusion. Newer profile IDs take precedence in overlapping areas. Extruding an older surrounding region excludes those areas and generates cut walls; newer regions keep their own extrusion height. Edge-touching profiles create notches and crossing profiles can leave disconnected regions. Edits, deletion, undo/redo, and `.osk` reload regenerate the result. Open-line partitions, elevated solid-face sketches, and exact analytic curved intersections remain pending. Split curved profiles currently use polygonal boundaries; untouched Truck curves remain analytic. See the [modeling version 2 rules](formats/osk.md#coplanar-region-evaluation-modeling-version-2).
+
+### Move/Rotate gizmos
+
+- [x] World X/Y/Z translation arrows, XY/YZ/ZX move-plane handles, and world-axis rotation rings in every selection mode.
+- [x] Screen-sized handles, hit tolerances, hover/active highlighting, axis labels, and a live constrained distance/angle readout.
+- [x] Pointer drag/release previews, Escape/tool/view/focus-loss cancellation, default 0.5-unit / 15-degree snapping, and one undo step per completed gesture.
+- [x] Automatic selection pivot and Alt-click offset pivot; a point rotated about itself is a no-op.
+- [x] True world rotation composition for an already rotated/scaled volume; component transforms preserve the owning body's authored pose.
+- [x] Regenerated component boundary edits, adjacency rebuilding, topology-signature validation, atomic edit/delete rejection, and schema/modeling version 3 persistence.
+- [ ] Exact analytic curved/nonplanar component surface reconstruction (current output uses a regenerated faceted boundary).
+- [ ] Component edits on a profile cutting another region; use Volume transforms for that profile for now.
+- [ ] General self-intersection detection and semantic references beyond guarded output connectivity.
+- [ ] Scale gizmo, multi-component selection, NURBS/control-cage editing, and soft-selection falloff controls.
+
+Regression checks cover all selection modes for movement/rotation across all four existing profile types, constrained handle math in each view preset, a complete press/move/release batch in one frame, world rotation composition, single-point pivot behavior, component reference errors, collapsing geometry, undo/redo, and `.osk` regeneration. Native macOS review verified volume-axis movement, face movement/rotation with connected walls, edge movement, and the fast-drag fix; native point/pivot interaction and Windows/Linux runtime review remain pending.

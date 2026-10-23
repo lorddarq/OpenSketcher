@@ -1,5 +1,6 @@
+use crate::selection::SelectionMode;
 use crate::{
-    model::{Body, evaluate},
+    model::{Body, evaluate_scene},
     viewport::Camera,
 };
 use serde::{Deserialize, Serialize};
@@ -22,40 +23,62 @@ pub struct Project {
     pub camera: Camera,
     pub snapping: bool,
     pub selected: Option<u64>,
+    #[serde(default)]
+    pub selection_mode: SelectionMode,
+    #[serde(default)]
+    pub selected_element: Option<usize>,
 }
 impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 1,
-            modeling_version: 1,
+            schema_version: 3,
+            modeling_version: 3,
             bodies,
             camera,
             snapping,
             selected,
+            selection_mode: SelectionMode::Volume,
+            selected_element: None,
         }
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if self.schema_version != 1 || self.modeling_version != 1 {
+        if !matches!(self.schema_version, 1..=3) || !matches!(self.modeling_version, 1..=3) {
             return Err(
-                "Unsupported .osk version. This application supports schema/modeling version 1."
+                "Unsupported .osk version. This application supports schema versions 1–3 and modeling versions 1–3."
                     .into(),
             );
         }
         if self.bodies.len() > 1000 {
             return Err("Project exceeds the current 1,000-object limit.".into());
         }
+        if (self.schema_version < 3 || self.modeling_version < 3)
+            && self
+                .bodies
+                .iter()
+                .any(|body| !body.component_edits.is_empty())
+        {
+            return Err("Component edits require .osk schema/modeling version 3.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
-        for body in &self.bodies {
+        let scene = evaluate_scene(&self.bodies)?;
+        for (body, (_, geometry)) in self.bodies.iter().zip(&scene) {
             if body.id == 0 || body.id == u64::MAX || !ids.insert(body.id) {
                 return Err("Invalid or duplicate object ID.".into());
             }
-            let geometry = evaluate(body).map_err(|e| format!("Object {}: {e}", body.id))?;
+            if self.selected == Some(body.id)
+                && self.selection_mode != SelectionMode::Volume
+                && self
+                    .selected_element
+                    .is_none_or(|element| element >= self.selection_mode.count(geometry))
+            {
+                return Err("Selected component does not exist.".into());
+            }
             triangles += geometry.triangles.len();
             if triangles > 1_000_000 {
                 return Err("Project exceeds the current geometry budget.".into());
@@ -63,6 +86,16 @@ impl Project {
         }
         if self.selected.is_some_and(|id| !ids.contains(&id)) {
             return Err("Selected object reference does not exist.".into());
+        }
+        if (self.selected.is_none() || self.selection_mode == SelectionMode::Volume)
+            && self.selected_element.is_some()
+        {
+            return Err("Invalid component selection.".into());
+        }
+        if self.schema_version == 1
+            && (self.selection_mode != SelectionMode::Volume || self.selected_element.is_some())
+        {
+            return Err("Schema 1 cannot contain component selection.".into());
         }
         Ok(())
     }
@@ -75,9 +108,16 @@ impl Project {
         if bytes.len() as u64 > MAX_BYTES {
             return Err("Project exceeds the 16 MiB file limit.".into());
         }
-        let project: Self =
+        let mut project: Self =
             serde_json::from_slice(&bytes).map_err(|e| format!("Invalid .osk document: {e}"))?;
+        if project.modeling_version == 1 && project.schema_version <= 2 {
+            // Partitioning changes topology slots; preserve the owner, discard stale slots.
+            project.selection_mode = SelectionMode::Volume;
+            project.selected_element = None;
+        }
         project.validate()?;
+        project.schema_version = 3;
+        project.modeling_version = 3;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -135,6 +175,25 @@ mod tests {
         project.save(&path).unwrap();
         let restored = Project::load(&path).unwrap();
         assert_eq!(restored, project);
+        for mode in [
+            SelectionMode::Face,
+            SelectionMode::Edge,
+            SelectionMode::Point,
+        ] {
+            let mut component = project.clone();
+            component.selection_mode = mode;
+            component.selected_element = Some(0);
+            component.save(&path).unwrap();
+            assert_eq!(Project::load(&path).unwrap(), component);
+            component.selected_element = Some(usize::MAX);
+            assert!(component.validate().is_err());
+        }
+        let mut legacy = serde_json::to_value(&project).unwrap();
+        legacy["schema_version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("selection_mode");
+        legacy.as_object_mut().unwrap().remove("selected_element");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(Project::load(&path).unwrap(), project);
         let mut model = Model::from_bodies(restored.bodies);
         let mut edit = model.bodies[0].clone();
         edit.width = 5.;

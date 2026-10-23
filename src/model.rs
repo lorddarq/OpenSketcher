@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use truck_meshalgo::tessellation::MeshableShape;
-use truck_modeling::{Deg, Matrix4, Point3, Rad, Shell, Solid, Vector3, Wire, builder};
+use truck_modeling::{Point3, Rad, Shell, Solid, Vector3, Wire, builder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,8 @@ pub struct Body {
     pub position: [f64; 3],
     pub rotation: [f64; 3],
     pub scale: [f64; 3],
+    #[serde(default)]
+    pub component_edits: Vec<crate::components::ComponentEdit>,
 }
 impl Body {
     pub fn new(shape: Shape) -> Self {
@@ -44,6 +46,7 @@ impl Body {
             position: [0.; 3],
             rotation: [0.; 3],
             scale: [1.; 3],
+            component_edits: Vec::new(),
         }
     }
     pub fn from_points(shape: Shape, a: [f64; 3], b: [f64; 3]) -> Result<Self, String> {
@@ -69,6 +72,7 @@ impl Body {
         Ok(body)
     }
     pub fn validate(&self) -> Result<(), String> {
+        crate::components::validate(&self.component_edits)?;
         if ![self.width, self.depth, self.extrusion]
             .into_iter()
             .chain(self.position)
@@ -95,19 +99,55 @@ impl Body {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Geometry {
     pub triangles: Vec<[Point3; 3]>,
     pub edges: Vec<[Point3; 2]>,
+    pub triangle_faces: Vec<usize>,
+    pub edge_groups: Vec<usize>,
+    pub points: Vec<Point3>,
+    pub face_count: usize,
+    pub edge_count: usize,
+    pub topology: crate::components::Topology,
 }
 
 pub fn evaluate(body: &Body) -> Result<Geometry, String> {
     body.validate()?;
     // The kernel is never called with unchecked UI values. Its panic must not discard the document.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body)))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body, None)))
         .map_err(|_| "The geometry kernel could not evaluate these parameters.".to_owned())?
 }
-fn build(b: &Body) -> Result<Geometry, String> {
+pub fn evaluate_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
+    for body in bodies {
+        body.validate()?;
+    }
+    for cutter in bodies
+        .iter()
+        .filter(|body| !body.component_edits.is_empty())
+    {
+        for target in bodies
+            .iter()
+            .filter(|body| body.id < cutter.id && body.shape != Shape::Line)
+        {
+            if crate::regions::boundaries(target, &[target.clone(), cutter.clone()])?.is_some() {
+                return Err("Component edits on a profile cutting another region are not supported yet. Use Volume transforms for that profile.".into());
+            }
+        }
+    }
+    bodies
+        .iter()
+        .map(|body| {
+            let loops = crate::regions::boundaries(body, bodies)?;
+            let geometry =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(body, loops)))
+                    .map_err(|_| {
+                        "The geometry kernel could not build a split face.".to_owned()
+                    })??;
+            Ok((body.id, geometry))
+        })
+        .collect()
+}
+fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
     let r = b.width / 2.;
     let v = |x, y| builder::vertex(Point3::new(x, y, 0.));
     let wire: Wire = match b.shape {
@@ -139,12 +179,7 @@ fn build(b: &Body) -> Result<Geometry, String> {
             .into()
         }
     };
-    let rotation = Matrix4::from_angle_z(Deg(b.rotation[2]))
-        * Matrix4::from_angle_y(Deg(b.rotation[1]))
-        * Matrix4::from_angle_x(Deg(b.rotation[0]));
-    let transform = Matrix4::from_translation(Vector3::from(b.position))
-        * rotation
-        * Matrix4::from_nonuniform_scale(b.scale[0], b.scale[1], b.scale[2]);
+    let transform = crate::regions::transform(b);
     let mut geometry = Geometry::default();
     let shell: Shell = if b.shape == Shape::Line {
         if b.extrusion == 0. {
@@ -152,43 +187,117 @@ fn build(b: &Body) -> Result<Geometry, String> {
             geometry
                 .edges
                 .push([edge.front().point(), edge.back().point()]);
+            geometry.edge_groups.push(0);
+            geometry.edge_count = 1;
+            geometry.topology.edges.push([0, 1]);
+            geometry
+                .points
+                .extend([edge.front().point(), edge.back().point()]);
+            crate::components::apply(b, &mut geometry)?;
             return Ok(geometry);
         }
         vec![builder::tsweep(&wire[0], Vector3::unit_z() * b.extrusion)].into()
     } else {
-        let face = builder::try_attach_plane(&[wire]).map_err(|e| e.to_string())?;
-        if b.extrusion == 0. {
-            vec![face].into()
-        } else {
-            let solid: Solid = builder::tsweep(&face, Vector3::unit_z() * b.extrusion);
-            if !solid.is_geometric_consistent() {
-                return Err("Extrusion is not geometrically consistent.".into());
+        let faces = if let Some(loops) = loops {
+            if loops.is_empty() {
+                crate::components::apply(b, &mut geometry)?;
+                return Ok(geometry);
             }
-            solid.boundaries()[0].clone()
+            let wires: Vec<Wire> = loops
+                .iter()
+                .map(|polygon| {
+                    let vertices: Vec<_> = polygon.iter().map(|p| v(p[0], p[1])).collect();
+                    (0..vertices.len())
+                        .map(|i| builder::line(&vertices[i], &vertices[(i + 1) % vertices.len()]))
+                        .collect()
+                })
+                .collect();
+            let mut faces = Vec::new();
+            for (i, polygon) in loops
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| crate::regions::area(p) > 0.)
+            {
+                let mut boundaries = vec![wires[i].clone()];
+                for (j, hole) in loops
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| crate::regions::area(p) < 0.)
+                {
+                    if crate::regions::contains(hole[0], polygon) {
+                        boundaries.push(wires[j].clone());
+                    }
+                }
+                faces.push(builder::try_attach_plane(&boundaries).map_err(|e| e.to_string())?);
+            }
+            faces
+        } else {
+            vec![builder::try_attach_plane(&[wire]).map_err(|e| e.to_string())?]
+        };
+        let mut shell = Shell::default();
+        for face in faces {
+            if b.extrusion == 0. {
+                shell.push(face);
+            } else {
+                let solid: Solid = builder::tsweep(&face, Vector3::unit_z() * b.extrusion);
+                if !solid.is_geometric_consistent() {
+                    return Err("Extrusion is not geometrically consistent.".into());
+                }
+                shell.extend(solid.boundaries()[0].clone());
+            }
         }
+        shell
     };
     let shell = builder::transformed(&shell, transform);
     let meshed = shell.triangulation(0.01);
     // Preserve face-level output until all faces have successfully tessellated.
-    for face in meshed.face_iter() {
+    let mut edges = std::collections::HashMap::new();
+    let mut vertices = std::collections::HashMap::new();
+    for (face_index, face) in meshed.face_iter().enumerate() {
+        geometry.face_count += 1;
         let mesh = face.surface();
         let mesh = mesh.as_ref().ok_or("A face could not be tessellated.")?;
+        geometry.topology.faces.push(Vec::new());
         for tri in mesh.tri_faces() {
-            geometry
-                .triangles
-                .push(tri.map(|v| mesh.positions()[v.pos]));
+            let mut triangle = tri.map(|v| mesh.positions()[v.pos]);
+            if !face.orientation() {
+                triangle.swap(1, 2);
+            }
+            geometry.triangles.push(triangle);
+            geometry.triangle_faces.push(face_index);
         }
-        // The meshed boundary curves are polylines; they retain curved face edges without drawing triangulation diagonals.
         for edge in face.edge_iter() {
-            let curve = edge.oriented_curve();
-            for pair in curve.windows(2) {
+            for vertex in [edge.front(), edge.back()] {
+                let index = vertices.len();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    vertices.entry(vertex.id())
+                {
+                    entry.insert(index);
+                    geometry.points.push(vertex.point());
+                }
+            }
+            if let Some(index) = edges.get(&edge.id()) {
+                geometry.topology.faces[face_index].push(*index);
+                continue;
+            }
+            let index = edges.len();
+            edges.insert(edge.id(), index);
+            geometry.topology.faces[face_index].push(index);
+            geometry
+                .topology
+                .edges
+                .push([vertices[&edge.front().id()], vertices[&edge.back().id()]]);
+            for pair in edge.oriented_curve().windows(2) {
                 geometry.edges.push([pair[0], pair[1]]);
+                geometry.edge_groups.push(index);
             }
         }
     }
+    geometry.edge_count = edges.len();
     if geometry.triangles.is_empty() {
         return Err("No displayable faces were generated.".into());
     }
+    crate::components::apply(b, &mut geometry)?;
     Ok(geometry)
 }
 
@@ -220,7 +329,7 @@ impl Model {
         self.editing = false;
     }
     fn store(&mut self, mut body: Body, live: bool) -> Result<u64, String> {
-        evaluate(&body)?;
+        body.validate()?;
         if body.id == 0 {
             if self.bodies.len() >= 1000 {
                 return Err("The current project limit is 1,000 objects.".into());
@@ -236,6 +345,13 @@ impl Model {
         if self.bodies.iter().any(|b| b == &body) {
             return Ok(id);
         }
+        let mut candidate = self.bodies.clone();
+        if let Some(old) = candidate.iter_mut().find(|b| b.id == id) {
+            *old = body.clone();
+        } else {
+            candidate.push(body.clone());
+        }
+        evaluate_scene(&candidate)?;
         if !live || !self.editing {
             self.checkpoint();
         }
@@ -254,12 +370,16 @@ impl Model {
         }
         self.redo.clear();
     }
-    pub fn delete(&mut self, id: u64) {
+    pub fn delete(&mut self, id: u64) -> Result<(), String> {
         self.finish_edit();
         if self.bodies.iter().any(|b| b.id == id) {
+            let mut candidate = self.bodies.clone();
+            candidate.retain(|body| body.id != id);
+            evaluate_scene(&candidate)?;
             self.checkpoint();
-            self.bodies.retain(|b| b.id != id);
+            self.bodies = candidate;
         }
+        Ok(())
     }
     pub fn undo(&mut self) {
         self.finish_edit();
@@ -285,6 +405,92 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_profiles_extrude_holes_notches_and_disconnected_regions() {
+        let mut outer = Body::new(Shape::Rectangle);
+        outer.id = 1;
+        outer.width = 6.;
+        outer.depth = 4.;
+        outer.extrusion = 3.;
+        let mut inner = Body::new(Shape::Rectangle);
+        inner.id = 2;
+        inner.width = 1.;
+        inner.depth = 2.;
+        let cap_area = |g: &Geometry| -> f64 {
+            g.triangles
+                .iter()
+                .filter(|t| t.iter().all(|p| (p.z - 3.).abs() < 1e-7))
+                .map(|t| ((t[1] - t[0]).cross(t[2] - t[0])).z.abs() / 2.)
+                .sum()
+        };
+        for (position, width, depth, expected) in [
+            ([0., 0., 0.], 1., 2., 22.),   // Interior hole.
+            ([-2.5, 0., 0.], 1., 2., 22.), // Flush with an outer edge: notch.
+            ([-3., 0., 0.], 2., 2., 22.),  // Crossing an outer edge.
+            ([0., 0., 0.], 1., 6., 20.),   // Crossing two edges: separate remaining regions.
+        ] {
+            inner.position = position;
+            inner.width = width;
+            inner.depth = depth;
+            let scene = evaluate_scene(&[outer.clone(), inner.clone()]).unwrap();
+            assert!(
+                (cap_area(&scene[0].1) - expected).abs() < 1e-6,
+                "cap area {}",
+                cap_area(&scene[0].1)
+            );
+            assert!(scene[0].1.points.iter().any(
+                |p| (p.z - 3.).abs() < 1e-7 && (p.x - (position[0] + width / 2.)).abs() < 1e-7
+            ));
+            assert!(
+                scene[1]
+                    .1
+                    .triangles
+                    .iter()
+                    .flatten()
+                    .all(|p| p.z.abs() < 1e-7)
+            );
+        }
+        inner.position = [0., 0., 0.];
+        inner.width = 2.;
+        inner.depth = 2.;
+        let mut second = inner.clone();
+        second.id = 3;
+        second.position[0] = 1.;
+        let scene = evaluate_scene(&[outer.clone(), inner.clone(), second.clone()]).unwrap();
+        assert!((cap_area(&scene[0].1) - 18.).abs() < 1e-6); // Union, not double subtraction.
+        let project = crate::project::Project::new(
+            vec![outer.clone(), inner.clone(), second],
+            crate::viewport::Camera::default(),
+            true,
+            Some(1),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("split.osk");
+        project.save(&path).unwrap();
+        let restored = crate::project::Project::load(&path).unwrap();
+        assert!((cap_area(&evaluate_scene(&restored.bodies).unwrap()[0].1) - 18.).abs() < 1e-6);
+        inner.position = [0., 0., 0.];
+        inner.shape = Shape::Circle;
+        inner.width = 1.;
+        let scene = evaluate_scene(&[outer.clone(), inner.clone()]).unwrap();
+        assert!((cap_area(&scene[0].1) - (24. - std::f64::consts::PI / 4.)).abs() < 0.02);
+        inner.position[2] = 1.;
+        assert_eq!(
+            cap_area(&evaluate_scene(&[outer.clone(), inner.clone()]).unwrap()[0].1),
+            24.
+        );
+        // Live edits and history regenerate the same partition from persisted profiles.
+        inner.position[2] = 0.;
+        inner.shape = Shape::Rectangle;
+        inner.width = 1.;
+        inner.depth = 2.;
+        let mut model = Model::from_bodies(vec![outer, inner]);
+        let mut edit = model.bodies[1].clone();
+        edit.position[0] = 1.;
+        model.edit(edit).unwrap();
+        model.undo();
+        assert!((cap_area(&evaluate_scene(&model.bodies).unwrap()[0].1) - 22.).abs() < 1e-6);
+    }
     #[test]
     fn creation_extrusion_transforms_and_history() {
         let rectangle = Body::from_points(Shape::Rectangle, [4., 3., 0.], [-2., -1., 0.]).unwrap();
@@ -319,6 +525,11 @@ mod tests {
             b.rotation = [0., 0., 90.];
             b.position = [4., 5., 6.];
             let g = evaluate(&b).unwrap();
+            assert_eq!(g.triangle_faces.len(), g.triangles.len());
+            assert_eq!(g.edge_groups.len(), g.edges.len());
+            if shape == Shape::Rectangle {
+                assert_eq!((g.face_count, g.edge_count, g.points.len()), (6, 12, 8));
+            }
             let low = g
                 .triangles
                 .iter()
@@ -344,7 +555,7 @@ mod tests {
             b.width = f64::NAN;
             assert!(model.commit(b).is_err());
             assert_eq!(model.bodies, before);
-            model.delete(id);
+            model.delete(id).unwrap();
             assert!(model.bodies.is_empty());
             model.undo();
             assert_eq!(model.bodies, before);

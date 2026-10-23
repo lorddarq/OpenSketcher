@@ -1,4 +1,5 @@
-use crate::model::{Body, Geometry, evaluate};
+use crate::model::{Body, Geometry, evaluate_scene};
+use crate::selection::{self, SelectionMode};
 use eframe::{egui, egui_wgpu, wgpu};
 use serde::{Deserialize, Serialize};
 use truck_modeling::{InnerSpace, Point3, Vector3};
@@ -100,14 +101,35 @@ impl Camera {
         });
         (Point3::from(p), -Vector3::from(b.map(f64::from)))
     }
-    pub fn ground(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
+    pub fn plane(
+        &self,
+        point: egui::Pos2,
+        rect: egui::Rect,
+        origin: [f64; 3],
+        axis: usize,
+    ) -> Option<[f64; 3]> {
         let (o, d) = self.ray(point, rect);
-        if d.z.abs() < 1e-5 {
+        if d[axis].abs() < 1e-5 {
             return None;
         }
-        let t = -o.z / d.z;
+        let t = (origin[axis] - o[axis]) / d[axis];
         (t >= 0.).then(|| (o + d * t).into())
     }
+    pub fn screen_plane(
+        &self,
+        point: egui::Pos2,
+        rect: egui::Rect,
+        pivot: Point3,
+    ) -> Option<Point3> {
+        let (o, d) = self.ray(point, rect);
+        let normal = Vector3::from(self.basis()[2].map(f64::from));
+        let denominator = d.dot(normal);
+        (denominator.abs() > 1e-8).then(|| o + d * ((pivot - o).dot(normal) / denominator))
+    }
+    pub fn ground(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
+        self.plane(point, rect, [0.; 3], 2)
+    }
+
     pub fn fit(&mut self, scene: &[(u64, Geometry)]) {
         let points: Vec<_> = scene
             .iter()
@@ -283,22 +305,29 @@ impl Viewport {
         }
     }
 
-    pub fn update(&mut self, bodies: &[Body], selected: Option<u64>) -> Result<(), String> {
-        let scene: Vec<_> = bodies
-            .iter()
-            .map(|b| evaluate(b).map(|g| (b.id, g)))
-            .collect::<Result<_, _>>()?;
+    pub fn update(
+        &mut self,
+        bodies: &[Body],
+        selected: Option<u64>,
+        mode: SelectionMode,
+        element: Option<usize>,
+    ) -> Result<(), String> {
+        let scene = evaluate_scene(bodies)?;
         let mut data = Vec::new();
         let mut vertex = |p: Point3, c: [f32; 3]| {
             data.extend([p.x as f32, p.y as f32, p.z as f32]);
             data.extend(c);
         };
         for (id, g) in &scene {
-            for tri in &g.triangles {
+            for (index, tri) in g.triangles.iter().enumerate() {
                 let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize();
                 let shade =
                     (0.45 + 0.4 * n.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs()) as f32;
-                let color = if Some(*id) == selected {
+                let color = if Some(*id) == selected
+                    && (mode == SelectionMode::Volume
+                        || (mode == SelectionMode::Face
+                            && element == Some(g.triangle_faces[index])))
+                {
                     [shade * 0.55, shade * 0.8, shade]
                 } else {
                     [shade * 0.88, shade * 0.95, shade]
@@ -332,11 +361,15 @@ impl Viewport {
             vertex(end.into(), c);
         }
         for (id, g) in &scene {
-            for edge in &g.edges {
+            for (index, edge) in g.edges.iter().enumerate() {
                 for p in edge {
                     vertex(
                         *p,
-                        if Some(*id) == selected {
+                        if Some(*id) == selected
+                            && (mode == SelectionMode::Volume
+                                || (mode == SelectionMode::Edge
+                                    && element == Some(g.edge_groups[index])))
+                        {
                             [0.35, 0.75, 1.]
                         } else {
                             [0.55, 0.6, 0.65]
@@ -359,49 +392,14 @@ impl Viewport {
         Ok(())
     }
 
-    pub fn pick(&self, camera: &Camera, point: egui::Pos2, rect: egui::Rect) -> Option<u64> {
-        let (o, d) = camera.ray(point, rect);
-        let mut nearest = f64::INFINITY;
-        let mut hit = None;
-        for (id, g) in &self.scene {
-            for tri in &g.triangles {
-                let e1 = tri[1] - tri[0];
-                let e2 = tri[2] - tri[0];
-                let h = d.cross(e2);
-                let det = e1.dot(h);
-                if det.abs() < 1e-10 {
-                    continue;
-                }
-                let s = o - tri[0];
-                let u = s.dot(h) / det;
-                let q = s.cross(e1);
-                let v = d.dot(q) / det;
-                let t = e2.dot(q) / det;
-                if u >= 0. && v >= 0. && u + v <= 1. && t >= 0. && t < nearest {
-                    nearest = t;
-                    hit = Some(*id);
-                }
-            }
-        }
-        // Lines have no face to intersect: pick their screen-space segment within six pixels,
-        // while rejecting segments behind the nearest face.
-        for (id, g) in &self.scene {
-            if !g.triangles.is_empty() {
-                continue;
-            }
-            for [a, bp] in &g.edges {
-                let (a, za) = camera.project(*a, rect);
-                let (b, zb) = camera.project(*bp, rect);
-                let ab = b - a;
-                let t = ((point - a).dot(ab) / ab.length_sq().max(1e-8)).clamp(0., 1.);
-                let depth = camera.span as f64 * 50. - (za + (zb - za) * t) as f64;
-                if point.distance(a + ab * t) <= 6. && depth <= nearest + 1e-5 {
-                    nearest = depth;
-                    hit = Some(*id);
-                }
-            }
-        }
-        hit
+    pub fn pick(
+        &self,
+        camera: &Camera,
+        point: egui::Pos2,
+        rect: egui::Rect,
+        mode: SelectionMode,
+    ) -> Option<(u64, Option<usize>)> {
+        selection::pick(&self.scene, camera, point, rect, mode)
     }
 
     pub fn render(&mut self, size: [u32; 2], camera: &Camera) -> egui::TextureId {

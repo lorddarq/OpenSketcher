@@ -30,10 +30,18 @@ jobs:
       - name: Package macOS app
         if: runner.os == 'macOS'
         run: |
-          mkdir -p dist/OpenSketcher.app/Contents/MacOS
+          mkdir -p dist/OpenSketcher.app/Contents/MacOS dist/OpenSketcher.app/Contents/Resources
           cp target/release/opensketcher dist/OpenSketcher.app/Contents/MacOS/
           cp packaging/macos/Info.plist dist/OpenSketcher.app/Contents/
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/OpenSketcher.app/Contents/Resources/
           ditto -c -k --keepParent dist/OpenSketcher.app dist/OpenSketcher-macOS.zip
+      - name: Package Windows and Linux files
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/
+          cp target/release/opensketcher${{ runner.os == 'Windows' && '.exe' || '' }} dist/
       - uses: actions/upload-artifact@v4
         if: runner.os == 'macOS'
         with:
@@ -43,9 +51,9 @@ jobs:
         if: runner.os == 'Windows'
         with:
           name: OpenSketcher-Windows
-          path: target/release/opensketcher.exe
+          path: dist/
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:
           name: OpenSketcher-Linux
-          path: target/release/opensketcher
+          path: dist/
