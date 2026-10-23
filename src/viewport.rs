@@ -126,10 +126,6 @@ impl Camera {
         let denominator = d.dot(normal);
         (denominator.abs() > 1e-8).then(|| o + d * ((pivot - o).dot(normal) / denominator))
     }
-    pub fn ground(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
-        self.plane(point, rect, [0.; 3], 2)
-    }
-
     pub fn fit(&mut self, scene: &[(u64, Geometry)]) {
         let points: Vec<_> = scene
             .iter()
@@ -518,11 +514,11 @@ mod tests {
             }
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.));
             if view == View::Side {
-                assert!(camera.ground(rect.center(), rect).is_none());
+                assert!(camera.plane(rect.center(), rect, [0.; 3], 2).is_none());
             } else {
                 let point = Point3::new(2., -1., 0.);
                 let projected = camera.project(point, rect).0;
-                let recovered = camera.ground(projected, rect).unwrap();
+                let recovered = camera.plane(projected, rect, [0.; 3], 2).unwrap();
                 assert!(
                     (recovered[0] - point.x).abs() < 0.001
                         && (recovered[1] - point.y).abs() < 0.001

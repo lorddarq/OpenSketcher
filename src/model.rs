@@ -29,6 +29,8 @@ pub struct Body {
     pub width: f64,
     pub depth: f64,
     pub extrusion: f64,
+    #[serde(default)]
+    pub cuts_profiles: bool,
     pub position: [f64; 3],
     pub rotation: [f64; 3],
     pub scale: [f64; 3],
@@ -43,6 +45,7 @@ impl Body {
             width: 2.,
             depth: 2.,
             extrusion: 0.,
+            cuts_profiles: false,
             position: [0.; 3],
             rotation: [0.; 3],
             scale: [1.; 3],
@@ -414,6 +417,7 @@ mod tests {
         outer.extrusion = 3.;
         let mut inner = Body::new(Shape::Rectangle);
         inner.id = 2;
+        inner.cuts_profiles = true;
         inner.width = 1.;
         inner.depth = 2.;
         let cap_area = |g: &Geometry| -> f64 {

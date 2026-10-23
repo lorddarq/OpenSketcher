@@ -44,9 +44,11 @@ fn triangle_hit(o: Point3, d: Vector3, tri: &[Point3; 3]) -> Option<f64> {
     let q = s.cross(e1);
     let v = d.dot(q) / det;
     let t = e2.dot(q) / det;
-    (u >= -1e-8 && v >= -1e-8 && u + v <= 1. + 1e-8 && t >= 0.).then_some(t)
+    // Camera projection uses f32 screen coordinates. Keep silhouette ray tests
+    // tolerant of that rounding so an exposed top corner occludes its base.
+    (u >= -1e-6 && v >= -1e-6 && u + v <= 1. + 1e-6 && t >= 0.).then_some(t)
 }
-fn surface_hit(
+pub fn surface_hit(
     scene: &[(u64, Geometry)],
     camera: &Camera,
     p: egui::Pos2,

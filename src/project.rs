@@ -22,6 +22,8 @@ pub struct Project {
     pub bodies: Vec<Body>,
     pub camera: Camera,
     pub snapping: bool,
+    #[serde(default)]
+    pub drawing: crate::snapping::Preferences,
     pub selected: Option<u64>,
     #[serde(default)]
     pub selection_mode: SelectionMode,
@@ -32,11 +34,12 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 3,
-            modeling_version: 3,
+            schema_version: 4,
+            modeling_version: 4,
             bodies,
             camera,
             snapping,
+            drawing: crate::snapping::Preferences::default(),
             selected,
             selection_mode: SelectionMode::Volume,
             selected_element: None,
@@ -46,9 +49,9 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=3) || !matches!(self.modeling_version, 1..=3) {
+        if !matches!(self.schema_version, 1..=4) || !matches!(self.modeling_version, 1..=4) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–3 and modeling versions 1–3."
+                "Unsupported .osk version. This application supports schema versions 1–4 and modeling versions 1–4."
                     .into(),
             );
         }
@@ -115,9 +118,17 @@ impl Project {
             project.selection_mode = SelectionMode::Volume;
             project.selected_element = None;
         }
+        if (1..=3).contains(&project.schema_version) || (1..=3).contains(&project.modeling_version)
+        {
+            // Previous evaluators cut with every later closed profile. Preserve those
+            // existing relationships; new profiles still default to non-cutting.
+            for body in &mut project.bodies {
+                body.cuts_profiles = true;
+            }
+        }
         project.validate()?;
-        project.schema_version = 3;
-        project.modeling_version = 3;
+        project.schema_version = 4;
+        project.modeling_version = 4;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -193,7 +204,11 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("selection_mode");
         legacy.as_object_mut().unwrap().remove("selected_element");
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert_eq!(Project::load(&path).unwrap(), project);
+        let mut migrated = project.clone();
+        for body in &mut migrated.bodies {
+            body.cuts_profiles = true;
+        }
+        assert_eq!(Project::load(&path).unwrap(), migrated);
         let mut model = Model::from_bodies(restored.bodies);
         let mut edit = model.bodies[0].clone();
         edit.width = 5.;

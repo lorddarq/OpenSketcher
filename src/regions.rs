@@ -1,6 +1,6 @@
 //! Coplanar closed profiles partition older profiles before Truck builds their faces.
 use crate::model::{Body, Shape};
-use truck_modeling::{Deg, Matrix4, Point3, SquareMatrix, Transform, Vector3};
+use truck_modeling::{Deg, Matrix3, Matrix4, Point3, SquareMatrix, Transform, Vector3};
 type P = [f64; 2];
 
 pub fn transform(b: &Body) -> Matrix4 {
@@ -9,6 +9,18 @@ pub fn transform(b: &Body) -> Matrix4 {
         * Matrix4::from_angle_y(Deg(b.rotation[1]))
         * Matrix4::from_angle_x(Deg(b.rotation[0]))
         * Matrix4::from_nonuniform_scale(b.scale[0], b.scale[1], b.scale[2])
+}
+pub fn rotation_angles(rotation: Matrix3) -> [f64; 3] {
+    let y = (-rotation.x.z).clamp(-1., 1.).asin();
+    let (x, z) = if y.cos().abs() > 1e-8 {
+        (
+            rotation.y.z.atan2(rotation.z.z),
+            rotation.x.y.atan2(rotation.x.x),
+        )
+    } else {
+        (0., (-rotation.y.x).atan2(rotation.y.y))
+    };
+    [x.to_degrees(), y.to_degrees(), z.to_degrees()]
 }
 fn profile(b: &Body) -> Vec<P> {
     let r = b.width / 2.;
@@ -84,7 +96,7 @@ pub fn boundaries(body: &Body, bodies: &[Body]) -> Result<Option<Vec<Vec<P>>>, S
     let mut polygons = vec![outer];
     for other in bodies
         .iter()
-        .filter(|b| b.id > body.id && b.shape != Shape::Line)
+        .filter(|b| b.id > body.id && b.shape != Shape::Line && b.cuts_profiles)
     {
         let relative = inverse * transform(other);
         let points: Vec<_> = profile(other)

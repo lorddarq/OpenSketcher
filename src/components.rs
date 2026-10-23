@@ -113,16 +113,7 @@ pub fn transformed(
             ) * Matrix3::from_angle_z(truck_modeling::Deg(body.rotation[2]))
                 * Matrix3::from_angle_y(truck_modeling::Deg(body.rotation[1]))
                 * Matrix3::from_angle_x(truck_modeling::Deg(body.rotation[0]));
-            let y = (-rotation.x.z).clamp(-1., 1.).asin();
-            let (x, z) = if y.cos().abs() > 1e-8 {
-                (
-                    rotation.y.z.atan2(rotation.z.z),
-                    rotation.x.y.atan2(rotation.x.x),
-                )
-            } else {
-                (0., (-rotation.y.x).atan2(rotation.y.y))
-            };
-            result.rotation = [x.to_degrees(), y.to_degrees(), z.to_degrees()];
+            result.rotation = crate::regions::rotation_angles(rotation);
         }
     } else {
         let element = element.ok_or("Select a component first.")?;
@@ -351,16 +342,21 @@ fn validate_boundary(g: &Geometry, closed: bool) -> Result<(), String> {
     }
     if closed && !shell.is_empty() {
         for part in shell.connected_components() {
+            let volume: f64 = part
+                .face_iter()
+                .map(|face| {
+                    let wire = &face.boundaries()[0];
+                    let a = wire[0].front().point().to_vec();
+                    let b = wire[1].front().point().to_vec();
+                    let c = wire[2].front().point().to_vec();
+                    a.dot(b.cross(c)) / 6.
+                })
+                .sum();
+            if volume <= 1e-10 {
+                return Err("Component transform collapses or inverts a solid region.".into());
+            }
             Solid::try_new(vec![part])
                 .map_err(|e| format!("Component transform would open or tear the body: {e}"))?;
-        }
-        let volume: f64 = g
-            .triangles
-            .iter()
-            .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
-            .sum();
-        if volume <= 1e-10 {
-            return Err("Component transform collapses or inverts the solid.".into());
         }
     }
     Ok(())
@@ -496,6 +492,40 @@ mod tests {
         for (a, b) in source.points.iter().zip(&result.points) {
             assert!((matrix.transform_point(*a) - *b).magnitude() < 1e-6);
         }
+        // An outer region with a notch also supports face editing, while deleting
+        // its cutting profile must not invalidate saved component references.
+        let mut outer = Body::new(Shape::Rectangle);
+        outer.id = 1;
+        outer.width = 6.;
+        outer.depth = 4.;
+        outer.extrusion = 2.;
+        let mut inner = Body::new(Shape::Rectangle);
+        inner.id = 2;
+        inner.cuts_profiles = true;
+        inner.width = 1.;
+        inner.position = [-2.5, 0., 0.];
+        let mut split = Model::from_bodies(vec![outer.clone(), inner]);
+        let scene = evaluate_scene(&split.bodies).unwrap();
+        let source = &scene[0].1;
+        let top = source
+            .triangles
+            .iter()
+            .zip(&source.triangle_faces)
+            .find(|(t, _)| t.iter().all(|p| (p.z - 2.).abs() < 1e-7))
+            .map(|(_, face)| *face)
+            .unwrap();
+        let edited = transformed(
+            &outer,
+            source,
+            SelectionMode::Face,
+            Some(top),
+            Matrix4::from_translation(Vector3::unit_z() * 0.5),
+        )
+        .unwrap();
+        split.commit(edited).unwrap();
+        let before = split.bodies.clone();
+        assert!(split.delete(2).is_err());
+        assert_eq!(split.bodies, before);
         // A single point rotated about itself is a no-op, not an owner-body rotation.
         let p = geometry.points[0];
         let matrix = Matrix4::from_translation(p.to_vec())

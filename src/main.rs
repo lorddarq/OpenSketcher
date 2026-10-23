@@ -7,6 +7,7 @@ mod model;
 mod project;
 mod regions;
 mod selection;
+mod snapping;
 use project::Project;
 use selection::SelectionMode;
 use std::path::PathBuf;
@@ -47,6 +48,9 @@ fn main() -> eframe::Result {
                 transform: None,
                 pivot: None,
                 snap: true,
+                drawing: snapping::Preferences::default(),
+                construction: None,
+                show_preferences: false,
                 error: None,
                 path: None,
                 saved: Project::new(Vec::new(), Camera::default(), true, None),
@@ -93,6 +97,9 @@ struct OpenSketcher {
     transform: Option<TransformGesture>,
     pivot: Option<Point3>,
     snap: bool,
+    drawing: snapping::Preferences,
+    construction: Option<snapping::Plane>,
+    show_preferences: bool,
     error: Option<String>,
     path: Option<PathBuf>,
     saved: Project,
@@ -107,6 +114,7 @@ impl OpenSketcher {
             self.snap,
             self.selected,
         );
+        project.drawing = self.drawing.clone();
         project.selection_mode = self.selection_mode;
         project.selected_element = self.selected_element;
         project
@@ -208,11 +216,13 @@ impl OpenSketcher {
                 self.model = Model::default();
                 self.camera = Camera::default();
                 self.snap = true;
+                self.drawing = snapping::Preferences::default();
                 self.selected = None;
                 self.selection_mode = SelectionMode::Volume;
                 self.selected_element = None;
                 self.draft = None;
                 self.anchor = None;
+                self.construction = None;
                 self.tool = Tool::Select;
                 self.path = None;
                 self.saved = self.snapshot();
@@ -237,6 +247,7 @@ impl OpenSketcher {
                         self.model = Model::from_bodies(p.bodies.clone());
                         self.camera = p.camera.clone();
                         self.snap = p.snapping;
+                        self.drawing = p.drawing.clone();
                         self.selected = p.selected;
                         self.selection_mode = p.selection_mode;
                         self.selected_element = p.selected_element;
@@ -250,6 +261,7 @@ impl OpenSketcher {
                             })
                             .cloned();
                         self.anchor = None;
+                        self.construction = None;
                         self.tool = Tool::Select;
                         self.path = Some(path);
                         self.saved = p;
@@ -350,22 +362,42 @@ impl OpenSketcher {
             self.set_selection(None, self.selection_mode, None);
         }
     }
-    fn creation_point(&self, point: egui::Pos2, rect: egui::Rect) -> Option<[f64; 3]> {
-        let mut p = self.camera.ground(point, rect)?;
-        if self.snap {
-            for v in &mut p {
-                *v = (*v * 2.).round() / 2.;
-            }
-            if let Some(a) = self.anchor {
-                let tolerance = (self.camera.span / rect.height().max(1.) * 8.) as f64;
-                for axis in 0..2 {
-                    if (p[axis] - a[axis]).abs() < tolerance {
-                        p[axis] = a[axis];
-                    }
-                }
-            }
+    fn creation_point(
+        &self,
+        point: egui::Pos2,
+        rect: egui::Rect,
+    ) -> Result<snapping::SnapPoint, String> {
+        let mut preferences = self.drawing.clone();
+        if !self.snap {
+            preferences.geometry = false;
+            preferences.grid_axes = false;
         }
-        Some(p)
+        let selected = if self.selection_mode == SelectionMode::Face {
+            self.selected.zip(self.selected_element)
+        } else {
+            None
+        };
+        let plane = if let Some(plane) = self.construction.filter(|_| self.anchor.is_some()) {
+            plane
+        } else {
+            snapping::acquire_plane(
+                &self.viewport.scene,
+                &self.camera,
+                rect,
+                point,
+                selected,
+                preferences.geometry,
+            )?
+        };
+        snapping::point(
+            &self.viewport.scene,
+            &self.camera,
+            rect,
+            point,
+            plane,
+            self.anchor.map(Point3::from),
+            &preferences,
+        )
     }
 }
 
@@ -511,6 +543,9 @@ impl eframe::App for OpenSketcher {
                 if ui.button("Save As…").clicked() {
                     self.save(true);
                 }
+                if ui.button("Preferences").clicked() {
+                    self.show_preferences = !self.show_preferences;
+                }
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -529,6 +564,21 @@ impl eframe::App for OpenSketcher {
                 }
             });
         });
+        let mut preferences_changed = false;
+        egui::Window::new("Drawing preferences")
+            .open(&mut self.show_preferences).resizable(false).collapsible(false)
+            .enabled(self.pending.is_none()).show(&ctx,|ui| {
+                ui.label("Saved with this project. New projects start with geometry/grid snapping on and cutting off.");
+                preferences_changed|=ui.checkbox(&mut self.drawing.geometry,"Snap to geometry").changed();
+                ui.weak("Visible endpoints, midpoints, edges, and projected limits. Selected faces pin the drawing plane.");
+                preferences_changed|=ui.checkbox(&mut self.drawing.grid_axes,"Snap to grid and anchor axes").changed();
+                preferences_changed|=ui.checkbox(&mut self.drawing.cut_on_creation,"New profiles cut coplanar regions").changed();
+                ui.weak("Off by default. Applies to new profiles only; existing cuts are retained. This is not a general solid Boolean tool.");
+            });
+        if preferences_changed {
+            self.anchor = None;
+            self.construction = None;
+        }
         egui::Panel::bottom("status").show_inside(ui,|ui| {
             if let Some(e)=&self.error {ui.colored_label(egui::Color32::LIGHT_RED,e);}
             ui.label(match self.tool {
@@ -541,7 +591,7 @@ impl eframe::App for OpenSketcher {
                 Tool::Move=>"Move · Select geometry, then drag an axis arrow or plane handle · Snap: 0.5 units · Escape cancels · Alt-click sets pivot",
                 Tool::Rotate=>"Rotate · Select geometry, then drag an axis ring · Snap: 15° · Alt-click sets pivot (needed for a single point) · Escape cancels",
                 Tool::Orbit=>"Drag to orbit · Shift-drag / right / middle to pan · Scroll to zoom",
-                Tool::Create(_)=>"Pick two points on the XY plane · Escape cancels the preview · Snap is on by default",
+                Tool::Create(_)=>"Draw on a selected or visible planar face, otherwise XY · Snap: visible geometry + grid · Escape cancels",
             });
         });
         let canvas = ui.available_rect_before_wrap();
@@ -572,14 +622,15 @@ impl eframe::App for OpenSketcher {
                                 self.refresh();
                                 self.tool = tool;
                                 self.anchor = None;
+                                self.construction = None;
                                 self.model.finish_edit();
                             }
                         }
 
                         ui.separator();
                         if matches!(self.tool, Tool::Move | Tool::Rotate) {
-                            ui.weak("Drag colored handles. X / Y / Z are world axes.");
-                            ui.weak("Alt-click canvas to set pivot on a view-aligned plane.");
+                            ui.weak("World X / Y / Z");
+                            ui.weak("Alt-click: set pivot").on_hover_text("Place the pivot on the view-aligned plane through its current position. A point needs an offset pivot to rotate.");
                             if ui.button("Reset pivot").clicked() {
                                 self.transform = None;
                                 self.pivot = None;
@@ -587,7 +638,7 @@ impl eframe::App for OpenSketcher {
                             }
                         }
                         ui.checkbox(&mut self.snap, "Snap")
-                            .on_hover_text("Creation: 0.5-unit grid and X/Y alignment. Move: 0.5-unit offsets. Rotate: 15° offsets.");
+                            .on_hover_text("Creation: geometry limits plus grid/anchor alignment. Configure both in Preferences. Move: 0.5-unit offsets. Rotate: 15° offsets.");
                         ui.separator();
                         ui.label("Selection");
                         for mode in [
@@ -606,6 +657,7 @@ impl eframe::App for OpenSketcher {
                                     self.tool = Tool::Select;
                                 }
                                 self.anchor = None;
+                                self.construction = None;
                                 self.refresh();
                             }
                         }
@@ -642,7 +694,9 @@ impl eframe::App for OpenSketcher {
             egui::ScrollArea::vertical().auto_shrink([false,true]).max_height((panel_height-36.).max(64.)).show(ui,|ui| {
                 if let Tool::Create(shape)=self.tool {
                     ui.heading(format!("Create {}",shape.label()));
-                    ui.label(match shape { Shape::Rectangle=>"Pick opposite corners on the XY plane.", Shape::Circle=>"Pick center, then a point on the radius.", Shape::Line=>"Pick the start and end points.", Shape::Semicircle=>"Pick the two diameter endpoints." });
+                    ui.label(match shape { Shape::Rectangle=>"Pick opposite corners on the drawing plane.", Shape::Circle=>"Pick center, then a point on the radius.", Shape::Line=>"Pick the start and end points.", Shape::Semicircle=>"Pick the two diameter endpoints." });
+                    ui.weak("A selected planar face pins the plane; otherwise the first click captures a visible face with geometry snapping on.");
+                    ui.weak(if self.drawing.cut_on_creation {"New closed profiles cut older coplanar regions."}else{"New profiles are independent; automatic cutting is off."});
                     ui.weak(if self.anchor.is_some() {"Pick the second point. Escape cancels."}else{"Pick the first point in the viewport."});
                     if shape==Shape::Semicircle {ui.weak("The filled half-disc lies to the left of the directed diameter.");}
                     ui.separator();
@@ -670,8 +724,10 @@ impl eframe::App for OpenSketcher {
                         ui.label(format!("Component edits: {}",draft.component_edits.len()));
                         ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
                         if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
+                        ui.label("Source profile parameters");
                     }
                     let mut finished=dimensions(ui,&mut draft);
+                    if draft.shape!=Shape::Line {finished|=ui.checkbox(&mut draft.cuts_profiles,"Cut older coplanar profiles").changed();}
                     ui.add_space(8.);finished |= vector(ui,"Position · world units",&mut draft.position,-1000.0..=1000.0);
                     finished |= vector(ui,"Rotation · degrees · local X, Y, Z order",&mut draft.rotation,-36000.0..=36000.0);
                     finished |= vector(ui,"Scale · local axes",&mut draft.scale,0.01..=100.0);
@@ -820,27 +876,30 @@ impl eframe::App for OpenSketcher {
                                 );
                             }
                         }
-                        Tool::Create(shape) => {
-                            if let Some(p) = self.creation_point(point, rect) {
-                                if let Some(a) = self.anchor {
-                                    match Body::from_points(shape, a, p) {
+                        Tool::Create(shape) => match self.creation_point(point, rect) {
+                            Ok(target) => {
+                                if let Some(anchor) = self.anchor {
+                                    match target.plane.body(
+                                        shape,
+                                        anchor.into(),
+                                        target.position,
+                                        self.drawing.cut_on_creation,
+                                    ) {
                                         Ok(body) => {
                                             self.commit(body);
                                             self.anchor = None;
+                                            self.construction = None;
                                         }
-                                        Err(e) => self.error = Some(e),
+                                        Err(error) => self.error = Some(error),
                                     }
                                 } else {
-                                    self.anchor = Some(p);
+                                    self.anchor = Some(target.position.into());
+                                    self.construction = Some(target.plane);
                                     self.error = None;
                                 }
-                            } else {
-                                self.error = Some(
-                                    "The XY plane is edge-on. Switch to Top or Isometric to draw."
-                                        .into(),
-                                );
                             }
-                        }
+                            Err(error) => self.error = Some(error),
+                        },
                         _ => {}
                     }
                 }
@@ -913,16 +972,34 @@ impl eframe::App for OpenSketcher {
                 }
                 if let Tool::Create(shape) = self.tool
                     && let Some(pointer) = response.hover_pos()
-                    && let Some(p) = self.creation_point(pointer, rect)
+                    && let Ok(target) = self.creation_point(pointer, rect)
                 {
-                    let screen = self.camera.project(p.into(), rect).0;
+                    let p = target.position;
+                    let screen = self.camera.project(p, rect).0;
+                    if let Some(guide) = target.guide {
+                        ui.painter().line_segment(
+                            guide.map(|p| self.camera.project(p, rect).0),
+                            egui::Stroke::new(1., egui::Color32::LIGHT_GREEN),
+                        );
+                    }
+                    ui.painter().text(
+                        screen + egui::vec2(10., 12.),
+                        egui::Align2::LEFT_TOP,
+                        target.label,
+                        egui::FontId::proportional(12.),
+                        egui::Color32::LIGHT_GREEN,
+                    );
                     ui.painter().circle_stroke(
                         screen,
                         4.,
                         egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
                     );
                     if let Some(a) = self.anchor {
-                        if let Ok(body) = Body::from_points(shape, a, p) {
+                        if let Ok(body) =
+                            target
+                                .plane
+                                .body(shape, a.into(), p, self.drawing.cut_on_creation)
+                        {
                             if let Ok(g) = model::evaluate(&body) {
                                 for edge in g.edges {
                                     ui.painter().line_segment(
