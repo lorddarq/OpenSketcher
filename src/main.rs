@@ -13,8 +13,10 @@ mod face_operations;
 mod gizmo;
 mod model;
 mod operators;
+mod profile_imprints;
 mod project;
 mod regions;
+mod section_edits;
 mod selection;
 mod shelling;
 mod snapping;
@@ -42,15 +44,20 @@ fn main() -> eframe::Result {
                 .clone()
                 .expect("wgpu renderer required");
             let mut viewport = Viewport::new(state);
-            viewport
-                .update(&[], &[], SelectionMode::Volume)
-                .expect("empty scene");
+            viewport.update_scene(
+                &[],
+                Vec::new(),
+                std::sync::Arc::default(),
+                &[],
+                SelectionMode::Volume,
+            );
             Ok(Box::new(OpenSketcher {
                 camera: Camera::default(),
                 viewport,
                 model: Model::default(),
                 evaluator: evaluation::Evaluator::default(),
                 committed_scene: Vec::new(),
+                committed_display: std::sync::Arc::default(),
                 selected: None,
                 selection_mode: SelectionMode::Volume,
                 selected_element: None,
@@ -115,6 +122,7 @@ struct OpenSketcher {
     model: Model,
     evaluator: evaluation::Evaluator,
     committed_scene: Vec<(u64, model::Geometry)>,
+    committed_display: std::sync::Arc<viewport::SceneDisplay>,
     selected: Option<u64>,
     selection_mode: SelectionMode,
     selected_element: Option<usize>,
@@ -297,14 +305,13 @@ impl OpenSketcher {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             FileAction::New => {
-                if let Err(e) = self.viewport.update(&[], &[], SelectionMode::Volume) {
-                    self.error = Some(e);
-                    return;
-                }
                 self.transform = None;
                 self.pivot = None;
                 self.model = Model::default();
                 self.committed_scene.clear();
+                self.committed_display = std::sync::Arc::default();
+                model::cache_scene(&[], &[]);
+                self.refresh();
                 self.camera = Camera::default();
                 self.snap = true;
                 self.drawing = snapping::Preferences::default();
@@ -414,6 +421,7 @@ impl OpenSketcher {
         self.viewport.update_scene(
             &self.model.bodies,
             self.committed_scene.clone(),
+            self.committed_display.clone(),
             &self.selection,
             self.selection_mode,
         );
@@ -461,6 +469,7 @@ impl OpenSketcher {
                             self.viewport.update_scene(
                                 bodies,
                                 update.scene,
+                                update.display,
                                 &self.selection,
                                 self.selection_mode,
                             );
@@ -468,6 +477,7 @@ impl OpenSketcher {
                     } else {
                         self.model = update.model;
                         self.committed_scene = update.scene;
+                        self.committed_display = update.display;
                         model::cache_scene(&self.model.bodies, &self.committed_scene);
                         self.refresh();
                         if let Some((path, p)) = update.loaded {
@@ -613,7 +623,35 @@ impl OpenSketcher {
         self.transform = None;
         self.pivot = None;
         self.finish_model_edit();
-        self.selection = picks;
+        self.selection = picks
+            .into_iter()
+            .filter_map(|(id, element)| {
+                let geometry = self
+                    .committed_scene
+                    .iter()
+                    .find(|(owner, _)| *owner == id)
+                    .map(|(_, g)| g);
+                if self.selection_mode == SelectionMode::Edge
+                    && element.is_some_and(|edge| {
+                        geometry.is_some_and(|g| g.internal_edges.contains(&edge))
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    id,
+                    if self.selection_mode == SelectionMode::Face {
+                        element.map(|face| geometry.map_or(face, |g| g.face_group(face)))
+                    } else if self.selection_mode == SelectionMode::Edge {
+                        element.map(|edge| geometry.map_or(edge, |g| g.edge_group(edge)))
+                    } else {
+                        element
+                    },
+                ))
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        self.selection.retain(|pick| seen.insert(*pick));
         self.selected = self.selection.last().map(|p| p.0);
         self.selected_element = self.selection.last().and_then(|p| p.1);
         self.draft = if self.selection_mode == SelectionMode::Volume && self.selection.len() == 1 {
@@ -855,7 +893,7 @@ impl OpenSketcher {
             )?
         } else {
             snapping::acquire_plane(
-                &self.viewport.scene,
+                self.viewport.query(),
                 &self.camera,
                 rect,
                 point,
@@ -865,7 +903,7 @@ impl OpenSketcher {
             )?
         };
         snapping::point(
-            &self.viewport.scene,
+            self.viewport.query(),
             &self.camera,
             rect,
             point,
@@ -886,7 +924,10 @@ impl OpenSketcher {
         if self.drawing.plane.is_some() && selected.is_none() {
             return None;
         }
-        let hit = selection::surface_hit(&self.viewport.scene, &self.camera, pointer, rect)
+        let hit = self
+            .viewport
+            .query()
+            .surface_hit(&self.camera, pointer, rect)
             .map(|(_, id, face)| (id, face));
         let (owner, face) = selected.or(hit).or_else(|| {
             let id = target.owner?;
@@ -1737,7 +1778,7 @@ impl eframe::App for OpenSketcher {
                     let painter = ui.painter().with_clip_rect(rect);
                     for (id, g) in &self.viewport.scene {
                         for (index, p) in g.points.iter().enumerate() {
-                            if selection::visible(&self.viewport.scene, &self.camera, *p, rect) {
+                            if self.viewport.query().visible(&self.camera, *p, rect) {
                                 let chosen = self.selection.contains(&(*id, Some(index)));
                                 let point = self.camera.project(*p, rect).0;
                                 painter.circle_filled(

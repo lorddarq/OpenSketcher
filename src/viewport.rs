@@ -1,4 +1,6 @@
-use crate::model::{Body, Geometry, evaluate_scene};
+#[cfg(test)]
+use crate::model::evaluate_scene;
+use crate::model::{Body, Geometry};
 use crate::selection::{self, SelectionMode};
 use eframe::{egui, egui_wgpu, wgpu};
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,7 @@ fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
         let normal = (t[1] - t[0]).cross(t[2] - t[0]);
         for p in t {
             *sums
-                .entry(key(*face, *p))
+                .entry(key(g.face_group(*face), *p))
                 .or_insert(Vector3::new(0., 0., 0.)) += normal;
         }
     }
@@ -22,7 +24,22 @@ fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
         .zip(&g.triangle_faces)
         .map(|(t, face)| {
             t.map(|p| {
-                let n = sums[&key(*face, p)];
+                if let Some(Some((ring, axis))) = g.cylinder_supports.get(*face) {
+                    let ring = &g.circles[*ring];
+                    let plane_normal = ring.u.cross(ring.v).normalize();
+                    let delta = p - ring.center;
+                    let radial = delta - *axis * (delta.dot(plane_normal) / axis.dot(plane_normal));
+                    let uu = ring.u.dot(ring.u);
+                    let uv = ring.u.dot(ring.v);
+                    let vv = ring.v.dot(ring.v);
+                    let det = uu * vv - uv * uv;
+                    let a = (radial.dot(ring.u) * vv - radial.dot(ring.v) * uv) / det;
+                    let b = (radial.dot(ring.v) * uu - radial.dot(ring.u) * uv) / det;
+                    let normal = (ring.v * a - ring.u * b).cross(*axis).normalize();
+                    let outward = (t[1] - t[0]).cross(t[2] - t[0]);
+                    return normal * if normal.dot(outward) < 0. { -1. } else { 1. };
+                }
+                let n = sums[&key(g.face_group(*face), p)];
                 if n.magnitude2() > 1e-20 {
                     n.normalize()
                 } else {
@@ -31,6 +48,30 @@ fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
             })
         })
         .collect()
+}
+
+// Immutable display work belongs to the evaluated scene, not to selection refreshes.
+#[derive(Default)]
+pub struct SceneDisplay {
+    pub index: selection::SpatialIndex,
+    shades: Vec<Vec<[f32; 3]>>,
+}
+impl SceneDisplay {
+    pub fn new(scene: &[(u64, Geometry)]) -> Self {
+        let light = Vector3::new(0.3, -0.4, 0.85).normalize();
+        Self {
+            index: selection::SpatialIndex::new(scene),
+            shades: scene
+                .iter()
+                .map(|(_, g)| {
+                    surface_normals(g)
+                        .into_iter()
+                        .map(|normals| normals.map(|n| (0.45 + 0.4 * n.dot(light).abs()) as f32))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,6 +244,7 @@ impl Camera {
 
 pub struct Viewport {
     pub scene: Vec<(u64, Geometry)>,
+    display: std::sync::Arc<SceneDisplay>,
     state: egui_wgpu::RenderState,
     triangles: wgpu::RenderPipeline,
     profile_overlay: wgpu::RenderPipeline,
@@ -338,6 +380,7 @@ impl Viewport {
         let vertex_count = 0;
         Self {
             scene: Vec::new(),
+            display: std::sync::Arc::default(),
             state,
             triangles,
             profile_overlay,
@@ -352,25 +395,41 @@ impl Viewport {
         }
     }
 
-    pub fn update(
-        &mut self,
-        bodies: &[Body],
-        picks: &[selection::Pick],
-        mode: SelectionMode,
-    ) -> Result<(), String> {
-        let scene = evaluate_scene(bodies)?;
-        self.update_scene(bodies, scene, picks, mode);
-        Ok(())
-    }
     pub fn update_scene(
         &mut self,
         bodies: &[Body],
         scene: Vec<(u64, Geometry)>,
+        display: std::sync::Arc<SceneDisplay>,
         picks: &[selection::Pick],
         mode: SelectionMode,
     ) {
+        self.display = display;
         let mut data = Vec::new();
-        let chosen: std::collections::HashSet<_> = picks.iter().copied().collect();
+        let chosen: std::collections::HashSet<_> = picks
+            .iter()
+            .map(|(id, element)| {
+                (
+                    *id,
+                    if mode == SelectionMode::Face {
+                        element.map(|face| {
+                            scene
+                                .iter()
+                                .find(|(owner, _)| owner == id)
+                                .map_or(face, |(_, g)| g.face_group(face))
+                        })
+                    } else if mode == SelectionMode::Edge {
+                        element.map(|edge| {
+                            scene
+                                .iter()
+                                .find(|(owner, _)| owner == id)
+                                .map_or(edge, |(_, g)| g.edge_group(edge))
+                        })
+                    } else {
+                        *element
+                    },
+                )
+            })
+            .collect();
         let mut vertex = |p: Point3, c: [f32; 3]| {
             data.extend([p.x as f32, p.y as f32, p.z as f32]);
             data.extend(c);
@@ -378,20 +437,18 @@ impl Viewport {
         let (order, overlay_start) = triangle_order(bodies, &scene, picks);
         for index in order {
             let (id, g) = &scene[index];
-            let normals = surface_normals(g);
+            let shades = &self.display.shades[index];
             for (index, tri) in g.triangles.iter().enumerate() {
-                let selected = chosen.contains(&(
-                    *id,
-                    if mode == SelectionMode::Volume {
-                        None
-                    } else {
-                        Some(g.triangle_faces[index])
-                    },
-                ));
-                for (p, n) in tri.iter().zip(&normals[index]) {
-                    let shade = (0.45
-                        + 0.4 * n.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs())
-                        as f32;
+                let selected = matches!(mode, SelectionMode::Volume | SelectionMode::Face)
+                    && chosen.contains(&(
+                        *id,
+                        if mode == SelectionMode::Volume {
+                            None
+                        } else {
+                            Some(g.face_group(g.triangle_faces[index]))
+                        },
+                    ));
+                for (p, shade) in tri.iter().zip(shades[index]) {
                     vertex(
                         *p,
                         if selected {
@@ -428,12 +485,16 @@ impl Viewport {
         }
         for (id, g) in &scene {
             for (index, edge) in g.edges.iter().enumerate() {
+                if g.internal_edges.contains(&g.edge_groups[index]) {
+                    continue;
+                }
                 for p in edge {
                     vertex(
                         *p,
                         if (mode == SelectionMode::Volume && chosen.contains(&(*id, None)))
                             || (mode == SelectionMode::Edge
-                                && chosen.contains(&(*id, Some(g.edge_groups[index]))))
+                                && chosen
+                                    .contains(&(*id, Some(g.edge_group(g.edge_groups[index])))))
                         {
                             [0.35, 0.75, 1.]
                         } else if bodies.iter().any(|b| b.id == *id && b.construction) {
@@ -459,6 +520,10 @@ impl Viewport {
         self.scene = scene;
     }
 
+    pub fn query(&self) -> selection::Query<'_> {
+        selection::Query::indexed(&self.scene, &self.display.index)
+    }
+
     pub fn pick(
         &self,
         camera: &Camera,
@@ -466,7 +531,7 @@ impl Viewport {
         rect: egui::Rect,
         mode: SelectionMode,
     ) -> Option<(u64, Option<usize>)> {
-        selection::pick(&self.scene, camera, point, rect, mode)
+        self.query().pick(camera, point, rect, mode)
     }
 
     pub fn render(&mut self, size: [u32; 2], camera: &Camera) -> egui::TextureId {
@@ -572,6 +637,356 @@ mod tests {
     fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
         a.into_iter().zip(b).map(|(a, b)| a * b).sum()
     }
+    #[test]
+    fn display_shading_matches_geometry_and_is_shared_across_refreshes() {
+        let mut circle = Body::new(crate::model::Shape::Circle);
+        circle.extrusion = 3.;
+        let scene = evaluate_scene(&[circle]).unwrap();
+        let display = std::sync::Arc::new(SceneDisplay::new(&scene));
+        let refreshed = display.clone();
+        assert!(std::sync::Arc::ptr_eq(&display, &refreshed));
+        assert_eq!(display.shades.len(), scene.len());
+        for ((_, g), shades) in scene.iter().zip(&display.shades) {
+            assert_eq!(shades.len(), g.triangles.len());
+            for (normals, shades) in surface_normals(g).iter().zip(shades) {
+                for (normal, shade) in normals.iter().zip(shades) {
+                    let expected = (0.45
+                        + 0.4 * normal.dot(Vector3::new(0.3, -0.4, 0.85).normalize()).abs())
+                        as f32;
+                    assert_eq!(*shade, expected);
+                    assert!(shade.is_finite());
+                }
+            }
+        }
+        assert!(SceneDisplay::new(&[]).shades.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual CPU audit: cargo test --release geometry_workload_timings -- --ignored --nocapture"]
+    fn geometry_workload_timings() {
+        use crate::model::{Body, Shape};
+        use std::time::Instant;
+        // Match the native evaluator's bounded pool rather than the global pool.
+        rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap().install(|| {
+        let measure = |name: &str, mut bodies: Vec<Body>| {
+            let mut builds = Vec::new();
+            let mut normals = Vec::new();
+            let mut copies = Vec::new();
+            let mut triangles = 0;
+            let mut point_overlay = None;
+            let mut indexed_overlay = None;
+            let mut index_build = Vec::new();
+            let mut index_bytes = 0;
+            for _ in 0..3 {
+                bodies[0].extrusion += 0.01;
+                let start = Instant::now();
+                let scene = evaluate_scene(&bodies).unwrap();
+                builds.push(start.elapsed());
+                triangles = scene.iter().map(|(_, g)| g.triangles.len()).sum::<usize>();
+                let start = Instant::now();
+                let cloned = scene.clone();
+                copies.push(start.elapsed());
+                std::hint::black_box(cloned);
+                let start = Instant::now();
+                for (_, g) in &scene {
+                    std::hint::black_box(surface_normals(g));
+                }
+                normals.push(start.elapsed());
+                let start=Instant::now();let index=selection::SpatialIndex::new(&scene);index_build.push(start.elapsed());index_bytes=index.allocated_bytes();
+                if point_overlay.is_none() && bodies.len() <= 25 {
+                    let mut camera = Camera::default();
+                    camera.fit(&scene);
+                    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280., 850.));
+                    let start = Instant::now();
+                    let mut points = 0;
+                    for (_, g) in &scene {
+                        for p in &g.points {
+                            std::hint::black_box(selection::visible(&scene, &camera, *p, rect));
+                            points += 1;
+                        }
+                    }
+                    point_overlay = Some((points, start.elapsed()));
+                    let fast=selection::Query::indexed(&scene,&index);let start=Instant::now();
+                    for (_,g) in &scene {for p in &g.points {std::hint::black_box(fast.visible(&camera,*p,rect));}}
+                    indexed_overlay=Some(start.elapsed());
+                }
+            }
+            eprintln!(
+                "{name}: {} bodies, {triangles} visible triangles; rebuild={builds:?}; normals={normals:?}; scene clone={copies:?}; point overlay={point_overlay:?}; indexed overlay={indexed_overlay:?}; index build={index_build:?}; index bytes={index_bytes}",
+                bodies.len()
+            );
+        };
+        for count in [1, 25, 100] {
+            let bodies = (0..count)
+                .map(|i| {
+                    let mut b = Body::new(Shape::Circle);
+                    b.id = i + 1;
+                    b.width = 20.;
+                    b.extrusion = 3.;
+                    b.position = [(i % 10) as f64 * 30., (i / 10) as f64 * 30., 0.];
+                    b
+                })
+                .collect();
+            measure(&format!("cylinders-{count}"), bodies);
+        }
+        if let Ok(path) = std::env::var("OSK_PROFILE_PROJECT") {
+            let project = crate::project::Project::load(std::path::Path::new(&path)).unwrap();
+            for _ in 0..3 {
+                evaluate_scene(&[]).unwrap();
+                let start = Instant::now();
+                let scene = evaluate_scene(&project.bodies).unwrap();
+                eprintln!(
+                    "project replay: {} authored bodies, {} visible triangles, cold evaluation {:?}",
+                    project.bodies.len(),
+                    scene.iter().map(|(_, g)| g.triangles.len()).sum::<usize>(),
+                    start.elapsed()
+                );
+            }
+        }
+        });
+    }
+
+    #[test]
+    fn clipped_circle_extrusion_has_no_old_rim_continuation_edge() {
+        use crate::{
+            booleans::{Boolean, Kind},
+            components,
+            edge_treatments::FaceTarget,
+            model::{Shape, evaluate_scene},
+        };
+        let mut source = Body::new(Shape::Circle);
+        source.id = 1;
+        source.width = 4.;
+        source.extrusion = 3.;
+        let mut profile = Body::new(Shape::Circle);
+        profile.id = 2;
+        profile.width = 3.;
+        profile.position = [1., 0., 3.];
+        let mut bodies = vec![source.clone(), profile];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let face = (0..scene[0].1.face_count)
+            .find(|f| {
+                crate::edge_treatments::target(&source, &scene[0].1, *f) == Ok(FaceTarget::Top)
+            })
+            .unwrap();
+        let mut feature = Body::new(Shape::Rectangle);
+        feature.id = 3;
+        feature.boolean = Some(Boolean::new(
+            Kind::Imprint,
+            &[(1, Some(face)), (2, None)],
+            SelectionMode::Face,
+            &scene,
+        ));
+        bodies.push(feature.clone());
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[2].1;
+        let cap = (0..g.face_count)
+            .filter(|f| crate::snapping::Plane::face(g, *f).is_some_and(|p| p.normal.z > 0.99))
+            .max_by(|a, b| {
+                let center = |face: usize| {
+                    let xs = g
+                        .triangles
+                        .iter()
+                        .zip(&g.triangle_faces)
+                        .filter(|(_, f)| **f == face)
+                        .flat_map(|(t, _)| t.iter())
+                        .map(|p| p.x)
+                        .collect::<Vec<_>>();
+                    xs.iter().sum::<f64>() / xs.len() as f64
+                };
+                center(*a).total_cmp(&center(*b))
+            })
+            .unwrap();
+        bodies[2] = components::sweep_face(&feature, g, cap, 0.7).unwrap();
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[2].1;
+        let mut continuations = 0;
+        for edge in 0..g.edge_count {
+            let owners = (0..g.face_count)
+                .filter(|face| g.topology.faces[*face].contains(&edge))
+                .collect::<Vec<_>>();
+            if owners.len() != 2
+                || owners
+                    .iter()
+                    .any(|face| crate::snapping::Plane::face(g, *face).is_some())
+            {
+                continue;
+            }
+            let points = g
+                .edges
+                .iter()
+                .zip(&g.edge_groups)
+                .filter(|(_, group)| **group == edge)
+                .flat_map(|(e, _)| e.iter())
+                .collect::<Vec<_>>();
+            if points.is_empty()
+                || !points
+                    .iter()
+                    .all(|p| (p.z - 3.).abs() < 1e-7 && (p.x * p.x + p.y * p.y - 4.).abs() < 1e-6)
+            {
+                continue;
+            }
+            continuations += 1;
+            assert!(
+                g.internal_edges.contains(&edge),
+                "Old rim edge {edge} between faces {owners:?} is internal to the same cylinder"
+            );
+            assert_eq!(g.face_group(owners[0]), g.face_group(owners[1]));
+        }
+        assert!(continuations > 0);
+        let normals = surface_normals(g);
+        for (index, triangle) in g.triangles.iter().enumerate() {
+            if g.cylinder_supports
+                .get(g.triangle_faces[index])
+                .is_none_or(Option::is_none)
+            {
+                continue;
+            }
+            for (point, normal) in triangle.iter().zip(normals[index]) {
+                // Exact radial normals must not depend on how either patch was triangulated.
+                if (point.x * point.x + point.y * point.y - 4.).abs() < 1e-6 {
+                    let expected = Vector3::new(point.x, point.y, 0.).normalize();
+                    assert!(normal.dot(expected) > 1. - 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn circular_extrusions_have_one_editable_wall_without_patch_edges() {
+        use crate::{
+            components, face_operations,
+            model::{Model, Shape, evaluate},
+            selection,
+        };
+        use truck_modeling::{Matrix4, Transform};
+        for affine in [false, true] {
+            let mut body = Body::new(Shape::Circle);
+            body.id = 1;
+            body.width = 4.;
+            body.extrusion = 3.;
+            if affine {
+                body.position = [2., -3., 1.];
+                body.rotation = [15., 25., 35.];
+                body.scale = [1.4, 0.7, 1.2];
+            }
+            let g = evaluate(&body).unwrap();
+            // Preserve raw topology for old feature guards, but remove its
+            // circle-arc junctions from modeling selection and snapping.
+            let raw =
+                crate::model::tessellate(&crate::model::primitive_shell(&body).unwrap()).unwrap();
+            assert_eq!(g.topology, raw.topology);
+            assert_eq!(g.face_elements(1), vec![1, 2, 3]);
+            assert_eq!(g.internal_edges.len(), 3);
+            let rims: std::collections::HashSet<_> = (0..g.edge_count)
+                .filter(|edge| !g.internal_edges.contains(edge))
+                .map(|edge| g.edge_group(edge))
+                .collect();
+            assert_eq!(rims.len(), 2);
+            assert!(rims.iter().all(|edge| g.edge_elements(*edge).len() == 3));
+            for edge in &g.internal_edges {
+                assert!(!selection::valid(
+                    (1, Some(*edge)),
+                    &[(1, g.clone())],
+                    SelectionMode::Edge
+                ));
+            }
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000., 800.));
+            let mut camera = Camera::default();
+            camera.fit(&[(1, g.clone())]);
+            let mut visible = 0;
+            for edge in &g.internal_edges {
+                assert!(
+                    components::transformed(
+                        &body,
+                        &g,
+                        SelectionMode::Edge,
+                        Some(*edge),
+                        Matrix4::from_translation(Vector3::new(0.2, 0., 0.))
+                    )
+                    .unwrap_err()
+                    .contains("not editable")
+                );
+                let segment = g
+                    .edges
+                    .iter()
+                    .zip(&g.edge_groups)
+                    .find(|(_, group)| **group == *edge)
+                    .unwrap()
+                    .0;
+                let midpoint = segment[0] + (segment[1] - segment[0]) * 0.5;
+                if selection::visible(&[(1, g.clone())], &camera, midpoint, rect) {
+                    visible += 1;
+                    assert_ne!(
+                        selection::pick(
+                            &[(1, g.clone())],
+                            &camera,
+                            camera.project(midpoint, rect).0,
+                            rect,
+                            SelectionMode::Edge
+                        ),
+                        Some((1, Some(*edge)))
+                    );
+                }
+            }
+            assert!(visible > 0);
+            let normals = surface_normals(&g);
+            let mut shared = std::collections::HashMap::<[i64; 3], Vector3>::new();
+            for (index, t) in g.triangles.iter().enumerate() {
+                if g.face_group(g.triangle_faces[index]) != 1 {
+                    continue;
+                }
+                for (point, normal) in t.iter().zip(normals[index]) {
+                    let key = [point.x, point.y, point.z].map(|v| (v * 1e6).round() as i64);
+                    if let Some(previous) = shared.insert(key, normal) {
+                        // Positions share a quantized key, not necessarily identical coordinates.
+                        assert!((previous - normal).magnitude() < 1e-6);
+                    }
+                }
+            }
+            let moved = components::transformed(
+                &body,
+                &g,
+                SelectionMode::Face,
+                Some(1),
+                Matrix4::from_translation(Vector3::new(0.2, 0., 0.)),
+            )
+            .unwrap();
+            let edit = moved.component_edits.last().unwrap();
+            assert_eq!(edit.element, 1);
+            assert_eq!(edit.elements, vec![2, 3]);
+            let changed = evaluate(&moved).unwrap();
+            assert!(changed.shell.is_some());
+            assert_eq!(changed.circles.len(), g.circles.len());
+            assert!(changed.shell.as_ref().unwrap().is_geometric_consistent());
+            for (before, after) in g.points.iter().zip(&changed.points) {
+                assert!(
+                    (*after
+                        - Matrix4::from_translation(Vector3::new(0.2, 0., 0.))
+                            .transform_point(*before))
+                    .magnitude()
+                        < 1e-7
+                );
+            }
+            let deleted = face_operations::selected(
+                std::slice::from_ref(&body),
+                &[(1, g.clone())],
+                &[(1, Some(2))],
+                face_operations::FaceEdit::Open,
+            )
+            .unwrap();
+            let opened = evaluate(&deleted[0]).unwrap();
+            assert!(!opened.is_solid);
+            assert_eq!(opened.face_count, 2);
+            let mut model = Model::from_bodies(vec![body.clone()]);
+            model.commit(moved.clone()).unwrap();
+            model.undo();
+            assert_eq!(model.bodies, vec![body]);
+            model.redo();
+            assert_eq!(model.bodies, vec![moved]);
+        }
+    }
+
     #[test]
     fn logical_surfaces_smooth_internal_samples_but_preserve_boundaries() {
         let a = Point3::new(0., 0., 0.);

@@ -208,18 +208,19 @@ fn on_circle(
 }
 
 fn targets(
-    scene: &[(u64, Geometry)],
+    query: selection::Query<'_>,
     camera: &Camera,
     rect: Rect,
     pointer: Pos2,
     plane: Option<Plane>,
 ) -> Vec<Target> {
+    let scene = query.scene;
     let mut targets = Vec::new();
     let mut add = |point: Point3, owner, label, priority, tolerance| {
         let distance = camera.project(point, rect).0.distance(pointer);
         if distance <= tolerance
             && plane.is_none_or(|plane| plane.contains(point))
-            && selection::visible(scene, camera, point, rect)
+            && query.visible(camera, point, rect)
         {
             targets.push(Target {
                 point,
@@ -246,10 +247,16 @@ fn targets(
         }
         let mut lengths = vec![0.; g.edge_count];
         for (edge, group) in g.edges.iter().zip(&g.edge_groups) {
+            if g.internal_edges.contains(group) {
+                continue;
+            }
             lengths[*group] += (edge[1] - edge[0]).magnitude();
         }
         let mut traveled = vec![0.; g.edge_count];
         for (edge, group) in g.edges.iter().zip(&g.edge_groups) {
+            if g.internal_edges.contains(group) {
+                continue;
+            }
             let length = (edge[1] - edge[0]).magnitude();
             let half = lengths[*group] / 2.;
             if length > 1e-12 && traveled[*group] <= half && traveled[*group] + length >= half {
@@ -278,7 +285,7 @@ fn targets(
 }
 
 pub fn acquire_plane(
-    scene: &[(u64, Geometry)],
+    query: selection::Query<'_>,
     camera: &Camera,
     rect: Rect,
     pointer: Pos2,
@@ -286,6 +293,7 @@ pub fn acquire_plane(
     geometry: bool,
     base_plane: bool,
 ) -> Result<Plane, String> {
+    let scene = query.scene;
     if let Some((owner, face)) = selected {
         return scene.iter().find(|(id,_)|*id==owner).and_then(|(_,g)|Plane::face(g,face))
             .ok_or_else(||"Drawing requires a planar support face. Select a planar face or clear the selection.".into());
@@ -295,7 +303,7 @@ pub fn acquire_plane(
     }
     // Choosing a support face is placement, not snapping; disabling Snap must
     // not silently move drawing back to the ground plane.
-    if let Some((_, owner, face)) = selection::surface_hit(scene, camera, pointer, rect) {
+    if let Some((_, owner, face)) = query.surface_hit(camera, pointer, rect) {
         return scene
             .iter()
             .find(|(id, _)| *id == owner)
@@ -306,7 +314,7 @@ pub fn acquire_plane(
     }
     if geometry {
         // Acquire silhouettes just outside a face too, using its visible boundary.
-        let nearby = targets(scene, camera, rect, pointer, None);
+        let nearby = targets(query, camera, rect, pointer, None);
         for target in &nearby {
             if let Some((_, g)) = scene.iter().find(|(id, _)| *id == target.owner) {
                 let (_, direction) = camera.ray(pointer, rect);
@@ -334,7 +342,7 @@ pub fn acquire_plane(
 }
 
 pub fn point(
-    scene: &[(u64, Geometry)],
+    query: selection::Query<'_>,
     camera: &Camera,
     rect: Rect,
     pointer: Pos2,
@@ -342,11 +350,12 @@ pub fn point(
     anchor: Option<Point3>,
     preferences: &Preferences,
 ) -> Result<SnapPoint, String> {
+    let scene = query.scene;
     let raw = plane
         .intersect(camera, pointer, rect)
         .ok_or("The drawing plane is edge-on. Change view or select another face.")?;
     if preferences.geometry
-        && let Some(target) = targets(scene, camera, rect, pointer, Some(plane)).first()
+        && let Some(target) = targets(query, camera, rect, pointer, Some(plane)).first()
     {
         return Ok(SnapPoint {
             position: target.point,
@@ -389,7 +398,7 @@ pub fn point(
                 .iter()
                 .flat_map(|(_, g)| g.points.iter())
                 .filter(|p| plane.contains(**p))
-                .filter(|p| selection::visible(scene, camera, **p, rect))
+                .filter(|p| query.visible(camera, **p, rect))
                 .filter_map(|p| {
                     let mut aligned = raw_uv;
                     aligned[axis] = plane.coordinates(*p)[axis];
@@ -453,14 +462,39 @@ mod tests {
             .copied()
             .unwrap();
         let pointer = camera.project(corner, rect).0 + eframe::egui::vec2(2., 2.);
-        let plane = acquire_plane(&scene, &camera, rect, pointer, None, true, false).unwrap();
+        let plane = acquire_plane(
+            selection::Query::brute(&scene),
+            &camera,
+            rect,
+            pointer,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         assert!(
             plane.contains(corner),
             "plane {plane:?}, corner {corner:?}, visible {}, targets {}",
             selection::visible(&scene, &camera, corner, rect),
-            targets(&scene, &camera, rect, pointer, None).len()
+            targets(
+                selection::Query::brute(&scene),
+                &camera,
+                rect,
+                pointer,
+                None
+            )
+            .len()
         );
-        let endpoint = point(&scene, &camera, rect, pointer, plane, None, &preferences).unwrap();
+        let endpoint = point(
+            selection::Query::brute(&scene),
+            &camera,
+            rect,
+            pointer,
+            plane,
+            None,
+            &preferences,
+        )
+        .unwrap();
         assert_eq!(endpoint.label, "Endpoint");
         assert!((endpoint.position - corner).magnitude() < 1e-7);
         assert!((endpoint.position.z - top).abs() < 1e-7); // Neither base Z nor grid-rounded coordinates.
@@ -471,7 +505,7 @@ mod tests {
             .unwrap();
         let middle = edge[0] + (edge[1] - edge[0]) * 0.5;
         let midpoint = point(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             camera.project(middle, rect).0,
@@ -484,7 +518,7 @@ mod tests {
         assert!((midpoint.position - middle).magnitude() < 1e-7);
         let edge_point = edge[0] + (edge[1] - edge[0]) * 0.3;
         let snapped = point(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             camera.project(edge_point, rect).0,
@@ -498,7 +532,7 @@ mod tests {
         // Beyond the face, infer its actual non-grid X limit while retaining captured depth.
         let raw = Point3::new(2.79, 3., top);
         let projected = point(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             camera.project(raw, rect).0,
@@ -519,7 +553,7 @@ mod tests {
                 .all(|p| (p.z - top).abs() < 1e-6)
         );
         let no_snap_plane = acquire_plane(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             camera.project(Point3::new(1.2, -0.7, top), rect).0,
@@ -529,10 +563,19 @@ mod tests {
         )
         .unwrap();
         assert!(no_snap_plane.contains(corner));
-        let base = acquire_plane(&scene, &camera, rect, rect.center(), None, true, true).unwrap();
+        let base = acquire_plane(
+            selection::Query::brute(&scene),
+            &camera,
+            rect,
+            rect.center(),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
         assert_eq!(base.origin.z, 0.);
         let pinned = acquire_plane(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             Pos2::ZERO,
@@ -551,7 +594,7 @@ mod tests {
         };
         let raw = Point3::new(1.12, -0.13, top);
         let unsnapped = point(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             camera.project(raw, rect).0,
@@ -571,7 +614,7 @@ mod tests {
             .map(|(_, face)| *face)
             .unwrap();
         let plane = acquire_plane(
-            &scene,
+            selection::Query::brute(&scene),
             &camera,
             rect,
             rect.center(),
@@ -686,7 +729,7 @@ mod tests {
                 .find(|f| Plane::face(&scene[0].1, *f).is_some_and(|p| p.contains(circle.center)))
                 .unwrap();
             let plane = acquire_plane(
-                &scene,
+                selection::Query::brute(&scene),
                 &camera,
                 rect,
                 camera.project(circle.center, rect).0,
@@ -697,7 +740,7 @@ mod tests {
             .unwrap();
             let preferences = Preferences::default();
             let center = point(
-                &scene,
+                selection::Query::brute(&scene),
                 &camera,
                 rect,
                 camera.project(circle.center, rect).0 + eframe::egui::vec2(1., 1.),
@@ -710,7 +753,7 @@ mod tests {
             assert!((center.position - circle.center).magnitude() < 1e-9);
             let rim = circle.center + circle.u * 0.37f64.cos() + circle.v * 0.37f64.sin();
             let snapped = point(
-                &scene,
+                selection::Query::brute(&scene),
                 &camera,
                 rect,
                 camera.project(rim, rect).0,
@@ -730,7 +773,7 @@ mod tests {
             );
             assert!(plane.contains(snapped.position));
             let off = point(
-                &scene,
+                selection::Query::brute(&scene),
                 &camera,
                 rect,
                 camera.project(circle.center, rect).0,
@@ -782,7 +825,7 @@ mod tests {
                 ..Default::default()
             };
             let snapped = point(
-                &scene,
+                selection::Query::brute(&scene),
                 &camera,
                 rect,
                 camera.project(raw, rect).0,

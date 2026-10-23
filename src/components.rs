@@ -26,9 +26,13 @@ pub struct ComponentEdit {
     #[serde(default)]
     pub retrim: bool,
     #[serde(default)]
+    pub section_transform: bool,
+    #[serde(default)]
     pub sweep: Option<[f64; 3]>,
     #[serde(default)]
     pub tangent_walls: bool,
+    #[serde(default)]
+    pub prismatic_cut: bool,
     #[serde(default)]
     pub face_edit: Option<crate::face_operations::FaceEdit>,
     pub mode: SelectionMode,
@@ -72,14 +76,14 @@ pub fn pivot(g: &Geometry, mode: SelectionMode, element: Option<usize>) -> Optio
             .triangles
             .iter()
             .zip(&g.triangle_faces)
-            .filter(|(_, face)| Some(**face) == element)
+            .filter(|(_, face)| Some(g.face_group(**face)) == element.map(|f| g.face_group(f)))
             .flat_map(|(t, _)| t.iter().copied())
             .collect(),
         SelectionMode::Edge => g
             .edges
             .iter()
             .zip(&g.edge_groups)
-            .filter(|(_, edge)| Some(**edge) == element)
+            .filter(|(_, edge)| Some(g.edge_group(**edge)) == element.map(|e| g.edge_group(e)))
             .flat_map(|(e, _)| e.iter().copied())
             .collect(),
         _ => vertices(g, mode, element)
@@ -250,6 +254,23 @@ fn transformed_many(
     elements: &[usize],
     matrix: Matrix4,
 ) -> Result<Body, String> {
+    if mode == SelectionMode::Edge && elements.iter().any(|edge| g.internal_edges.contains(edge)) {
+        return Err("Internal cylinder junctions are not editable edges.".into());
+    }
+    let mut expanded = Vec::new();
+    for element in elements {
+        let group = match mode {
+            SelectionMode::Face => g.face_elements(*element),
+            SelectionMode::Edge => g.edge_elements(*element),
+            _ => vec![*element],
+        };
+        for member in group {
+            if !expanded.contains(&member) {
+                expanded.push(member);
+            }
+        }
+    }
+    let elements = expanded.as_slice();
     let element = elements.first().copied();
     let mut result = body.clone();
     if matrix == Matrix4::identity() {
@@ -284,11 +305,23 @@ fn transformed_many(
             return Ok(result);
         }
         let placement = crate::regions::transform(body);
+        let retrim = mode == SelectionMode::Face && planar_supports(g).is_ok();
+        let mut selected = elements
+            .iter()
+            .flat_map(|element| vertices(g, mode, Some(*element)))
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.dedup();
+        let section_transform = !retrim
+            && matches!(mode, SelectionMode::Face | SelectionMode::Edge)
+            && crate::section_edits::translation(g, &selected, matrix)?.is_some();
         result.component_edits.push(ComponentEdit {
             evaluated: true,
-            retrim: mode == SelectionMode::Face && planar_supports(g).is_ok(),
+            retrim,
+            section_transform,
             sweep: None,
             tangent_walls: false,
+            prismatic_cut: false,
             face_edit: None,
             mode,
             element,
@@ -323,8 +356,10 @@ pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Resu
     changed.component_edits.push(ComponentEdit {
         evaluated: true,
         retrim: false,
+        section_transform: false,
         sweep: Some(vector.into()),
         tangent_walls: true,
+        prismatic_cut: true,
         face_edit: None,
         mode: SelectionMode::Face,
         element: face,
@@ -406,7 +441,14 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
     }
     for (index, edit) in edits.iter().enumerate() {
         let m = Matrix4::from(edit.matrix);
-        if (edit.tangent_walls && edit.sweep.is_none())
+        if (edit.section_transform
+            && (!edit.evaluated
+                || !matches!(edit.mode, SelectionMode::Face | SelectionMode::Edge)
+                || edit.retrim
+                || edit.sweep.is_some()
+                || edit.face_edit.is_some()))
+            || (edit.tangent_walls && edit.sweep.is_none())
+            || (edit.prismatic_cut && (!edit.tangent_walls || edit.sweep.is_none()))
             || edit.face_edit.is_some_and(|_| {
                 !edit.evaluated
                     || edit.mode != SelectionMode::Face
@@ -499,13 +541,24 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
             return Err("A component transform references a missing element.".into());
         }
         if let Some(vector)=edit.sweep {
-            *g=crate::face_extrusions::evaluated_sweep(g,edit.element,vector.into(),body.shape==Shape::Circle,edit.tangent_walls)?;
+            *g=crate::face_extrusions::evaluated_sweep(g,edit.element,vector.into(),body.shape==Shape::Circle,edit.tangent_walls,edit.prismatic_cut)?;
             return Ok(());
         }
         let matrix = Matrix4::from(edit.matrix);
+        if edit.section_transform {
+            let exact=crate::section_edits::translation(g,&selected,matrix)?.ok_or("The referenced complete cap or opposite section changed; reselect the cap.")?;
+            map_geometry(g,exact);
+            return Ok(());
+        }
         if edit.retrim {
             let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
             *g=retrim_faces(g,&faces,matrix)?;
+            return Ok(());
+        }
+        // A continuous cylinder wall can own every boundary vertex. This is
+        // a rigid transform of the entire retained shape, not mesh deformation.
+        if selected.len()==g.points.len() {
+            map_geometry(g,matrix);
             return Ok(());
         }
         let old = g.clone();
@@ -993,7 +1046,8 @@ mod tests {
                 let [a, b] = e.map(|i| g.points[i]);
                 (a.x.hypot(a.y) - 1.).abs() < 1e-6
                     && (b.x.hypot(b.y) - 1.).abs() < 1e-6
-                    && (a.z - b.z).abs() > 1.9
+                    && (a.z - 2.).abs() < 1e-6
+                    && (b.z - 2.).abs() < 1e-6
             })
             .take(2)
             .map(|(i, _)| (1, Some(i)))
@@ -1262,7 +1316,19 @@ mod tests {
                         .commit(edited.clone())
                         .unwrap_or_else(|e| panic!("{shape:?} {mode:?} rotate={rotate}: {e}"));
                     let output = evaluate_scene(&model.bodies).unwrap();
-                    let chosen = vertices(&g, mode, element);
+                    let selected = match (mode, element) {
+                        (SelectionMode::Face, Some(face)) => g.face_elements(face),
+                        (SelectionMode::Edge, Some(edge)) => g.edge_elements(edge),
+                        _ => element.into_iter().collect(),
+                    };
+                    let chosen = if mode == SelectionMode::Volume {
+                        (0..g.points.len()).collect::<Vec<_>>()
+                    } else {
+                        selected
+                            .into_iter()
+                            .flat_map(|element| vertices(&g, mode, Some(element)))
+                            .collect()
+                    };
                     for i in 0..g.points.len() {
                         if edited.component_edits.last().is_some_and(|e| e.retrim) {
                             let face = element.unwrap();
@@ -1593,9 +1659,10 @@ mod tests {
                 project.save(&path).unwrap();
                 assert_eq!(Project::load(&path).unwrap().bodies, vec![changed.clone()]);
                 let mut old = serde_json::to_value(project).unwrap();
-                // Exercise the original v19 payload without the v24 opt-in.
+                // Exercise the original v19 payload without later opt-ins.
                 for edit in old["bodies"][0]["component_edits"].as_array_mut().unwrap() {
                     edit.as_object_mut().unwrap().remove("tangent_walls");
+                    edit.as_object_mut().unwrap().remove("prismatic_cut");
                 }
                 old["schema_version"] = 18.into();
                 old["modeling_version"] = 18.into();

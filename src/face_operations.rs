@@ -63,22 +63,31 @@ pub fn selected(
         if face >= g.face_count {
             return Err("Selected face no longer exists.".into());
         }
+        let faces = if kind == FaceEdit::CapOpenings {
+            vec![face]
+        } else {
+            g.face_elements(face)
+        };
         if let Some(body) = changed.iter_mut().find(|b| b.id == *id) {
             let edit = body.component_edits.last_mut().unwrap();
-            if face != edit.element && !edit.elements.contains(&face) {
-                edit.elements.push(face);
+            for face in faces {
+                if face != edit.element && !edit.elements.contains(&face) {
+                    edit.elements.push(face);
+                }
             }
         } else {
             let mut body = body.clone();
             body.component_edits.push(ComponentEdit {
                 evaluated: true,
                 retrim: false,
+                section_transform: false,
                 sweep: None,
                 tangent_walls: false,
+                prismatic_cut: false,
                 face_edit: Some(kind),
                 mode: SelectionMode::Face,
                 element: face,
-                elements: Vec::new(),
+                elements: faces.into_iter().filter(|other| *other != face).collect(),
                 topology: g.topology.clone(),
                 matrix: Matrix4::identity().into(),
             });
@@ -235,6 +244,14 @@ pub(crate) fn imprint(
     let profiles = planar_regions(selected_shell.extract_boundaries())?;
     if profiles.is_empty() {
         return Err("The profile has no closed face regions.".into());
+    }
+    if op.analytic_crossings
+        && support
+            .edge_iter()
+            .chain(profiles.iter().flat_map(|f| f.edge_iter()))
+            .any(|edge| !matches!(edge.curve(), truck_modeling::Curve::Line(_)))
+    {
+        return crate::profile_imprints::apply(source, element, &profiles, &tool.circles);
     }
     let mut view = Geometry {
         triangles: tool
@@ -1142,7 +1159,7 @@ mod tests {
         }
     }
     #[test]
-    fn imprint_rejects_occluded_and_curved_crossings_and_preserves_holes() {
+    fn imprint_rejects_occluded_and_legacy_curved_crossings_and_preserves_holes() {
         use crate::booleans::{Boolean, Kind as Operation};
         let mut source = Body::new(Shape::Rectangle);
         source.id = 1;
@@ -1231,6 +1248,9 @@ mod tests {
             SelectionMode::Face,
             &scene,
         ));
+        // Legacy histories retain the old crossing policy; newly authored
+        // analytic-crossing Imprints are checked by profile_imprints tests.
+        feature.boolean.as_mut().unwrap().analytic_crossings = false;
         assert!(
             evaluate_scene(&[curved, profile, feature])
                 .err()

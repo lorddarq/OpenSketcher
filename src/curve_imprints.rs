@@ -10,7 +10,7 @@ const EPS: f64 = 1e-7;
 
 // Isolate roots using the spline control hull, not the display tessellation.
 // Homogeneous numerators remain valid even for zero-weight control points.
-fn roots(
+pub(crate) fn roots(
     curve: Curve,
     origin: Point3,
     normal: Vector3,
@@ -122,7 +122,7 @@ fn roots(
     Ok(hits)
 }
 
-fn split(edge: &Edge, hits: &[(f64, Vertex)]) -> Result<Vec<Edge>, String> {
+pub(crate) fn split(edge: &Edge, hits: &[(f64, Vertex)]) -> Result<Vec<Edge>, String> {
     let mut tail = if edge.orientation() {
         edge.clone()
     } else {
@@ -133,8 +133,17 @@ fn split(edge: &Edge, hits: &[(f64, Vertex)]) -> Result<Vec<Edge>, String> {
         if vertex == tail.front() || vertex == tail.back() {
             continue;
         }
+        // A Line cut reparameterizes its remainder to 0..1, whereas splines
+        // retain their knot parameters. Recompute successive line parameters.
+        let parameter = if matches!(tail.curve(), Curve::Line(_)) {
+            let a = tail.front().point();
+            let d = tail.back().point() - a;
+            (vertex.point() - a).dot(d) / d.magnitude2()
+        } else {
+            *t
+        };
         let (head, next) = tail
-            .cut_with_parameter(vertex, *t)
+            .cut_with_parameter(vertex, parameter)
             .ok_or("The trim intersection is too close to an edge endpoint to split safely.")?;
         pieces.push(head);
         tail = next;
@@ -142,7 +151,7 @@ fn split(edge: &Edge, hits: &[(f64, Vertex)]) -> Result<Vec<Edge>, String> {
     pieces.push(tail);
     Ok(pieces)
 }
-fn oriented(edge: &Edge, pieces: &[Edge]) -> Vec<Edge> {
+pub(crate) fn oriented(edge: &Edge, pieces: &[Edge]) -> Vec<Edge> {
     if edge.orientation() {
         pieces.to_vec()
     } else {
@@ -333,79 +342,29 @@ pub(crate) fn apply(op: &Boolean, inputs: &[&Geometry]) -> Result<Geometry, Stri
         directed.push(edge.inverse());
         directed.push(edge);
     }
-    let mut outgoing = HashMap::<VertexID, Vec<usize>>::new();
-    for (i, edge) in directed.iter().enumerate() {
-        outgoing.entry(edge.front().id()).or_default().push(i);
-    }
-    let mut used = vec![false; directed.len()];
-    let mut cycles = Vec::new();
-    for start in 0..directed.len() {
-        if used[start] {
-            continue;
-        }
-        let mut wire = Wire::new();
-        let mut current = start;
-        loop {
-            if used[current] {
-                return Err("The cut forms a nonseparating or ambiguous trim.".into());
-            }
-            used[current] = true;
-            let edge = &directed[current];
-            wire.push_back(edge.clone());
-            let curve = edge.oriented_curve();
-            let incoming = -curve.der(curve.range_tuple().1).normalize();
-            let candidates = outgoing
-                .get(&edge.back().id())
-                .ok_or("An imprint trim is open.")?;
-            current = *candidates
-                .iter()
-                .filter(|i| directed[**i].id() != edge.id())
-                .min_by(|x, y| {
-                    let angle = |i: usize| {
-                        let c = directed[i].oriented_curve();
-                        let d = c.der(c.range_tuple().0).normalize();
-                        (-plane.normal.dot(incoming.cross(d)))
-                            .atan2(incoming.dot(d))
-                            .rem_euclid(std::f64::consts::TAU)
-                    };
-                    angle(**x).total_cmp(&angle(**y))
-                })
-                .ok_or("The line does not separate material into closed faces.")?;
-            if current == start {
-                break;
-            }
-        }
-        let poly = crate::face_operations::wire_polygon(&wire, &plane);
-        let area = crate::regions::area(&poly);
-        if area.abs() < 1e-12 {
-            return Err("The imprint produces a degenerate region.".into());
-        }
-        cycles.push((wire, poly, area));
-    }
-    let mut regions = Vec::new();
-    for (outer, poly, area) in &cycles {
-        if *area <= 0. {
-            continue;
-        }
-        let mut wires = vec![outer.clone()];
-        for (hole, points, area) in &cycles {
-            if *area < 0. && crate::regions::contains(points[0], poly) {
-                wires.push(hole.clone());
-            }
-        }
-        regions.push(
-            builder::try_attach_plane(&wires)
-                .map_err(|e| format!("Invalid imprint region: {e}"))?,
-        );
-    }
+    partition(source, element, plane, &pieces, directed)
+}
+
+pub(crate) fn partition(
+    source: &Geometry,
+    element: usize,
+    plane: crate::snapping::Plane,
+    pieces: &HashMap<EdgeID, Vec<Edge>>,
+    directed: Vec<Edge>,
+) -> Result<Geometry, String> {
+    let shell = source
+        .shell
+        .as_ref()
+        .ok_or("Imprint requires retained boundaries.")?;
+    let regions = planar_arrangement(plane, directed)?;
     if regions.len() < 2 {
         return Err(
-            "The line does not separate the selected face into independent regions.".into(),
+            "The imprint does not separate the selected face into independent regions.".into(),
         );
     }
     let mut result_shell = Shell::new();
     let mut roles = Vec::new();
-    for (face, role) in shell.iter().zip(mapping) {
+    for (face, role) in shell.iter().zip(source.surface_mapping()?) {
         if *role == element {
             continue;
         }
@@ -444,6 +403,94 @@ pub(crate) fn apply(op: &Boolean, inputs: &[&Geometry]) -> Result<Geometry, Stri
     result.is_solid = true;
     result.circles = source.circles.clone();
     Ok(result)
+}
+
+/// Shared directed analytic-edge arrangement for imprint and planar set operations.
+pub(crate) fn planar_arrangement(
+    plane: crate::snapping::Plane,
+    directed: Vec<Edge>,
+) -> Result<Vec<Face>, String> {
+    let mut outgoing = HashMap::<VertexID, Vec<usize>>::new();
+    for (i, edge) in directed.iter().enumerate() {
+        outgoing.entry(edge.front().id()).or_default().push(i);
+    }
+    let mut used = vec![false; directed.len()];
+    let mut cycles = Vec::new();
+    for start in 0..directed.len() {
+        if used[start] {
+            continue;
+        }
+        let mut wire = Wire::new();
+        let mut current = start;
+        loop {
+            if used[current] {
+                return Err("The cut forms a nonseparating or ambiguous trim.".into());
+            }
+            used[current] = true;
+            let edge = &directed[current];
+            wire.push_back(edge.clone());
+            let curve = edge.oriented_curve();
+            let incoming = -curve.der(curve.range_tuple().1).normalize();
+            let candidates = outgoing
+                .get(&edge.back().id())
+                .ok_or("An imprint trim is open.")?;
+            current = *candidates
+                .iter()
+                .filter(|i| directed[**i].id() != edge.id())
+                .min_by(|x, y| {
+                    let angle = |i: usize| {
+                        let c = directed[i].oriented_curve();
+                        let d = c.der(c.range_tuple().0).normalize();
+                        (-plane.normal.dot(incoming.cross(d)))
+                            .atan2(incoming.dot(d))
+                            .rem_euclid(std::f64::consts::TAU)
+                    };
+                    angle(**x).total_cmp(&angle(**y))
+                })
+                .ok_or("The imprint does not separate material into closed faces.")?;
+            if current == start {
+                break;
+            }
+        }
+        let poly = crate::face_operations::wire_polygon(&wire, &plane);
+        let area = crate::regions::area(&poly);
+        if area.abs() < 1e-12 {
+            return Err("The imprint produces a degenerate region.".into());
+        }
+        cycles.push((wire, poly, area));
+    }
+    // A disconnected inner profile contributes both directions of its loop.
+    // Assign its negative cycle to the smallest enclosing positive cycle,
+    // never to the equal-area reverse cycle or every ancestor island.
+    let mut holes = HashMap::<usize, Vec<Wire>>::new();
+    for (hole, points, area) in &cycles {
+        if *area >= 0. {
+            continue;
+        }
+        let owner = cycles
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, poly, outer_area))| {
+                *outer_area > -*area + 1e-12 && crate::regions::contains(points[0], poly)
+            })
+            .min_by(|(_, a), (_, b)| a.2.total_cmp(&b.2))
+            .map(|(i, _)| i)
+            .ok_or("An imprint hole has no enclosing material region.")?;
+        holes.entry(owner).or_default().push(hole.clone());
+    }
+    let mut regions = Vec::new();
+    for (index, (outer, _, area)) in cycles.iter().enumerate() {
+        if *area <= 0. {
+            continue;
+        }
+        let mut wires = vec![outer.clone()];
+        wires.extend(holes.remove(&index).unwrap_or_default());
+        regions.push(
+            builder::try_attach_plane(&wires)
+                .map_err(|e| format!("Invalid imprint region: {e}"))?,
+        );
+    }
+    Ok(regions)
 }
 
 #[cfg(test)]

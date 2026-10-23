@@ -82,6 +82,7 @@ The profile's ID owns any emerging body, distinct from the target. STL/GLB/STEP/
 ### Interactive evaluation and CPU behavior
 
 - [x] Evaluate model edits, component previews, history, and project loading off the UI thread.
+- [x] Share a world-space triangle acceleration index across point/edge visibility, all selection modes and snapping; construct it on the geometry worker, preserve silhouette/coincident-hit rules and publish matching scene/index pairs.
 - [x] Use one long-lived evaluator with at most one active job; coalesce repeated pending input rather than starting a thread per value.
 - [x] Bound the geometry Rayon pool to at most two threads, leaving processor capacity for the UI.
 - [x] Keep the last valid scene visible, reject stale/cancelled results, show progress, and support Escape cancellation.
@@ -93,12 +94,18 @@ Cancellation discards pending results immediately; the already executing kernel 
 
 ## P1: operator completeness and references
 
+Measured performance gaps and reproducible release workloads are recorded in [the CPU/memory investigation](../performance/cpu-investigation-2026-10-24.md). Point-mode visibility now uses indexed triangle queries; full-scene rebuilds, repeated normal calculation and deferred separation of analytic/display geometry remain active performance work; an idle sample does not establish the absence of leaks under sustained editing.
+
 - [x] Explicit planar closed-profile Imprint: exact contained curved wires, existing inner-loop preservation, independent regions, and straight-boundary crossings with adjacent-edge reconciliation.
 - [x] Holed and disconnected planar profile tools, exact nested analytic loops, whole-profile references, and independent island regions.
 - [x] Finite straight-line Imprint on planar solid faces, including analytic curved trims, holes and concave regions; retain shared neighbor boundaries and independent regions.
-- [ ] Complete Imprint for arbitrary open curves and analytic curved closed-profile crossings.
+- [x] Noncoincident analytic closed-profile crossings on planar supports, retaining B-spline/NURBS trims, shared neighbor edges, holes, disconnected regions and independent edited faces.
+- [x] Analytic closed-profile Imprint across shared conic rim intervals; keep existing boundary intervals once and retain interior divider edges, with independently sweepable regions and reconciled neighbors.
+- [ ] Complete Imprint for arbitrary open curves, general nonconic coincident spline overlaps and intersection-generated trims.
+- [x] Continuous cylinder-wall selection/editing and circular-rim edge groups; exclude internal arc-junction edges from modeling and inference while preserving saved kernel guards.
 - [x] Cylindrical-wall Offset face changes radius without moving the axis; equal X/Y scale required, independent Z scale allowed. An elliptic cylinder is rejected because its parallel offset is not an ellipse.
 - [x] Exact planar face Translate/Rotate on convex planar solids with retained adjacent planes, exact shared edges/faces, guarded connectivity and analytic STEP.
+- [x] Exact complete-cap/rim translation on retained two-section solids, including circular/semicircular, through-pipe and concave Boolean caps; preserve the opposite cap and analytic boundaries.
 - [ ] General face Translate/Rotate beyond convex planar solids, including concave/curved neighbors and rigid curved/deformed face preservation.
 - [ ] Arbitrary selected-edge chamfer/fillet, including concave edges and already edited solids. Original box edges now have edge-local treatment; Boolean-result/concave edges and exact general fillets remain pending.
 - [x] Multiple supported face/edge operation inputs across one or several source bodies, applied atomically in one undo step.
@@ -111,7 +118,7 @@ Cancellation discards pending results immediately; the already executing kernel 
 - [ ] Complete curved and multi-plane varying-depth termination on general edited geometry.
 - [ ] Persistent semantic face/edge references beyond current guarded connectivity; no silent ambiguous rebinding. Source support-face roles are now retained for attached sweeps; arbitrary output/trim/edge naming remains pending.
 - [x] Identify failed supported operation and reference, retain last valid geometry, and distinguish rejected properties from committed parameters.
-- [ ] Separate analytic evaluation from disposable preview tessellation; retain the existing duplicate-evaluation cache and measure interactive latency.
+- [ ] Separate analytic evaluation from disposable preview tessellation; retain the existing duplicate-evaluation cache and measure interactive latency. Unchanged base geometry is now reused by exact body parameters plus resolved profile boundaries; downstream bores, Booleans and reference guards still replay. Visibility indexing and shading are shared with the evaluated scene. Triangle bounds are computed once per index build, and superseded live edits stop between evaluation stages before display preparation. Disposable preview quality and general incremental operator evaluation remain pending.
 - [ ] Complete analytic STEP coverage for every edited surface. Retained kernel boundaries now export their analytic/NURBS surfaces directly; mesh-only component edits/noncircular approximated blends remain faceted. Nonuniformly scaled revolutions now export as exact rational tensor-product NURBS, preserving surface geometry and orientation. Intersection trims use independently sampled spline curves at kernel tolerance to avoid a pinned STEP-writer intersection-entity ID defect; cached geometry is never mutated by export.
 
 ## P2: broader operators
@@ -133,7 +140,9 @@ These researched capabilities inform the backlog; they do not authorize speculat
 ## Ordered Boolean tools
 
 - [x] Union, ordered subtraction, and intersection for closed volumes and coplanar planar faces, retained source parameters, Keep tools, and undo/redo.
-- [ ] Curved/noncoplanar sheet trimming, general slice/split, and analytic planar arc preservation.
+- [x] Analytic planar face Union/Subtract/Intersect with retained B-spline/NURBS trims, shared intersections, holes, disconnected regions and opposite normals; versioned replay preserves older files.
+- [x] Coincident rational-conic overlap merging in analytic planar face sets, including partial circle/ellipse arcs with different starts and prior trims.
+- [ ] Curved/noncoplanar sheet trimming, general slice/split, general nonconic spline overlaps and intersection-generated trims.
 
 See [research, behavior, and current limitations](boolean-operators.md).
 
@@ -376,7 +385,7 @@ Supported inward regions on convex planar bodies reuse exact shared-boundary con
 
 `.osk` v24 adds `boolean.kind: "imprint"` and optional `component_edits[].tangent_walls`. Imprint requires two face references. New evaluated sweeps set tangent walls; missing/false retains the legacy grouping and evaluation behavior, preserving previously saved histories. The flag requires a sweep and cannot be used for unrelated transforms.
 
-Regression covers all basic closed profiles on boxes/cylinders/semicylinders under rotation/nonuniform scale, existing annular loops, independent outward regions, fast blind/through cuts, crossing/touching rectangular boundaries, adjacent-edge splits, unchanged opposite-face area, keep/remove tools, rollback, history, migration/version gates, round-trip and four exports. Open curves, analytic curved crossings and general inward curved trimming remain unchecked requirements.
+Regression covers all basic closed profiles on boxes/cylinders/semicylinders under rotation/nonuniform scale, existing annular loops, independent outward regions, fast blind/through cuts, crossing/touching rectangular boundaries, adjacent-edge splits, unchanged opposite-face area, keep/remove tools, rollback, history, migration/version gates, round-trip and four exports. Arbitrary curved tools, analytic curved closed-profile crossings and general inward curved trimming remain unchecked requirements.
 
 Native release review selected the box face first and Shift-selected its coincident circle profile. Imprint exposed a separate circular face; entering −4 mm on the 3 mm body produced a through-hole promptly, with no emerging extension. Undo restored the imprinted region and Redo restored the cut. Save retained ordered input picks, `imprint`, the −4 mm sweep and `tangent_walls: true` in `.osk` v24. Circular snap metadata for new pocket floors/exits is separately covered by kernel/export regression.
 
@@ -401,3 +410,57 @@ Select one solid planar face and choose **Imprint using curve**, then a visible 
 Curve intersections use native B-spline/rational control hulls and parameter roots, preserving analytic subcurves rather than flattening circular boundaries. Shared original edges are split on adjacent surfaces too; those surfaces retain their original geometry. Region classification samples retained curves only to classify trim loops. Whole-circle snap references survive across split rims. Each resulting logical region can be selected/extruded independently. Source and line remain live, guarded inputs, suppressed by default; Keep tools retains the line and removing the operation restores the inputs. This operation serializes as `imprint_curve` in `.osk` v26.
 
 Runnable checks cover rectangle/circle/semicircle caps, holes, finite concave-arm scope, transformed elliptic rims, unchanged material, analytic edge retention, independent positive sweeps, rejected finite/offset/stale inputs, live line changes, undo/redo, removal, Keep tools, version gates, save/reopen and STL/GLB/STEP/DXF output. Arbitrary curved tools, projected/noncoplanar imprints, intersection-curve trims and analytic curved closed-profile crossings remain pending.
+
+Native v26 release review selected a cylinder cap and chose its coplanar line through **Imprint using curve**. The two resulting regions were independently selectable (Face 5/Face 6). Entering 0.8 mm on one region raised only that region, preserving the other cap and curved neighbor. Undo restored the flat split; Redo restored the raised region. Save retained `imprint_curve`, source `[1,4]`, line `[2,null]`, both input guards and a tangent-aware evaluated 0.8 mm sweep in `/tmp/osk-curve-imprint-review.osk`. Four operator regressions plus the complete suite passed (64 passed, one manual timing test ignored); Clippy and the release build passed. Numeric drag stability has a separate headless pointer regression; this native review verified extrusion through numeric entry.
+
+### Analytic closed-profile crossings
+
+New Imprints support closed profiles crossing planar face boundaries containing retained B-spline/NURBS curves. This includes circle-to-circle intersections and rectangles/circles/semicircles crossing circular and semicircular caps. Only profile portions inside the selected material region become split edges. Outside portions and portions in existing voids are discarded. Shared straight boundary overlap is reconciled; the source material is unchanged. All resulting regions retain logical selection and can be extruded independently.
+
+The operator uses conservative rational control hulls and parameter refinement, not polygon intersection on viewport triangles. The same split curve/vertex objects are installed on neighboring faces, which keep their original surface geometry. Finite line and closed-profile tools share the region graph, nested-loop ownership and neighbor reconstruction. Full retained circular loops preserve analytic snap references; a clipped arc does not create a fictitious complete circle outside the result.
+
+New histories persist `boolean.analytic_crossings: true` in `.osk` v27. Missing/false preserves legacy evaluation, and earlier declared file versions reject the new flag. A non-Imprint operation cannot carry it. The explicit face/whole-profile input scope, live upstream changes, Keep tools, removal, undo and failure rollback remain unchanged.
+
+Operator checks cover all nine basic closed-profile/cap combinations, curved annular supports, rotated/nonuniformly scaled ellipses, disconnected crossing and contained regions, independent positive sweeps, unchanged volume, retained analytic curves, geometric consistency, live input changes, rollback for offset/stale references, undo/redo, keep/remove, version gates, save/reopen and four exports. Shared circular/elliptical boundary intervals now retain the existing support rim while interior tool edges partition independent regions. A coincident-only profile still rejects because it creates no divider. General nonconic overlaps, unresolved near-tangencies, intersection-generated trims and arbitrary open curved tools remain pending. Planar face set-operation arc preservation is implemented separately.
+
+### Cylinder continuity and internal arc junctions
+
+A circle extrusion's connected patches on the same cylindrical support represent one modeling wall. Its joined arc endpoints do not create independent longitudinal modeling edges. The viewport smooths across those internal joins, Face mode acquires/highlights the whole wall, and Edge mode cannot acquire or author transforms of the internal joins. Geometry inference likewise excludes those lines. Each connected circular rim acts as one modeling edge across its retained arc segments; edge transforms expand to all member arcs. Genuine planar cap boundaries, bevel/chamfer transitions and imprinted face boundaries remain distinct.
+
+Continuity groups are derived from retained curved faces and circular references after evaluation. They do not rewrite authored features or stored topology guards. New transforms and Delete Face commands record their complete member selection using the existing `element`/`elements` history representation. Legacy histories replay their explicit original elements. A transform selecting every retained boundary vertex maps the analytic geometry directly instead of clearing it for a faceted fallback. Partial arbitrary curved-face neighbor reconstruction remains part of the unchecked general editing requirement.
+
+Regression covers ordinary and rotated/nonuniformly scaled circle extrusions, one wall/two rim groups, invisible/unpickable internal joins, direct rejection of seam transform authoring, shared smooth normals, grouped wall transformation with analytic boundary retention, grouped Delete Face, undo/redo and real pipe-rim movement/persistence. The prior pipe test selected longitudinal arc-junction edges; it now exercises genuine inner-rim edges, consistent with this behavior requirement.
+
+Native analytic-crossing review loaded a circle overlapping the cylinder rim, used **Imprint using profile**, and independently selected the clipped region and remaining cap. A 0.7 mm extrusion raised only the clipped region; Undo restored the flat partition and Redo restored the extrusion. Save retained `analytic_crossings: true`, ordered `[1,4]` / `[2,null]` input picks and the tangent-aware evaluated sweep in `/tmp/osk-curved-profile-review.osk` (v27).
+
+Continuation regression: extruding a circular region clipped by a cylinder rim must not leave the old rim as an editable/visible edge between two patches on the same cylinder. Classification uses radial support coordinates and axial extent of the retained curved face; display-triangle chord normals cannot establish analytic cylinder tangency. The dedicated check authors the circle/circle Imprint, extrudes the clipped region by 0.7 mm and verifies that every co-cylindrical old-rim join is internal and joins the same modeling wall.
+
+Native cylinder-continuation review loaded the same saved 0.7 mm clipped-circle extrusion into the corrected release build. The initial isometric view and subsequent rotated view showed neither the longitudinal arc joins nor the old horizontal rim continuation. The kernel patches and original serialized history remained intact. Whole-wall/rim edit membership, rejected seam acquisition, analytic whole-boundary transformation and grouped deletion are verified by runnable checks. Final verification: 70 tests passed, one manual timing check ignored; Clippy, release build, formatting and diff checks passed. The native review window remains open with the current view; its user-changed camera was not overwritten.
+
+### Exact complete-cap translation
+
+Translating a complete planar end face, or a rim selection owning that complete cap, now retains analytic geometry when all remaining boundary vertices lie on one parallel opposite section. The selected cap translates rigidly, the opposite section stays fixed, and adjacent geometry follows one affine shear/stretch. This supports cylinders, semicylinders, complete through-pipe end faces and concave planar Boolean caps. Existing convex-planar face retrimming keeps its current plane-editing contract.
+
+This path freezes the cap's existing circle/NURBS shape; it does not rebuild it from a polygon or approximate its connecting wall. Lateral moves produce oblique cylinders. Cylinder support recognition tests compatible rim-plane/axis candidates so those walls remain one modeling surface, with no artificial longitudinal joins. The requested translation is stored in the object's existing local frame, so upstream dimensions regenerate the section map rather than baking a tessellation.
+
+New histories store `component_edits[].section_transform: true` in `.osk` v28. The flag requires an evaluated Face/Edge transform and cannot combine with retrim, sweeps or Delete Face. Missing/false preserves legacy mesh-deformation replay. A later change invalidating the complete cap or opposite section rejects with its operation reference. Moves consuming/crossing the fixed opposite section reject rather than creating an inverted solid; inward extrusion remains the subtractive tool. Partial rim edits, intermediate sections and cap rotations are not silently reinterpreted as this operator and remain in the broader curved-editing work.
+
+Checks cover top/bottom circular and semicircular caps, rotated/nonuniform placement, lateral/axial motion, unchanged opposite vertices, exact topology/analytic surface retention, oblique-wall continuity, complete rim acquisition, pipe/concave Boolean results, consuming-move rollback, stale guards, undo/redo, legacy replay, version gates, save/reopen and STL/GLB/STEP/DXF output.
+
+Cylinder viewport continuity uses exact normals from the recognized circular/elliptic extrusion support, including oblique cylinders. Triangle averaging must not introduce a shading seam at arc junctions or old cap rims; genuine cap and cut boundaries remain sharp. The clipped-circle continuation regression checks radial normals independently of tessellation.
+
+### Imprint with a shared rim
+
+A closed planar profile can share circular/elliptical intervals with the selected support face. Use the common analytic-conic proof, endpoint splitting and interval classification shared with planar face Booleans. Pieces already on the support boundary contribute no duplicate trim. Tool edges inside material become bidirectional dividers. Only endpoints needed by those dividers split the original source and neighboring faces. A profile entirely coincident with the support boundary, or outside material, still rejects without changing geometry because it creates no independent face region.
+
+This extends the existing `analytic_crossings` Imprint evaluator; absent/false retains the legacy path. No new serialized field or derived boundary data is required. A same-radius semicircle on a cylinder cap produces two independently selectable and sweepable regions, retaining the cylinder's analytic wall. On semicylinder caps, dividers can meet an existing straight boundary. Tilted/nonuniformly scaled geometry retains exact elliptic trims and neighboring closure.
+
+The runnable `coincident_rim_imprints_keep_shared_neighbors_and_independent_caps` check covers circle/semicircle hosts, rotated profiles, affine placement, region count and unchanged source volume, independent positive sweeps, through-subtraction of either circular half, retained kernel closure, STEP, undo/redo, rollback and `.osk` save/load. General nonconic coincident splines and arbitrary open curved tools remain separate gaps.
+
+### Through-cut of an imprinted prism region
+
+A negative sweep of a partial planar cap can share existing curved walls. For an eligible straight prism, travel through/past the opposite cap removes that footprint without coincident-wall CSG. Reconstruct the remaining entry-cap material through the original depth, retaining analytic curves and tangent wall groups. If no entry-cap material remains, the output is empty. Preserve only complete circular snapping loops that still exist.
+
+Do not infer prism eligibility from endpoints alone. All vertices must lie on the two cap levels, planar sides must be axis-parallel, and spline/rational sides must prove constant homogeneous-control translation between those levels. Blind cuts, tapered/oblique/intermediate-section solids and unsupported surface families retain existing behavior. The `prismatic_reconstruction_requires_a_complete_parallel_through_cut` check protects these exclusions. New evaluated sweeps save `prismatic_cut: true` in `.osk` v30; missing/false preserves existing saved evaluation and output references. The shared-rim Imprint check covers through-subtraction of either half, four exports, persistence and a version downgrade rejection. General curved/concave inward trimming remains pending.
+
+Native macOS release review opened a cylinder cap partitioned by a same-radius semicircle rotated 17°, selected one independent cap region and entered −4 on the 3-unit cylinder. It produced the remaining half-cylinder promptly. Undo restored both cap regions; Redo restored the cut. Save persisted the −4 sweep, `tangent_walls: true`, `prismatic_cut: true`, and schema/modeling 30. The isolated app is `dist/OpenSketcher Shared Rim Imprint Review.app`; the saved review model is `/tmp/osk-shared-rim-imprint-review.osk`. This is macOS evidence only.

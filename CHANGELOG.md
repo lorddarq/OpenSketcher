@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Accelerate point visibility, picking and snapping with a shared triangle index built on the geometry worker. Preserve occlusion/silhouette and coincident selection rules; reuse the index across camera/selection changes and clear it on New.
+
+- Reconstruct remaining cap material for proven straight-prism through-cuts, including imprinted half-cylinder regions sharing outer walls. Preserve analytic curves, tangent wall grouping, four exports and legacy replay through `.osk` v30 sweep intent.
+
+- Support analytic Imprint profiles sharing circular/elliptical support rims. Retain existing rim intervals once, split neighboring edges at interior divider endpoints and expose independent editable regions on cylinder/semicylinder caps.
+
+- Resolve coincident circular/elliptical intervals in analytic planar face Booleans. Prove shared conic supports from homogeneous curve coefficients, split overlap endpoints and retain one active interval across different arc starts, partial trims and affine placement.
+
+- Retain analytic trim curves for coplanar face Union/Subtract/Intersect through the shared Imprint intersection/arrangement solver. Preserve holes, disconnected regions, ordered picks, opposite normals, snapping references and legacy evaluation via `.osk` v29.
+
+- Use exact cylinder support normals across arc patches and continued extrusions, eliminating shading seams left by uneven tessellation.
+
+- Retain analytic curves/surfaces for complete planar-cap and rim translations on two-section solids, including cylinders, semicylinders, pipes and concave Boolean caps. Keep the opposite cap fixed, preserve oblique cylinder continuity and version exact section intent in `.osk` v28.
+
+- Treat connected cylinder patches as one editable wall and circular rims as one edge each. Exclude artificial longitudinal joins from display, picking, transform authoring and snapping; expand wall/rim edits across members while preserving legacy guards and whole-boundary analytic transforms.
+
+- Preserve analytic B-spline/NURBS trims in closed-profile Imprint crossings, including circular caps, holes, transformed inputs and disconnected regions. Reuse shared boundary splitting and independent-region editing; add versioned `.osk` v27 crossing intent while preserving legacy history behavior.
+
 - Add finite straight-line Imprint for planar faces, including analytic circular trims, holes and finite concave-arm cuts. Retain shared neighboring surface trims, independent region editing, live inputs, Keep tools, undo, four exports and `.osk` v26 persistence.
 
 - Keep extrusion numeric drags active when live geometry changes rebuild the inspector; stabilize scalar and face-distance control identities.

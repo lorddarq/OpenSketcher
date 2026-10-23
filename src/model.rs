@@ -195,9 +195,190 @@ pub struct Geometry {
     pub shell: Option<Shell>,
     pub surface_roles: Vec<usize>,
     pub is_solid: bool,
+    // Modeling aliases for internal patches, independent of persisted kernel guards.
+    pub face_groups: Vec<usize>,
+    pub cylinder_supports: Vec<Option<(usize, Vector3)>>,
+    pub edge_aliases: Vec<usize>,
+    pub internal_edges: std::collections::HashSet<usize>,
 }
 
 impl Geometry {
+    pub fn face_group(&self, face: usize) -> usize {
+        self.face_groups.get(face).copied().unwrap_or(face)
+    }
+    pub fn face_elements(&self, face: usize) -> Vec<usize> {
+        (0..self.face_count)
+            .filter(|other| self.face_group(*other) == self.face_group(face))
+            .collect()
+    }
+    pub fn edge_group(&self, edge: usize) -> usize {
+        self.edge_aliases.get(edge).copied().unwrap_or(edge)
+    }
+    pub fn edge_elements(&self, edge: usize) -> Vec<usize> {
+        (0..self.edge_count)
+            .filter(|other| {
+                !self.internal_edges.contains(other)
+                    && self.edge_group(*other) == self.edge_group(edge)
+            })
+            .collect()
+    }
+    fn group_cylinder_patches(&mut self) {
+        self.face_groups = (0..self.face_count).collect();
+        self.edge_aliases = (0..self.edge_count).collect();
+        self.internal_edges.clear();
+        self.cylinder_supports.clear();
+        let Some(shell) = &self.shell else {
+            return;
+        };
+        let Ok(mapping) = self.surface_mapping() else {
+            return;
+        };
+        let mut curved = vec![true; self.face_count];
+        for (face, role) in shell.iter().zip(mapping) {
+            if matches!(face.surface(), truck_modeling::Surface::Plane(_)) {
+                curved[*role] = false;
+            }
+        }
+        let mut cylinder = vec![None; self.face_count];
+        for (face, is_curved) in curved.iter().enumerate() {
+            if !is_curved {
+                continue;
+            }
+            let triangles: Vec<_> = self
+                .triangles
+                .iter()
+                .zip(&self.triangle_faces)
+                .filter(|(_, f)| **f == face)
+                .map(|(t, _)| t)
+                .collect();
+            if triangles.is_empty() {
+                continue;
+            }
+            cylinder[face] = self
+                .circles
+                .iter()
+                .enumerate()
+                .find_map(|(ring_index, ring)| {
+                    let uu = ring.u.dot(ring.u);
+                    let uv = ring.u.dot(ring.v);
+                    let vv = ring.v.dot(ring.v);
+                    let det = uu * vv - uv * uv;
+                    if det <= 1e-20 {
+                        return None;
+                    }
+                    let normal = ring.u.cross(ring.v).normalize();
+                    // Parallel translated caps can form an oblique cylinder.
+                    // Prove the support against all samples rather than assuming
+                    // the extrusion axis is perpendicular to the rim plane.
+                    let mut axes = vec![normal];
+                    for other in &self.circles {
+                        if (other.u - ring.u).magnitude() > 1e-7
+                            || (other.v - ring.v).magnitude() > 1e-7
+                        {
+                            continue;
+                        }
+                        let delta = other.center - ring.center;
+                        let height = delta.dot(normal);
+                        if height.abs() < 1e-7 {
+                            continue;
+                        }
+                        let axis = delta.normalize() * height.signum();
+                        if !axes.iter().any(|other| (*other - axis).magnitude() < 1e-10) {
+                            axes.push(axis);
+                        }
+                    }
+                    // A display triangle may connect three angular samples at
+                    // different heights. Its chord normal need not be radial.
+                    axes.iter()
+                        .position(|axis| {
+                            let heights = triangles
+                                .iter()
+                                .flat_map(|t| t.iter())
+                                .map(|p| (*p - ring.center).dot(normal))
+                                .fold([f64::INFINITY, f64::NEG_INFINITY], |[lo, hi], v| {
+                                    [lo.min(v), hi.max(v)]
+                                });
+                            heights[1] - heights[0] > 1e-7
+                                && triangles.iter().flat_map(|t| t.iter()).all(|p| {
+                                    let d = *p - ring.center;
+                                    let radial = d - *axis * (d.dot(normal) / axis.dot(normal));
+                                    let a =
+                                        (radial.dot(ring.u) * vv - radial.dot(ring.v) * uv) / det;
+                                    let b =
+                                        (radial.dot(ring.v) * uu - radial.dot(ring.u) * uv) / det;
+                                    (a * a + b * b - 1.).abs() < 1e-7
+                                })
+                        })
+                        .map(|axis| (ring_index, axes[axis]))
+                });
+        }
+        self.cylinder_supports = cylinder.clone();
+        let mut owners = vec![Vec::new(); self.edge_count];
+        for (face, edges) in self.topology.faces.iter().enumerate() {
+            for edge in edges {
+                owners[*edge].push(face);
+            }
+        }
+        for (edge, faces) in owners.iter().enumerate() {
+            if faces.len() != 2
+                || cylinder[faces[0]].is_none()
+                || cylinder[faces[0]] != cylinder[faces[1]]
+            {
+                continue;
+            }
+            let a = self.face_groups[faces[0]];
+            let b = self.face_groups[faces[1]];
+            for group in &mut self.face_groups {
+                if *group == a || *group == b {
+                    *group = a.min(b);
+                }
+            }
+            self.internal_edges.insert(edge);
+        }
+        // Circular rim segments are one modeling edge, not independent arcs.
+        for ring in &self.circles {
+            let mut valid = vec![true; self.edge_count];
+            let mut counts = vec![0; self.edge_count];
+            let uu = ring.u.dot(ring.u);
+            let uv = ring.u.dot(ring.v);
+            let vv = ring.v.dot(ring.v);
+            let det = uu * vv - uv * uv;
+            if det <= 1e-20 {
+                continue;
+            }
+            for (edge, group) in self.edges.iter().zip(&self.edge_groups) {
+                if self.internal_edges.contains(group) {
+                    continue;
+                }
+                counts[*group] += 1;
+                valid[*group] &= edge.iter().all(|point| {
+                    let d = *point - ring.center;
+                    let a = (d.dot(ring.u) * vv - d.dot(ring.v) * uv) / det;
+                    let b = (d.dot(ring.v) * uu - d.dot(ring.u) * uv) / det;
+                    (a * a + b * b - 1.).abs() < 1e-7
+                        && (d - ring.u * a - ring.v * b).magnitude() < 1e-7
+                });
+            }
+            let mut vertices = std::collections::HashMap::<usize, Vec<usize>>::new();
+            for edge in (0..self.edge_count).filter(|edge| valid[*edge] && counts[*edge] > 1) {
+                for vertex in self.topology.edges[edge] {
+                    vertices.entry(vertex).or_default().push(edge);
+                }
+            }
+            for edges in vertices.into_values() {
+                for pair in edges.windows(2) {
+                    let a = self.edge_aliases[pair[0]];
+                    let b = self.edge_aliases[pair[1]];
+                    for alias in &mut self.edge_aliases {
+                        if *alias == a || *alias == b {
+                            *alias = a.min(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Conservative analytic support interval; no viewport samples determine a cut depth.
     pub(crate) fn projection_range(&self, axis: Vector3) -> Result<[f64; 2], String> {
         use truck_modeling::{Curve, Surface};
@@ -346,6 +527,7 @@ pub fn evaluate(body: &Body) -> Result<Geometry, String> {
     body.validate()?;
     let mut geometry = build_checked(body, None)?;
     crate::components::apply_evaluated(body, &mut geometry).map_err(|e| body.error(e))?;
+    geometry.group_cylinder_patches();
     Ok(geometry)
 }
 fn build_checked(body: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
@@ -361,10 +543,20 @@ struct SceneCache {
     bodies: Vec<Body>,
     geometry: Vec<(u64, Geometry)>,
 }
+struct BaseGeometry {
+    body: Body,
+    loops: Option<Vec<Vec<[f64; 2]>>>,
+    geometry: Geometry,
+}
 thread_local! {
+    // Only the latest successful scene's bases; never accumulate edit revisions.
+    static BASE_CACHE: std::cell::RefCell<Vec<BaseGeometry>> = const { std::cell::RefCell::new(Vec::new()) };
     static SCENE_CACHE: std::cell::RefCell<Option<SceneCache>> = const { std::cell::RefCell::new(None) };
 }
 pub(crate) fn cache_scene(bodies: &[Body], geometry: &[(u64, Geometry)]) {
+    if bodies.is_empty() {
+        BASE_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
     SCENE_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(SceneCache {
             bodies: bodies.to_vec(),
@@ -414,6 +606,7 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
             }
         }
     }
+    let mut bases = Vec::new();
     let mut scene: Vec<_> = bodies
         .iter()
         .map(|body| {
@@ -421,7 +614,22 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
                 return Ok((body.id, Geometry::default()));
             }
             let loops = crate::regions::boundaries(body, bodies).map_err(|e| body.error(e))?;
-            let geometry = build_checked(body, loops)?;
+            let cached = BASE_CACHE.with(|cache| {
+                cache
+                    .borrow()
+                    .iter()
+                    .find(|base| base.body == *body && base.loops == loops)
+                    .map(|base| base.geometry.clone())
+            });
+            let geometry = match cached {
+                Some(geometry) => geometry,
+                None => build_checked(body, loops.clone())?,
+            };
+            bases.push(BaseGeometry {
+                body: body.clone(),
+                loops,
+                geometry: geometry.clone(),
+            });
             Ok((body.id, geometry))
         })
         .collect::<Result<_, String>>()?;
@@ -432,6 +640,10 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
         }
     }
     crate::booleans::apply(bodies, &mut scene)?;
+    for (_, geometry) in &mut scene {
+        geometry.group_cylinder_patches();
+    }
+    BASE_CACHE.with(|cache| *cache.borrow_mut() = bases);
     Ok(scene)
 }
 pub(crate) fn build(b: &Body, loops: Option<Vec<Vec<[f64; 2]>>>) -> Result<Geometry, String> {
@@ -936,6 +1148,51 @@ mod tests {
             assert_eq!(model.bodies, before);
         }
     }
+    #[test]
+    fn base_cache_reuses_unchanged_bodies_and_invalidates_profile_dependencies() {
+        cache_scene(&[], &[]);
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.width = 8.;
+        a.depth = 8.;
+        a.extrusion = 3.;
+        let mut b = Body::new(Shape::Circle);
+        b.id = 2;
+        b.position[0] = 20.;
+        b.extrusion = 2.;
+        let first = evaluate_scene(&[a.clone(), b.clone()]).unwrap();
+        b.extrusion = 4.;
+        let edited = evaluate_scene(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(
+            first[0].1.shell.as_ref().unwrap()[0].id(),
+            edited[0].1.shell.as_ref().unwrap()[0].id()
+        );
+        assert_ne!(
+            first[1].1.shell.as_ref().unwrap()[0].id(),
+            edited[1].1.shell.as_ref().unwrap()[0].id()
+        );
+        // The host parameters stay identical, but the resolved partition changes.
+        b.position[0] = 0.;
+        b.cuts_profiles = true;
+        let partitioned = evaluate_scene(&[a.clone(), b.clone()]).unwrap();
+        assert_ne!(
+            edited[0].1.shell.as_ref().unwrap()[0].id(),
+            partitioned[0].1.shell.as_ref().unwrap()[0].id()
+        );
+        BASE_CACHE.with(|cache| cache.borrow_mut().clear());
+        SCENE_CACHE.with(|cache| *cache.borrow_mut() = None);
+        let cold = evaluate_scene(&[a, b]).unwrap();
+        for ((_, warm), (_, cold)) in partitioned.iter().zip(&cold) {
+            assert_eq!(warm.triangles, cold.triangles);
+            assert_eq!(warm.topology, cold.topology);
+        }
+        let mut invalid = Body::new(Shape::Circle);
+        invalid.width = f64::NAN;
+        assert!(evaluate_scene(&[invalid]).is_err());
+        assert!(evaluate_scene(&[]).unwrap().is_empty());
+        BASE_CACHE.with(|cache| assert!(cache.borrow().is_empty()));
+    }
+
     #[test]
     fn scene_cache_tracks_parameters_and_preserves_validation() {
         let mut b = Body::new(Shape::Circle);

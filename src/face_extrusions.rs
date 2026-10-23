@@ -320,6 +320,163 @@ fn tangent_groups(wire: &truck_modeling::Wire) -> Vec<usize> {
 }
 
 // Shared by semantic source-cap sweeps and ordered evaluated-face operations.
+fn tangent_roles(
+    face: &truck_modeling::Face,
+    mut offset: usize,
+) -> std::collections::HashMap<truck_modeling::EdgeID, usize> {
+    let mut roles = std::collections::HashMap::new();
+    for wire in face.boundaries() {
+        for (edge, group) in wire.iter().zip(tangent_groups(&wire)) {
+            roles.insert(edge.id(), offset + group);
+        }
+        offset += wire.len();
+    }
+    roles
+}
+
+// A proven straight prism has no intermediate sections, and every side
+// surface is invariant along the sweep axis. Rebuild its remaining cap region
+// instead of intersecting coincident curved walls in the general CSG kernel.
+fn prismatic_through_remainder(
+    g: &Geometry,
+    indices: &[usize],
+    plane: crate::snapping::Plane,
+    distance: f64,
+) -> Result<Option<Geometry>, String> {
+    use truck_modeling::{ParametricSurface, Surface, Vector4};
+    let Some(shell) = &g.shell else {
+        return Ok(None);
+    };
+    let heights = g
+        .points
+        .iter()
+        .map(|p| (*p - plane.origin).dot(plane.normal))
+        .collect::<Vec<_>>();
+    let Some(depth) = heights.iter().find(|h| h.abs() > 1e-7).map(|h| -*h) else {
+        return Ok(None);
+    };
+    if depth <= 1e-7
+        || -distance < depth - 1e-7
+        || heights
+            .iter()
+            .any(|h| h.abs() > 1e-7 && (*h + depth).abs() > 1e-7)
+    {
+        return Ok(None);
+    }
+    let mut entry = truck_modeling::Shell::new();
+    for (index, face) in shell.iter().enumerate() {
+        let surface = face.oriented_surface();
+        let (points, degrees) = match surface {
+            Surface::Plane(p) => {
+                let n = p.normal().normalize();
+                let h = (p.subs(0., 0.) - plane.origin).dot(plane.normal);
+                if n.dot(plane.normal) > 1. - 1e-7 && h.abs() < 1e-7 {
+                    if !indices.contains(&index) {
+                        entry.push(face.clone());
+                    }
+                } else if !((n.dot(plane.normal) < -1. + 1e-7 && (h + depth).abs() < 1e-7)
+                    || n.dot(plane.normal).abs() < 1e-7)
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+            Surface::BSplineSurface(p) => (
+                p.control_points()
+                    .iter()
+                    .map(|row| row.iter().map(|p| p.to_vec().extend(1.)).collect())
+                    .collect::<Vec<Vec<Vector4>>>(),
+                p.degrees(),
+            ),
+            Surface::NurbsSurface(p) => (p.control_points().clone(), p.degrees()),
+            _ => return Ok(None),
+        };
+        let translated = |pairs: Vec<(Vector4, Vector4)>| {
+            let Some((a, b)) = pairs.first() else {
+                return false;
+            };
+            if a.w.abs() < 1e-12 || b.w.abs() < 1e-12 {
+                return false;
+            }
+            let start = (a.truncate() / a.w - plane.origin.to_vec()).dot(plane.normal);
+            let end = (b.truncate() / b.w - plane.origin.to_vec()).dot(plane.normal);
+            if !((start.abs() < 1e-7 && (end + depth).abs() < 1e-7)
+                || (end.abs() < 1e-7 && (start + depth).abs() < 1e-7))
+            {
+                return false;
+            }
+            pairs.iter().all(|(a, b)| {
+                let scale = a.w.abs().max(b.w.abs()).max(1.);
+                (a.w - b.w).abs() < 1e-10 * scale
+                    && (b.truncate() - a.truncate() - plane.normal * ((end - start) * a.w))
+                        .magnitude()
+                        < 1e-7 * scale
+                    && (a.truncate() - plane.origin.to_vec() * a.w - plane.normal * (start * a.w))
+                        .dot(plane.normal)
+                        .abs()
+                        < 1e-7 * scale
+            })
+        };
+        let u = degrees.0 == 1
+            && points.len() == 2
+            && translated(
+                points[0]
+                    .iter()
+                    .copied()
+                    .zip(points[1].iter().copied())
+                    .collect(),
+            );
+        let v = degrees.1 == 1
+            && points.iter().all(|row| row.len() == 2)
+            && translated(points.iter().map(|row| (row[0], row[1])).collect());
+        if !u && !v {
+            return Ok(None);
+        }
+    }
+    if entry.is_empty() {
+        return Ok(Some(Geometry::default()));
+    }
+    let mut output = truck_modeling::Shell::new();
+    let mut roles = Vec::new();
+    let mut next = 0;
+    for cap in crate::face_operations::planar_regions(entry.extract_boundaries())? {
+        let cap = cap.inverse();
+        let side_roles = tangent_roles(&cap, next + 2);
+        let sweep: Solid = builder::tsweep(&cap, -plane.normal * depth);
+        let boundary = &sweep.boundaries()[0];
+        for face in boundary {
+            roles.push(if face.id() == cap.id() {
+                next
+            } else if face.id() == boundary.last().unwrap().id() {
+                next + 1
+            } else {
+                face.edge_iter()
+                    .find_map(|e| side_roles.get(&e.id()).copied())
+                    .ok_or("Prismatic cut wall lost its source curve.")?
+            });
+            output.push(face.clone());
+        }
+        next = roles.iter().copied().max().unwrap() + 1;
+    }
+    Solid::try_new(output.connected_components())
+        .map_err(|e| format!("Invalid prismatic through-cut: {e}"))?;
+    let mut result = crate::model::tessellate(&output)?;
+    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    result.is_solid = true;
+    result.circles = g
+        .circles
+        .iter()
+        .filter(|ring| {
+            output
+                .iter()
+                .flat_map(|f| f.boundaries())
+                .any(|w| circle_on_wire(ring, &w))
+        })
+        .cloned()
+        .collect();
+    Ok(Some(result))
+}
+
 fn extend_face(
     g: &Geometry,
     face: &truck_modeling::Face,
@@ -341,17 +498,11 @@ fn extend_face(
         roles.remove(*index);
     }
     let side_role = roles.iter().copied().max().unwrap_or(0).max(cap_role) + 1;
-    let mut tangent_roles = std::collections::HashMap::new();
-    if tangent_walls {
-        let mut offset = side_role;
-        for wire in face.boundaries() {
-            let groups = tangent_groups(&wire);
-            for (edge, group) in wire.iter().zip(groups) {
-                tangent_roles.insert(edge.id(), offset + group);
-            }
-            offset += wire.len();
-        }
-    }
+    let tangent_roles = if tangent_walls {
+        tangent_roles(face, side_role)
+    } else {
+        std::collections::HashMap::new()
+    };
     for patch in sweep.boundaries()[0].iter() {
         if patch.id() == face.id() {
             continue;
@@ -409,6 +560,7 @@ pub(crate) fn evaluated_sweep(
     vector: truck_modeling::Vector3,
     circular_walls: bool,
     tangent_walls: bool,
+    prismatic_cut: bool,
 ) -> Result<Geometry, String> {
     if !g.is_solid {
         return Err("Face extrusion requires a closed solid.".into());
@@ -531,6 +683,12 @@ pub(crate) fn evaluated_sweep(
                     return Ok(result);
                 }
             }
+        }
+        if prismatic_cut
+            && vector.cross(plane.normal).magnitude() < vector.magnitude() * 1e-7
+            && let Some(result) = prismatic_through_remainder(g, &indices, plane, distance)?
+        {
+            return Ok(result);
         }
         let margin = -vector.normalize() * 1e-4;
         let start = builder::transformed(
@@ -655,28 +813,17 @@ fn through_boundary(
         let boundary = &sweep.boundaries()[0];
         boundary[1..boundary.len() - 1].iter().cloned().collect()
     };
+    let tangent_roles = if tangent_walls {
+        tangent_roles(entry, side_role)
+    } else {
+        std::collections::HashMap::new()
+    };
     for wall in walls {
         joined.push(wall.clone());
         roles.push(if tangent_walls {
-            let mut offset = side_role;
-            let mut role = None;
-            for wire in entry.boundaries() {
-                let groups = tangent_groups(&wire);
-                for (edge, group) in wire.iter().zip(groups) {
-                    if wall
-                        .edge_iter()
-                        .any(|candidate| candidate.id() == edge.id())
-                    {
-                        role = Some(offset + group);
-                        break;
-                    }
-                }
-                if role.is_some() {
-                    break;
-                }
-                offset += wire.len();
-            }
-            role.ok_or("Cut wall lost its source curve.")?
+            wall.edge_iter()
+                .find_map(|edge| tangent_roles.get(&edge.id()).copied())
+                .ok_or("Cut wall lost its source curve.")?
         } else if circular_walls {
             side_role
         } else {
@@ -753,6 +900,48 @@ mod tests {
         edge_treatments::{Kind, Modifier},
         model::{Shape, evaluate},
     };
+    #[test]
+    fn prismatic_reconstruction_requires_a_complete_parallel_through_cut() {
+        let mut body = crate::model::Body::new(crate::model::Shape::Circle);
+        body.id = 1;
+        body.width = 4.;
+        body.extrusion = 3.;
+        for tapered in [false, true] {
+            body.taper = if tapered {
+                Some(crate::drafting::Draft {
+                    degrees: 9.,
+                    neutral: FaceTarget::Bottom,
+                })
+            } else {
+                None
+            };
+            let g = crate::model::evaluate(&body).unwrap();
+            let cap = (0..g.face_count)
+                .find(|f| crate::snapping::Plane::face(&g, *f).is_some_and(|p| p.normal.z > 0.99))
+                .unwrap();
+            let indices = g
+                .surface_mapping()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(_, role)| **role == cap)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            let plane = crate::snapping::Plane::face(&g, cap).unwrap();
+            assert!(
+                prismatic_through_remainder(&g, &indices, plane, -2.)
+                    .unwrap()
+                    .is_none()
+            );
+            let full = prismatic_through_remainder(&g, &indices, plane, -4.).unwrap();
+            if tapered {
+                assert!(full.is_none(), "Do not flatten a tapered solid to a prism");
+            } else {
+                assert!(full.unwrap().triangles.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn treated_cap_extrudes_without_moving_treatment() {
         for shape in [Shape::Circle, Shape::Rectangle] {

@@ -28,7 +28,7 @@ impl Kind {
             Self::ImprintCurve => "Imprint curve",
         }
     }
-    fn contains(self, a: bool, b: bool) -> bool {
+    pub(crate) fn contains(self, a: bool, b: bool) -> bool {
         match self {
             Self::Union => a || b,
             Self::Subtract => a && !b,
@@ -46,6 +46,10 @@ pub struct Boolean {
     pub operands: [Pick; 2],
     pub topology: [Topology; 2],
     pub keep_tools: bool,
+    #[serde(default)]
+    pub analytic_crossings: bool,
+    #[serde(default)]
+    pub analytic_faces: bool,
 }
 impl Boolean {
     pub fn new(kind: Kind, picks: &[Pick], mode: SelectionMode, scene: &[(u64, Geometry)]) -> Self {
@@ -70,6 +74,9 @@ impl Boolean {
                     .unwrap_or_default()
             }),
             keep_tools: false,
+            analytic_crossings: kind == Kind::Imprint,
+            analytic_faces: mode == SelectionMode::Face
+                && matches!(kind, Kind::Union | Kind::Subtract | Kind::Intersect),
         }
     }
     pub fn references(&self) -> String {
@@ -101,6 +108,17 @@ impl Boolean {
         }
     }
     pub fn validate(&self, body: &Body) -> Result<(), String> {
+        if self.analytic_faces
+            && (!matches!(self.kind, Kind::Union | Kind::Subtract | Kind::Intersect)
+                || self.operands.iter().any(|p| p.1.is_none()))
+        {
+            return Err(
+                "Analytic face Booleans require two planar faces and a set operation.".into(),
+            );
+        }
+        if self.analytic_crossings && self.kind != Kind::Imprint {
+            return Err("Analytic profile crossings require an Imprint operation.".into());
+        }
         if self.operands[0] == self.operands[1]
             || self
                 .operands
@@ -398,6 +416,8 @@ pub(crate) fn face_coverage(
         operands: [(1, Some(0)), (2, Some(0))],
         topology: [mesh.topology.clone(), target.topology.clone()],
         keep_tools: false,
+        analytic_crossings: false,
+        analytic_faces: false,
     };
     if self::faces(&operation, &[mesh, &target])?
         .triangles
@@ -453,6 +473,9 @@ pub(crate) fn faces(op: &Boolean, geometry: &[&Geometry]) -> Result<Geometry, St
         .any(|p| (*p - origin).dot(n).abs() > 1e-6)
     {
         return Err("Face Booleans require coplanar planar faces. Curved or crossing faces need trim/split operations.".into());
+    }
+    if op.analytic_faces {
+        return crate::profile_imprints::boolean_faces(op, geometry);
     }
     let polygons: Vec<Vec<[f64; 2]>> = triangles
         .iter()

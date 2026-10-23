@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 26,
-            modeling_version: 26,
+            schema_version: 30,
+            modeling_version: 30,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,20 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=26) || !matches!(self.modeling_version, 1..=26) {
+        if !matches!(self.schema_version, 1..=30) || !matches!(self.modeling_version, 1..=30) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–26 and modeling versions 1–26."
+                "Unsupported .osk version. This application supports schema versions 1–30 and modeling versions 1–30."
                     .into(),
             );
+        }
+        if (self.schema_version < 28 || self.modeling_version < 28)
+            && self.bodies.iter().any(|body| {
+                body.component_edits
+                    .iter()
+                    .any(|edit| edit.section_transform)
+            })
+        {
+            return Err("Exact section transforms require .osk version 28.".into());
         }
         if (self.schema_version < 26 || self.modeling_version < 26)
             && self.bodies.iter().any(|b| {
@@ -96,6 +105,22 @@ impl Project {
             return Err(
                 "Imprint and tangent-aware evaluated sweeps require .osk version 24.".into(),
             );
+        }
+        if (self.schema_version < 27 || self.modeling_version < 27)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.boolean.as_ref().is_some_and(|op| op.analytic_crossings))
+        {
+            return Err("Analytic profile crossings require .osk version 27.".into());
+        }
+        if (self.schema_version < 29 || self.modeling_version < 29)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.boolean.as_ref().is_some_and(|op| op.analytic_faces))
+        {
+            return Err("Analytic face Booleans require .osk version 29.".into());
         }
         if (self.schema_version < 23 || self.modeling_version < 23)
             && self.bodies.iter().any(|b| {
@@ -260,6 +285,14 @@ impl Project {
                     .into(),
             );
         }
+        if (self.schema_version < 30 || self.modeling_version < 30)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.prismatic_cut))
+        {
+            return Err("Prismatic face through-cuts require .osk version 30.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
@@ -334,8 +367,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 26;
-        project.modeling_version = 26;
+        project.schema_version = 30;
+        project.modeling_version = 30;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

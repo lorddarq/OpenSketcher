@@ -1,6 +1,6 @@
 # OpenSketcher project format (.osk)
 
-Schema version: 26. Modeling semantics version: 26.
+Schema version: 30. Modeling semantics version: 30.
 
 An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. The extension is specific to OpenSketcher; the encoding is documented and does not encrypt the scene. The native project stores authored parameters, not only viewport triangles. Truck reevaluates the parameters to restore editable geometry.
 
@@ -9,8 +9,8 @@ An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. 
 | Field | Meaning |
 | --- | --- |
 | `format` | Required `OpenSketcher` identifier. |
-| `schema_version` | File layout version; currently 26. Versions 1–25 migrate on load. |
-| `modeling_version` | Evaluation semantics version; currently 26. |
+| `schema_version` | File layout version; currently 30. Versions 1–29 migrate on load. |
+| `modeling_version` | Evaluation semantics version; currently 30. |
 | `bodies` | Ordered scene objects with stable nonzero IDs. |
 | `camera` | Orthographic preset/free-view label, yaw, pitch, span, and target. Angles are radians; span is the visible vertical extent. |
 | `snapping` | Master geometry/grid snapping switch. |
@@ -27,7 +27,7 @@ All currently implemented scene properties are serialized. Materials, textures, 
 
 ## Excluded transient state
 
-GPU buffers, evaluated meshes, native file path, current tool, incomplete creation previews, text-entry drafts, hover state, error messages, and session undo/redo stacks are not scene data. Opening a project starts a fresh undo history while retaining parametric editability. The next created object receives an ID beyond existing objects.
+GPU buffers, evaluated meshes, transient spatial acceleration indices, derived cylinder-wall/rim continuity groups and internal-edge masks, native file path, current tool, incomplete creation previews, text-entry drafts, hover state, error messages, and session undo/redo stacks are not scene data. Opening a project starts a fresh undo history while retaining parametric editability. The next created object receives an ID beyond existing objects.
 
 ## File operations
 
@@ -46,7 +46,7 @@ Current limits are 16 MiB per document, 1,000 objects, and one million evaluated
 
 Write a complete temporary file beside the destination, synchronize its contents, then atomically replace the target with `tempfile::NamedTempFile::persist`. On write/replacement failure, preserve the last valid destination and keep the project dirty. This avoids partial-file overwrites; it is not an autosave, backup, or guarantee against every filesystem/power-loss scenario.
 
-Schema and modeling versions 1–26 are supported. Older documents migrate to schema/modeling version 26 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 26; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
+Schema and modeling versions 1–30 are supported. Older documents migrate to schema/modeling version 30 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 30; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
 
 Component slots refer to faces, unique topology edges, or unique topology vertices in this model evaluation, never GPU triangles or sampled curve vertices. Validate slot bounds against regenerated geometry. They are selection state, not feature dependencies or a general solution to persistent topological naming. Component transforms retain slots while source connectivity is unchanged. Undo/redo keeps component selection when its slot remains valid; future dependent CAD face operations still require semantic references.
 
@@ -92,7 +92,7 @@ Version 5 allowed at most six perimeter entries, one per source face. Version 9 
 
 Replay reconstructs the source solid and applies all stored modifiers; pose is applied afterwards. Circular rims are built by revolving an authored radial section with lines or quarter-circle arcs. Other convex profile treatments use clipping and grouped transition surfaces. Render subdivisions and revolution patch seams are excluded from selectable topology; the base face and transition band remain separate surfaces. Exports consume the same evaluated result; current STEP output is still faceted.
 
-Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 25 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
+Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 30 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
 
 ## Multiple selection (schema/modeling version 5)
 
@@ -132,7 +132,7 @@ Rejected property drafts and contextual evaluation errors are transient. `.osk` 
 
 ### Version 10: sweep termination extents
 
-Current writers use schema/modeling version 25. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
+Current writers use schema/modeling version 30. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
 
 ### Evaluated planar face extrusion (version 11)
 
@@ -229,3 +229,31 @@ No flattened profile, derived island or projected mesh is persisted. Holes, disc
 ### Version 26: finite line Imprint
 
 `boolean.kind: "imprint_curve"` references a solid planar face first and an entire unextruded straight-line body second (`[id, null]`). Both input topology guards are retained. The line's finite extent is authoritative; it is not extended or projected to the support. Covered material intervals become shared cut edges and independent face regions, while intervals outside the tool remain unchanged. Lines ending inside material, nonseparating cuts, offset lines and unresolved/tangent intersections reject atomically. Original B-spline/NURBS boundary curves are split analytically, with the same split edges installed on neighboring retained surfaces. Source material is unchanged. Source and line are suppressed; `keep_tools` retains the line. Removing the feature restores inputs. This kind requires both schema and modeling version 26; older Imprint kinds retain their existing behavior.
+
+### Version 27: analytic closed-profile crossings
+
+`boolean.analytic_crossings` is an optional boolean, valid only for `kind: "imprint"`. Newly authored Imprints set it to true; missing/false retains the previous evaluation path. True requires schema and modeling version 27. On a planar support, retained B-spline/NURBS profile and source trims are intersected and split at shared parameter roots. Adjacent source surfaces receive the same split boundary edges. Trimmed tool segments outside the selected face are discarded, including those inside existing holes. Source material remains unchanged; each partition remains an independent logical face. The original operands, topology guards, Keep tools, suppression, removal and subsequent evaluated face edits retain their existing contracts.
+
+Intersection search uses conservative control hulls, bounded subdivision and numerical root refinement at kernel tolerance. Exact overlapping straight trims are reconciled; general nonconic coincident overlaps, unresolved near-tangencies and intersection-curve trims reject atomically. Full retained tool circles keep their analytic snap references; clipped arcs retain their BRep curves without inventing a complete snapping circle outside the result. All-linear Imprints continue through the established exact linear reconciliation path.
+
+Cylinder continuity is derived evaluation metadata and adds no serialized fields. New whole-wall/rim operations explicitly store all member faces/edges in the existing component `element`/`elements` arrays. Kernel connectivity signatures remain unchanged, and earlier authored component operations replay their original explicit picks.
+
+### Version 28: exact complete-section translation
+
+`component_edits[].section_transform` is an optional boolean. New eligible complete-cap/rim translations set it to true; missing/false retains the previous component deformation path. True requires schema and modeling version 28, `evaluated: true`, Face/Edge mode and a translation matrix. It cannot combine with `retrim`, a `sweep` or `face_edit`. Replay retains the original topology guard and complete member selection, recomputes the opposite section and applies an exact affine map to the retained curves/surfaces. Cap consumption, degenerate maps or changed section references reject before replacing the current scene. No evaluated mesh or inferred cylinder axis is serialized.
+
+### Version 29: analytic planar face Booleans
+
+`boolean.analytic_faces` is an optional boolean, valid for Union/Subtract/Intersect with two face operands. New face Booleans set it to true. True requires schema and modeling version 29; missing/false retains the historical triangle-derived polygonal evaluator, including in existing volume-prism operations. No existing feature is silently opted in during migration.
+
+The selected coplanar retained boundaries are intersected and split analytically using the shared Imprint solver. Material-side winding determines which oriented trim pieces bound the requested set. Planar regions retain B-spline/NURBS curves, holes, disconnected outputs and original target-normal orientation; a complete circular output loop retains its center/rim snapping reference. Opposite input normals are normalized to the target's plane. The result is a separate sheet, preserving the established solid-input and Keep tools rules. Topology signatures, live dependencies, ordering and transaction rollback remain unchanged.
+
+Curved-surface/noncoplanar trimming, general nonconic spline overlap merging and intersection-generated input trims remain unsupported and reject atomically. No polygon approximation is substituted for an opted-in analytic operation. Derived meshes, classifications and arrangements are transient.
+
+The v29 analytic face path also merges proven shared rational-conic intervals (including differently parameterized circular/elliptical partial arcs). It splits overlap endpoints, retains one copy of each active interval and preserves complementary arcs. This resolves configurations previously rejected by the v29 solver without opting in legacy operations or adding serialized state. Common-support detection uses homogeneous Bernstein coefficient identities rather than viewport samples. Analytic Imprint reuses shared conic interval handling: already-existing rim pieces are omitted from the new divider set, while interior profile edges form independent regions. A coincident-only profile still rejects because it adds no partition. Missing/false `analytic_crossings` keeps the legacy path.
+
+### Version 30: exact prismatic face through-cuts
+
+New evaluated face sweeps set `component_edits[].prismatic_cut: true` alongside `tangent_walls`. True requires a sweep and tangent-wall grouping, plus schema/modeling version 30. Missing/false retains the historical through-cut evaluator; loading an old file does not opt its existing operations in.
+
+On negative travel reaching/passing the far cap, eligible straight prisms regenerate the remaining cap material as an exact extrusion instead of invoking coincident-surface CSG. Eligibility requires normal sweep travel, two cap levels, axis-parallel planar sides or rational/B-spline sides whose paired homogeneous control rows prove a constant translation between cap planes. The result retains exact curve trims, holes/disconnected regions and tangent wall grouping; consuming the complete cap removes the prism. Blind, tapered, intermediate-section, oblique or unproven geometry keeps the established paths. No derived control proof, cap mesh or rebuilt boundary is serialized.

@@ -21,6 +21,7 @@ struct Request {
 pub struct Update {
     pub model: Model,
     pub scene: Vec<(u64, Geometry)>,
+    pub display: std::sync::Arc<crate::viewport::SceneDisplay>,
     pub change: Change,
     pub selected: Option<u64>,
     pub loaded: Option<(std::path::PathBuf, crate::project::Project)>,
@@ -32,12 +33,15 @@ pub struct Evaluator {
     desired: Option<Request>,
     running: bool,
     revision: u64,
+    latest: std::sync::Arc<std::sync::atomic::AtomicU64>,
     finish: bool,
 }
 impl Default for Evaluator {
     fn default() -> Self {
         let (sender, requests) = mpsc::channel::<Request>();
         let (results, receiver) = mpsc::channel();
+        let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_latest = latest.clone();
         std::thread::Builder::new()
             .name("OpenSketcher geometry".into())
             .spawn(move || {
@@ -48,7 +52,7 @@ impl Default for Evaluator {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         pool.as_ref()
                             .map_err(|e| format!("Cannot start geometry workers: {e}"))?
-                            .install(|| execute(request))
+                            .install(|| execute(request, &worker_latest))
                     }))
                     .unwrap_or_else(|_| {
                         Err("Geometry evaluation failed; the committed model was preserved.".into())
@@ -65,6 +69,7 @@ impl Default for Evaluator {
             desired: None,
             running: false,
             revision: 0,
+            latest,
             finish: false,
         }
     }
@@ -72,6 +77,8 @@ impl Default for Evaluator {
 impl Evaluator {
     pub fn request(&mut self, model: &Model, change: Change) {
         self.revision += 1;
+        self.latest
+            .store(self.revision, std::sync::atomic::Ordering::Relaxed);
         self.finish = false;
         let request = self.desired.get_or_insert_with(|| Request {
             revision: self.revision,
@@ -136,6 +143,8 @@ impl Evaluator {
     }
     pub fn cancel(&mut self) {
         self.revision += 1;
+        self.latest
+            .store(self.revision, std::sync::atomic::Ordering::Relaxed);
         self.desired = None;
     }
     pub fn poll(&mut self) -> Option<Result<Update, String>> {
@@ -163,12 +172,21 @@ impl Evaluator {
         }))
     }
 }
-fn execute(request: Request) -> Result<Update, String> {
+fn execute(request: Request, latest: &std::sync::atomic::AtomicU64) -> Result<Update, String> {
+    let current = || {
+        if latest.load(std::sync::atomic::Ordering::Relaxed) == request.revision {
+            Ok(())
+        } else {
+            Err("Geometry request superseded by newer input.".to_string())
+        }
+    };
+    current()?;
     let mut model = request.model;
     let mut selected = None;
     let mut preview = None;
     let mut loaded = None;
     for change in &request.changes {
+        current()?;
         match change {
             Change::Edit(body, live) => {
                 selected = Some(if *live {
@@ -201,10 +219,14 @@ fn execute(request: Request) -> Result<Update, String> {
             Change::EndEdit => model.finish_edit(),
         }
     }
+    current()?;
     let scene = evaluate_scene(preview.as_deref().unwrap_or(&model.bodies))?;
+    current()?;
+    let display = std::sync::Arc::new(crate::viewport::SceneDisplay::new(&scene));
     Ok(Update {
         model,
         scene,
+        display,
         change: request.changes.last().unwrap().clone(),
         selected,
         loaded,
@@ -215,6 +237,30 @@ fn execute(request: Request) -> Result<Update, String> {
 mod tests {
     use super::*;
     use crate::model::Shape;
+    #[test]
+    fn superseded_requests_stop_before_validation_or_display_work() {
+        let latest = std::sync::atomic::AtomicU64::new(2);
+        let mut invalid = Body::new(Shape::Circle);
+        invalid.width = f64::NAN;
+        let stale = Request {
+            revision: 1,
+            model: Model::default(),
+            changes: vec![Change::Edit(Box::new(invalid), true)],
+        };
+        assert!(
+            execute(stale, &latest)
+                .err()
+                .unwrap()
+                .contains("superseded")
+        );
+        let current = Request {
+            revision: 2,
+            model: Model::default(),
+            changes: vec![Change::EndEdit],
+        };
+        assert!(execute(current, &latest).unwrap().scene.is_empty());
+    }
+
     #[test]
     fn failed_operations_report_references_and_recover_without_committing_input() {
         use crate::edge_treatments::{ChamferDefinition, FaceTarget, Kind, Modifier};
@@ -279,8 +325,10 @@ mod tests {
             .component_edits
             .push(crate::components::ComponentEdit {
                 retrim: false,
+                section_transform: false,
                 sweep: None,
                 tangent_walls: false,
+                prismatic_cut: false,
                 face_edit: None,
                 evaluated: false,
                 mode: crate::selection::SelectionMode::Face,
@@ -356,6 +404,21 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(update.model.bodies[0].width, 5.);
+        let query = crate::selection::Query::indexed(&update.scene, &update.display.index);
+        let camera = crate::viewport::Camera::default();
+        let rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(800., 600.),
+        );
+        for (_, geometry) in &update.scene {
+            for point in &geometry.points {
+                let pixel = camera.project(*point, rect).0;
+                assert_eq!(
+                    query.surface_hit(&camera, pixel, rect),
+                    crate::selection::Query::brute(&update.scene).surface_hit(&camera, pixel, rect)
+                );
+            }
+        }
         update.model.undo();
         assert_eq!(update.model.bodies[0].width, 2.);
         assert!(!update.model.can_undo());

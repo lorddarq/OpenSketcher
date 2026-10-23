@@ -27,7 +27,9 @@ OpenSketcher uses selection order consistently: Shift-click A, then B. Subtract 
 - [ ] General noncoplanar sheet trimming, curved face Boolean regions, intersection curves, and split/slice tools.
 - [ ] Persistent semantic references for arbitrary generated faces, beyond guarded topology slots.
 - [ ] Kernel-independent robust handling of every coincident/tangent solid case. Truck failures currently reject atomically.
-- [ ] Preserve analytic arcs in planar arrangement output. Current planar regions use evaluated face boundary sampling; result boundary edges are polygonal, while each planar region remains a single selectable face, not selectable tessellation triangles.
+- [x] Retain analytic B-spline/NURBS trims in newly authored coplanar face Union/Subtract/Intersect, including crossings, holes, disconnected regions and opposite input normals.
+- [x] Coincident rational-conic trim merging, including circular/elliptical partial arcs with different interval boundaries, parameterizations and orientations.
+- [ ] General nonconic spline overlap merging and intersection-generated input trims. These remain rejected in the analytic face evaluator; historical face/volume-prism features retain their saved polygonal behavior.
 - [ ] Arbitrarily oriented matching-depth prism fast path. Current fast path covers world-Z straight prisms with matching cap planes; other solids use Truck CSG.
 - [ ] Applying bores or direct component transforms to Boolean result bodies; edit source operands for now.
 - [x] Native volume subtraction and operand-swap review.
@@ -38,3 +40,23 @@ The coincident-cap prism path shares the existing planar arrangement classifier,
 ## Verification
 
 The runnable `booleans::tests` check covers ordered subtraction in both directions, union/intersection, consumed/retained tools, parametric regeneration, serialization validation, and undo/redo. Broader geometry cases should extend this check as kernel limitations are addressed.
+
+## Analytic planar face sets (.osk v29)
+
+New face set operations share analytic intersections and directed trim-loop assembly with Imprint. The first picked face supplies the result normal and subtraction target. Boundaries are split at shared curve parameters; winding on both sides of each piece determines whether to keep or reverse it. Output faces retain the source trim curves independently of viewport tessellation. Complete circular loops retain center/rim snapping metadata. No solid is removed when only one of its faces is used; the output is a separate sheet.
+
+`analytic_faces: true` versions this behavior. Old files replay the polygonal evaluator when the field is absent/false. Ordered volume operations keep their existing evaluator. Offset planes, curved supports, stale guards, unresolved nonconic spline overlaps and intersection-generated trims reject without changing committed inputs.
+
+Runnable checks `analytic_face_booleans_keep_arcs_order_holes_and_saved_behavior` and `mixed_analytic_face_booleans_and_solid_face_inputs_share_the_arrangement` cover the three set operations, both subtraction orders, all rectangle/circle/semicircle pairings, contained/crossing/disjoint circles, opposite normals, holes, affine placement, live edits, rollback, undo/redo, STEP and `.osk` migration gates.
+
+Native macOS review created an Intersect operation from two canvas-selected circle faces (Shift-click), saved `analytic_faces: true`, and verified subtraction reversal via Swap operands plus undo and save. The review project is `/tmp/osk-analytic-face-boolean-review.osk`; the isolated app is `dist/OpenSketcher Analytic Face Boolean Review.app`. This is macOS runtime evidence, not Windows/Linux interaction coverage.
+
+### Shared conic boundaries
+
+The analytic face evaluator recognizes an entire common conic support from rational quadratic Bézier controls and verifies the implicit equation's complete Bernstein coefficients on both trims. It does not infer overlap from display samples or a few matching points. The test is independent of source arc starts, rational parameterization and nonuniform affine placement. Ill-conditioned or unproven supports continue through the bounded general solver and may reject safely.
+
+For proven common supports, endpoint-on-curve roots split both boundaries into matching intervals. Duplicate intervals are consumed once; complementary arcs with matching endpoints remain distinct. Material winding still determines the requested Union/Subtract/Intersect set. Identical regions therefore union/intersect to one region and subtract to empty. Circle/semicircle and rotated semicircle overlaps retain exact partial arcs, including trims produced by earlier Boolean features. No new file field is required: the existing `analytic_faces` path resolves a previously rejected configuration; legacy polygonal operations and legacy Imprints retain their prior paths.
+
+`coincident_conic_face_sets_keep_exact_partial_and_reparameterized_arcs` and `coincident_trim_chains_preserve_history_and_reject_false_supports` cover shared conic intervals, tilted ellipses, different arc starts, partial overlap, trimmed-output chains, near-support rejection, undo/redo, rollback, persistence and analytic STEP export. General coincident nonconic splines remain pending. Analytic Imprint also reuses proven shared conic intervals, retaining the existing rim once and adding only interior divider pieces; coincident-only profiles reject because they do not partition a face.
+
+Native macOS review opened a circle minus a same-radius semicircle rotated 17° (different rational arc intervals), verified the remaining half-disc, swapped operands to an empty result, then undid and saved the restored geometry. The isolated app is `dist/OpenSketcher Conic Overlap Review.app`, with `/tmp/osk-conic-overlap-review.osk`. This does not establish Windows/Linux interaction coverage.
