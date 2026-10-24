@@ -11,6 +11,8 @@ use truck_modeling::{
     Transform, Vector3, Vector4, builder,
 };
 
+#[path = "periodic_cage.rs"]
+mod periodic;
 type SurfaceNet = NurbsSurface<Vector4>;
 
 pub const MAX_RADIUS: f64 = 1e6;
@@ -21,6 +23,10 @@ pub const MAX_RADIUS: f64 = 1e6;
 pub struct Binding {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disk: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub periodic: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patches: Vec<usize>,
     pub rows: usize,
     pub columns: usize,
     pub uknots: Vec<f64>,
@@ -30,6 +36,8 @@ impl Binding {
     fn of(net: &SurfaceNet) -> Self {
         Self {
             disk: false,
+            periodic: false,
+            patches: Vec::new(),
             rows: net.control_points().len(),
             columns: net.control_points()[0].len(),
             uknots: net.uknot_vec().iter().copied().collect(),
@@ -37,6 +45,20 @@ impl Binding {
         }
     }
     fn validate(&self) -> Result<(), String> {
+        if self.periodic
+            && (self.disk
+                || self.rows != 8
+                || self.columns != 5
+                || self.uknots != KnotVec::bezier_knot(7).to_vec()
+                || self.vknots != KnotVec::bezier_knot(4).to_vec()
+                || self.patches.is_empty()
+                || self.patches.len() > 16
+                || self.patches.iter().any(|&i| i >= 8192)
+                || self.patches.windows(2).any(|p| p[0] >= p[1]))
+            || !self.periodic && !self.patches.is_empty()
+        {
+            return Err("Invalid periodic cage definition or patch references.".into());
+        }
         if self.disk
             && (self.rows != 5
                 || self.columns != 5
@@ -69,7 +91,10 @@ impl Binding {
         Ok(())
     }
     fn interior(&self, [u, v]: [usize; 2]) -> bool {
-        u > 0 && v > 0 && u < self.rows - 1 && v < self.columns - 1
+        v > 0
+            && v < self.columns - 1
+            && u < self.rows
+            && (self.periodic || u > 0 && u < self.rows - 1)
     }
 }
 
@@ -102,7 +127,16 @@ pub struct Operation {
 impl Operation {
     pub fn validate(&self) -> Result<(), String> {
         self.binding.validate()?;
-        if self.version != if self.binding.disk { 2 } else { 1 } || self.domain == 0 {
+        if self.version
+            != if self.binding.periodic {
+                3
+            } else if self.binding.disk {
+                2
+            } else {
+                1
+            }
+            || self.domain == 0
+        {
             return Err("Unsupported control-domain or falloff version.".into());
         }
         match &self.action {
@@ -158,11 +192,16 @@ fn patch(g: &Geometry, face: usize) -> Result<Face, String> {
 pub struct Cage {
     pub domain: u64,
     pub face: usize,
+    pub binding: Binding,
+    pub patches: Vec<(usize, SurfaceNet)>,
     pub net: SurfaceNet,
     pub reference: SurfaceNet,
 }
 impl Cage {
     pub fn transform(&mut self, matrix: Matrix4) {
+        for (_, patch) in &mut self.patches {
+            patch.transform_control_points(|p| *p = matrix * *p);
+        }
         self.net.transform_control_points(|p| *p = matrix * *p);
         self.reference
             .transform_control_points(|p| *p = matrix * *p);
@@ -275,6 +314,31 @@ fn disk_surface(cage: &Cage) -> SurfaceNet {
         .collect();
     let knots = KnotVec::bezier_knot(8);
     NurbsSurface::new(BSplineSurface::new((knots.clone(), knots), controls))
+}
+
+/// Evaluate analytic derivatives over the actual supported domain before generating a display mesh.
+/// Sampling detects local rank loss; it is not a proof of global injectivity.
+fn regularity(surface: &SurfaceNet, disk: bool) -> Result<(), String> {
+    let (u, v) = surface.range_tuple();
+    for i in 0..=32 {
+        for j in 0..=32 {
+            let a = i as f64 / 32.;
+            let b = j as f64 / 32.;
+            if disk && (2. * a - 1.).powi(2) + (2. * b - 1.).powi(2) > 1. + 1e-12 {
+                continue;
+            }
+            let x = u.0 + (u.1 - u.0) * a;
+            let y = v.0 + (v.1 - v.0) * b;
+            let du = surface.uder(x, y);
+            let dv = surface.vder(x, y);
+            let area = du.cross(dv).magnitude2();
+            let scale = du.magnitude2() * dv.magnitude2();
+            if !area.is_finite() || !scale.is_finite() || scale <= 0. || area <= scale * 1e-12 {
+                return Err("Control edit produces a singular or numerically degenerate surface tangent plane.".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn rectangle(face: &Face) -> Result<SurfaceNet, String> {
@@ -405,6 +469,25 @@ pub fn create(body: &Body, g: &Geometry, face: usize) -> Result<Body, String> {
     if domain(body, face).is_some() {
         return Err("This face already has a control net; choose Edit nodes.".into());
     }
+    if g.face_elements(face).len() > 1 {
+        if body.component_edits.iter().any(|e| e.control.is_some()) {
+            return Err(
+                "Create a periodic wall cage before other control domains on this body.".into(),
+            );
+        }
+        let cage = periodic::create(g, face)?;
+        return append(
+            body,
+            g,
+            face,
+            Operation {
+                domain: 1,
+                binding: cage.binding,
+                version: 3,
+                action: Action::Create { planar: false },
+            },
+        );
+    }
     let f = patch(g, face)?;
     let (net,planar,disk)=match f.surface() {
         Surface::Plane(_)=>match rectangle(&f) {Ok(net)=>(net,true,false),Err(_)=>(disk_net(g,&f)?,true,true)},
@@ -493,6 +576,9 @@ pub fn edges(binding: &Binding) -> Vec<[usize; 2]> {
             if u + 1 < binding.rows {
                 edges.push([i, i + binding.columns]);
             }
+            if binding.periodic && u + 1 == binding.rows {
+                edges.push([i, v]);
+            }
             if v + 1 < binding.columns {
                 edges.push([i, i + 1]);
             }
@@ -509,13 +595,13 @@ pub fn locks(binding: &Binding, extra: &[[usize; 2]]) -> Vec<bool> {
 }
 pub fn field(
     net: &SurfaceNet,
+    binding: &Binding,
     placement: Matrix4,
     sources: &[[usize; 2]],
     locked: &[[usize; 2]],
     enabled: bool,
     radius: f64,
 ) -> Result<Vec<f64>, String> {
-    let binding = Binding::of(net);
     if !radius.is_finite() || !(0. ..=MAX_RADIUS).contains(&radius) {
         return Err("Radius must be finite and within 0–1000000 mm.".into());
     }
@@ -536,17 +622,16 @@ pub fn field(
         .collect::<Vec<_>>();
     influences(
         &rest,
-        &edges(&binding),
+        &edges(binding),
         &indices,
-        &locks(&binding, locked),
+        &locks(binding, locked),
         if enabled { radius } else { 0. },
     )
     .map_err(str::to_owned)
 }
-pub fn default_radius(net: &SurfaceNet) -> f64 {
+pub fn default_radius(net: &SurfaceNet, binding: &Binding) -> f64 {
     let p = positions(net);
-    let binding = Binding::of(net);
-    let mut lengths = edges(&binding)
+    let mut lengths = edges(binding)
         .iter()
         .map(|&[a, b]| (p[a] - p[b]).magnitude())
         .filter(|d| *d > 0.)
@@ -566,33 +651,65 @@ pub fn apply(
     operation: &Operation,
     placement: Matrix4,
 ) -> Result<Geometry, String> {
-    let f = patch(g, edit.element)?;
-    let mut surface = match &operation.action {
-        Action::Create { planar: true } => {
-            if operation.binding.disk {
-                disk_net(g, &f)?
-            } else {
-                rectangle(&f)?
-            }
-        }
-        _ => net(g, edit.element)?,
+    let mut created =
+        if operation.binding.periodic && matches!(operation.action, Action::Create { .. }) {
+            Some(periodic::create(g, edit.element)?)
+        } else {
+            None
+        };
+    let f = if operation.binding.periodic {
+        let index = *operation
+            .binding
+            .patches
+            .first()
+            .ok_or("Missing periodic patches.")?;
+        g.shell
+            .as_ref()
+            .and_then(|s| s.get(index))
+            .ok_or("A periodic source patch no longer exists.")?
+            .clone()
+    } else {
+        patch(g, edit.element)?
     };
-    if !operation.binding.disk {
+    let mut surface = if let Some(cage) = &created {
+        cage.net.clone()
+    } else {
+        match &operation.action {
+            Action::Create { planar: true } => {
+                if operation.binding.disk {
+                    disk_net(g, &f)?
+                } else {
+                    rectangle(&f)?
+                }
+            }
+            _ => net(g, edit.element)?,
+        }
+    };
+    if !operation.binding.disk && !operation.binding.periodic {
         supported(&surface, &f)?;
     }
-    let mut binding = Binding::of(&surface);
+    let mut binding = created
+        .as_ref()
+        .map(|c| c.binding.clone())
+        .or_else(|| {
+            g.cages
+                .iter()
+                .find(|c| c.domain == operation.domain && c.face == edit.element)
+                .map(|c| c.binding.clone())
+        })
+        .unwrap_or_else(|| Binding::of(&surface));
     binding.disk = operation.binding.disk;
     if binding != operation.binding {
-        return Err("An upstream edit changed authored control-node identities or knots.".into());
+        return Err("An upstream edit changed authored control-node identities, knots or periodic patch bindings.".into());
     }
-    if operation.binding.disk
+    if (operation.binding.disk || operation.binding.periodic)
         && !matches!(operation.action, Action::Create { .. })
         && !g
             .cages
             .iter()
             .any(|c| c.domain == operation.domain && c.face == edit.element)
     {
-        return Err("The authored circular cage binding is missing.".into());
+        return Err("The authored cage binding is missing.".into());
     }
     if matches!(operation.action, Action::Create { .. })
         && body
@@ -638,11 +755,31 @@ pub fn apply(
             return Err("The authored control domain is missing; nodes cannot be rebound by proximity or output slot.".into());
         }
     }
+    if let Some(mut cage) = created.take() {
+        cage.domain = operation.domain;
+        let mut result = g.clone();
+        let mut roles = g.surface_mapping()?.to_vec();
+        for &i in &operation.binding.patches {
+            roles[i] = edit.element;
+        }
+        crate::edge_treatments::merge_surfaces(&mut result, &roles);
+        let actual = result.surface_roles[operation.binding.patches[0]];
+        if actual != edit.element {
+            return Err(
+                "This cylinder's logical face order cannot retain the authored domain reference."
+                    .into(),
+            );
+        }
+        result.cages.push(cage);
+        return Ok(result);
+    }
     if operation.binding.disk && matches!(operation.action, Action::Create { .. }) {
         let mut result = g.clone();
         result.cages.push(Cage {
             domain: operation.domain,
             face: edit.element,
+            binding: operation.binding.clone(),
+            patches: Vec::new(),
             reference: surface.clone(),
             net: surface,
         });
@@ -656,7 +793,15 @@ pub fn apply(
             radius,
             delta,
         } => {
-            let weights = field(&surface, placement, sources, locked, *enabled, *radius)?;
+            let weights = field(
+                &surface,
+                &operation.binding,
+                placement,
+                sources,
+                locked,
+                *enabled,
+                *radius,
+            )?;
             let local = Vector3::from(*delta);
             for (p, w) in surface.control_points_mut().zip(weights) {
                 let d = local * w * p.w;
@@ -667,6 +812,9 @@ pub fn apply(
         }
         Action::MoveFace { delta } => {
             let local = Vector3::from(*delta);
+            if operation.binding.periodic {
+                return Err("Moving the complete periodic wall would also move both caps. Use Volume movement, or move an end cap to rebuild its neighbors.".into());
+            }
             if !g.is_solid && g.face_count == 1 {
                 let mut result = g.clone();
                 components::map_geometry(&mut result, Matrix4::from_translation(local));
@@ -767,6 +915,16 @@ pub fn apply(
         }
         Action::Create { .. } => (),
     }
+    if operation.binding.periodic {
+        let mut cage = g
+            .cages
+            .iter()
+            .find(|c| c.domain == operation.domain)
+            .ok_or("Missing periodic cage.")?
+            .clone();
+        cage.net = surface;
+        return periodic::apply(g, &cage);
+    }
     // Fresh topology prevents surface mutation from corrupting the source/cache on rejection.
     let shell: Shell = builder::transformed(g.shell.as_ref().unwrap(), Matrix4::identity());
     let idx = (0..shell.len())
@@ -780,8 +938,11 @@ pub fn apply(
     if operation.binding.disk {
         let c = cage.as_mut().ok_or("Missing circular cage.")?;
         c.net = surface;
-        shell[idx].set_surface(Surface::NurbsSurface(disk_surface(c)));
+        let skin = disk_surface(c);
+        regularity(&skin, true)?;
+        shell[idx].set_surface(Surface::NurbsSurface(skin));
     } else {
+        regularity(&surface, false)?;
         shell[idx].set_surface(Surface::NurbsSurface(surface));
     }
     let mut result = finish(g, &shell)?;
@@ -1219,6 +1380,7 @@ fn soft_selection_authored_history() {
 /// Transient editor preferences; each authored operation owns a separate settings snapshot.
 #[derive(Clone)]
 pub struct Editor {
+    pub binding: Binding,
     pub body: u64,
     pub face: usize,
     pub sources: Vec<[usize; 2]>,
@@ -1229,7 +1391,10 @@ pub struct Editor {
 }
 impl Editor {
     pub fn new(body: &Body, geometry: &Geometry, face: usize) -> Result<Self, String> {
-        domain(body, face).ok_or("Create a control net first.")?;
+        let binding = domain(body, face)
+            .ok_or("Create a control net first.")?
+            .binding
+            .clone();
         let surface = net(geometry, face)?;
         Ok(Self {
             body: body.id,
@@ -1237,7 +1402,8 @@ impl Editor {
             sources: vec![],
             locked: vec![],
             enabled: true,
-            radius: default_radius(&surface),
+            radius: default_radius(&surface, &binding),
+            binding,
             delta: [0.; 3],
         })
     }
@@ -1278,8 +1444,8 @@ impl Editor {
         let Ok(surface) = net(geometry, self.face) else {
             return;
         };
-        let binding = Binding::of(&surface);
-        let locked = locks(&binding, &self.locked);
+        let binding = &self.binding;
+        let locked = locks(binding, &self.locked);
         let hit = positions(&surface)
             .iter()
             .enumerate()
@@ -1330,10 +1496,11 @@ impl Editor {
         let Ok(surface) = net(geometry, self.face) else {
             return;
         };
-        let binding = Binding::of(&surface);
+        let binding = &self.binding;
         let points = positions(&surface);
         let field = field(
             &surface,
+            &self.binding,
             Matrix4::identity(),
             &self.sources,
             &self.locked,
@@ -1342,9 +1509,9 @@ impl Editor {
         )
         .unwrap_or_else(|_| vec![0.; points.len()]);
         let weights = frozen.unwrap_or(&field);
-        let locked = locks(&binding, &self.locked);
+        let locked = locks(binding, &self.locked);
         let painter = ui.painter().with_clip_rect(rect);
-        for [a, b] in edges(&binding) {
+        for [a, b] in edges(binding) {
             for i in 0..8 {
                 let p = points[a] + (points[b] - points[a]) * (i as f64 / 8.);
                 let q = points[a] + (points[b] - points[a]) * ((i + 1) as f64 / 8.);
@@ -1568,6 +1735,40 @@ fn circular_cages_keep_exact_rims_and_editable_history() {
             );
         }
         assert!((skin.subs(0.5, 0.5) - cage.reference.subs(0.5, 0.5)).magnitude() > 0.05);
+        let shift = Vector3::new(0.1, 0., 0.2);
+        let moved = components::transformed(
+            &changed,
+            &out,
+            SelectionMode::Face,
+            Some(face),
+            Matrix4::from_translation(shift),
+        )
+        .unwrap();
+        let moved_geometry = model::evaluate(&moved).unwrap();
+        let Surface::NurbsSurface(moved_skin) = patch(&moved_geometry, face).unwrap().surface()
+        else {
+            panic!("Moved skin remains NURBS")
+        };
+        for (u, v) in [(0.2, 0.4), (0.5, 0.5), (0.7, 0.7)] {
+            assert!((moved_skin.subs(u, v) - skin.subs(u, v) - shift).magnitude() < 1e-8);
+        }
+        for (a, b) in out.cages[0].net.control_points().iter().flatten().zip(
+            moved_geometry.cages[0]
+                .net
+                .control_points()
+                .iter()
+                .flatten(),
+        ) {
+            assert!((b.truncate() - a.truncate() - shift).magnitude() < 1e-8);
+        }
+        assert_eq!(moved_skin.knot_vecs(), skin.knot_vecs());
+        assert!(
+            moved_geometry
+                .shell
+                .as_ref()
+                .unwrap()
+                .is_geometric_consistent()
+        );
         let mut model = Model::from_bodies(vec![bound.clone()]);
         model.commit(changed.clone()).unwrap();
         model.undo();

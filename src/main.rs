@@ -238,6 +238,7 @@ impl OpenSketcher {
         {
             let field = soft_selection::field(
                 &surface,
+                &editor.binding,
                 truck_modeling::Matrix4::from_scale(1.),
                 &editor.sources,
                 &editor.locked,
@@ -257,8 +258,12 @@ impl OpenSketcher {
                 .show_ui(ui, |ui| {
                     let rows = surface.control_points().len();
                     let columns = surface.control_points()[0].len();
-                    for u in 1..rows - 1 {
+                    let boundary = soft_selection::locks(&editor.binding, &[]);
+                    for u in 0..rows {
                         for v in 1..columns - 1 {
+                            if boundary[u * columns + v] {
+                                continue;
+                            }
                             let id = [u, v];
                             let index = u * columns + v;
                             let label = format!(
@@ -2202,6 +2207,7 @@ impl eframe::App for OpenSketcher {
                                 .and_then(|surface| {
                                     soft_selection::field(
                                         &surface,
+                                        &n.binding,
                                         truck_modeling::Matrix4::from_scale(1.),
                                         &n.sources,
                                         &n.locked,

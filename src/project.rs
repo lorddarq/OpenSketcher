@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 44,
-            modeling_version: 44,
+            schema_version: 45,
+            modeling_version: 45,
             bodies,
             camera,
             snapping,
@@ -61,9 +61,9 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=44) || !matches!(self.modeling_version, 1..=44) {
+        if !matches!(self.schema_version, 1..=45) || !matches!(self.modeling_version, 1..=45) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–44 and modeling versions 1–44."
+                "Unsupported .osk version. This application supports schema versions 1–45 and modeling versions 1–45."
                     .into(),
             );
         }
@@ -416,6 +416,15 @@ impl Project {
         {
             return Err("Circular deformation cages require .osk version 44.".into());
         }
+        if (self.schema_version < 45 || self.modeling_version < 45)
+            && self.bodies.iter().any(|b| {
+                b.component_edits
+                    .iter()
+                    .any(|e| e.control.as_ref().is_some_and(|o| o.binding.periodic))
+            })
+        {
+            return Err("Periodic deformation cages require .osk version 45.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
@@ -490,8 +499,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 44;
-        project.modeling_version = 44;
+        project.schema_version = 45;
+        project.modeling_version = 45;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

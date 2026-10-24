@@ -169,7 +169,7 @@ Closed profiles explicitly marked to cut older coplanar profiles partition their
 - [ ] Exact analytic curved/nonplanar component surface reconstruction (current output uses a regenerated faceted boundary).
 - [ ] Component edits on a profile cutting another region; use Volume transforms for that profile for now.
 - [ ] General self-intersection detection and semantic references beyond guarded output connectivity.
-- [x] Explicit NURBS/control-net node editing with fixed boundaries, soft-selection falloff, radius and heatmap; supported rigid face movement and `.osk` history.
+- [x] Explicit NURBS/control-net editing, circular-cap cages and complete periodic-cylinder cages with soft-selection falloff, radius, heatmap, supported rigid cap movement and editable `.osk` history.
 - [ ] Scale gizmo and general trim/periodic/custom-cage reconstruction.
 
 Regression checks cover all selection modes for movement/rotation across all four existing profile types, constrained handle math in each view preset, a complete press/move/release batch in one frame, world rotation composition, single-point pivot behavior, component reference errors, collapsing geometry, undo/redo, and `.osk` regeneration. Native macOS review verified volume-axis movement, face movement/rotation with connected walls, edge movement, and the fast-drag fix; native point/pivot interaction and Windows/Linux runtime review remain pending.

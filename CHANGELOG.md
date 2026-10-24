@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add circular-cap and complete periodic-cylinder cages with exact calculated NURBS skins, fixed rims, shared seam curves and wrapped falloff; persist guarded bindings in `.osk` v44/v45.
 - Rebuild complete-cap rotations from retained curves and ruled NURBS surfaces, preserving axial circular symmetry and fixed opposite sections through `.osk` v43 intent. Use authored conic centers for cap pivots and kernel-generated surface normals for seam-independent shading. Replace the deformation validator's global squared triangle-count limit with bounded actual-overlap checks.
 
 - Add explicit NURBS control-net creation and node editing with connected soft-selection falloff, world-unit radius, marker heatmap, locks, numeric/gizmo translation and transactional preview/history. Preserve supported control-face deformation during rigid movement and owner transforms; persist editable control features in `.osk` v42 with guarded domain/node references and invalid-surface rejection.
