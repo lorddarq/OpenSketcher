@@ -20,6 +20,7 @@ mod section_edits;
 mod selection;
 mod shelling;
 mod snapping;
+mod soft_selection;
 use project::Project;
 use selection::SelectionMode;
 use std::path::PathBuf;
@@ -68,6 +69,7 @@ fn main() -> eframe::Result {
                 anchor: None,
                 tool: Tool::Select,
                 transform: None,
+                nodes: None,
                 pivot: None,
                 snap: true,
                 drawing: snapping::Preferences::default(),
@@ -104,6 +106,8 @@ struct TransformGesture {
     scene: Vec<(u64, model::Geometry)>,
     selection: Vec<selection::Pick>,
     drag: gizmo::Drag,
+    nodes: Option<soft_selection::Editor>,
+    weights: Option<Vec<f64>>,
     preview: Vec<Body>,
     valid: bool,
 }
@@ -134,6 +138,7 @@ struct OpenSketcher {
     anchor: Option<[f64; 3]>,
     tool: Tool,
     transform: Option<TransformGesture>,
+    nodes: Option<soft_selection::Editor>,
     pivot: Option<Point3>,
     snap: bool,
     drawing: snapping::Preferences,
@@ -147,6 +152,200 @@ struct OpenSketcher {
     allow_close: bool,
 }
 impl OpenSketcher {
+    fn create_control_net(&mut self) {
+        let result = (|| {
+            let (id, Some(face)) = *self.selection.first().ok_or("Select one face first.")? else {
+                return Err("Select one face first.".to_owned());
+            };
+            let body = self
+                .model
+                .bodies
+                .iter()
+                .find(|b| b.id == id)
+                .ok_or("Missing body.")?;
+            let g = &self
+                .committed_scene
+                .iter()
+                .find(|g| g.0 == id)
+                .ok_or("Missing geometry.")?
+                .1;
+            soft_selection::create(body, g, face)
+        })();
+        match result {
+            Ok(body) => self.request_change(evaluation::Change::Transform(vec![body])),
+            Err(e) => self.error = Some(e),
+        }
+    }
+    fn enter_nodes(&mut self) {
+        let result = (|| {
+            let (id, Some(face)) = *self
+                .selection
+                .first()
+                .ok_or("Select an authored control face.")?
+            else {
+                return Err("Select an authored control face.".to_owned());
+            };
+            let body = self
+                .model
+                .bodies
+                .iter()
+                .find(|b| b.id == id)
+                .ok_or("Missing body.")?;
+            let g = &self
+                .committed_scene
+                .iter()
+                .find(|g| g.0 == id)
+                .ok_or("Missing geometry.")?
+                .1;
+            soft_selection::Editor::new(body, g, face)
+        })();
+        match result {
+            Ok(editor) => {
+                self.nodes = Some(editor);
+                self.tool = Tool::Move;
+                self.face_offset = None;
+                self.pivot = None;
+                self.finish_model_edit();
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+    fn node_properties(&mut self, ui: &mut egui::Ui) {
+        let Some(mut editor) = self.nodes.take() else {
+            return;
+        };
+        ui.heading("Edit control nodes");
+        ui.weak("Click a node; Shift-click toggles. Boundary nodes stay locked to preserve shared trims.");
+        ui.checkbox(&mut editor.enabled, "Soft selection");
+        let before = editor.radius;
+        let response = ui.add(
+            egui::DragValue::new(&mut editor.radius)
+                .prefix("Radius · ")
+                .suffix(" mm")
+                .speed(0.05),
+        );
+        if !editor.radius.is_finite() || editor.radius < 0. {
+            editor.radius = before;
+            self.error = Some("Radius must be finite and nonnegative.".into());
+        }
+        response.on_hover_text(
+            "Shortest paths along control edges in world millimeters; 0 moves selected nodes only.",
+        );
+        if let Some((_, g)) = self.committed_scene.iter().find(|g| g.0 == editor.body)
+            && let Ok(surface) = soft_selection::net(g, editor.face)
+        {
+            let field = soft_selection::field(
+                &surface,
+                truck_modeling::Matrix4::from_scale(1.),
+                &editor.sources,
+                &editor.locked,
+                editor.enabled,
+                editor.radius,
+            )
+            .unwrap_or_default();
+            let soft = field.iter().filter(|w| **w > 0. && **w < 1.).count();
+            ui.label(format!(
+                "{} explicit · {} soft-selected",
+                editor.sources.len(),
+                soft
+            ));
+            ui.weak("Blue 0% · cyan · green · yellow · red 100%. Squares mark explicit selection; crossed nodes are locked. Radius rings are approximate; node percentages show graph influence.");
+            egui::ComboBox::from_id_salt("node_keyboard_selection")
+                .selected_text("Select node by control coordinates")
+                .show_ui(ui, |ui| {
+                    let rows = surface.control_points().len();
+                    let columns = surface.control_points()[0].len();
+                    for u in 1..rows - 1 {
+                        for v in 1..columns - 1 {
+                            let id = [u, v];
+                            let index = u * columns + v;
+                            let label = format!(
+                                "Node {},{} · {:.1}%{}",
+                                u + 1,
+                                v + 1,
+                                field.get(index).copied().unwrap_or(0.) * 100.,
+                                if editor.locked.contains(&id) {
+                                    " · locked"
+                                } else {
+                                    ""
+                                }
+                            );
+                            if ui
+                                .add_enabled(
+                                    !editor.locked.contains(&id),
+                                    egui::Button::selectable(editor.sources.contains(&id), label),
+                                )
+                                .clicked()
+                            {
+                                if editor.sources.contains(&id) {
+                                    editor.sources.retain(|p| *p != id);
+                                } else {
+                                    editor.sources.push(id);
+                                }
+                            }
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !editor.sources.is_empty(),
+                        egui::Button::new("Lock selected"),
+                    )
+                    .clicked()
+                {
+                    editor.locked.append(&mut editor.sources);
+                }
+                if ui.button("Unlock interior nodes").clicked() {
+                    editor.locked.clear();
+                }
+            });
+        }
+        ui.weak("Drag a world-axis or plane handle. Numeric displacement below is relative to the current shape.");
+        vector(
+            ui,
+            "Node displacement · world mm",
+            &mut editor.delta,
+            -10000. ..=10000.,
+        );
+        if ui
+            .add_enabled(
+                !editor.sources.is_empty() && !self.evaluator.pending(),
+                egui::Button::new("Translate nodes"),
+            )
+            .clicked()
+        {
+            let result = (|| {
+                let body = self
+                    .model
+                    .bodies
+                    .iter()
+                    .find(|b| b.id == editor.body)
+                    .ok_or("Missing body.")?;
+                let geometry = &self
+                    .committed_scene
+                    .iter()
+                    .find(|g| g.0 == editor.body)
+                    .ok_or("Missing geometry.")?
+                    .1;
+                editor.translated(body, geometry, editor.delta)
+            })();
+            match result {
+                Ok(body) => {
+                    self.request_change(evaluation::Change::Transform(vec![body]));
+                    editor.delta = [0.; 3];
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
+        if ui.button("Done editing nodes").clicked() {
+            self.tool = Tool::Select;
+            self.pivot = None;
+        } else {
+            self.nodes = Some(editor);
+        }
+    }
+
     fn snapshot(&self) -> Project {
         let mut project = Project::new(
             self.model.bodies.clone(),
@@ -308,6 +507,7 @@ impl OpenSketcher {
             }
             FileAction::New => {
                 self.transform = None;
+                self.nodes = None;
                 self.pivot = None;
                 self.model = Model::default();
                 self.committed_scene.clear();
@@ -573,6 +773,7 @@ impl OpenSketcher {
                         if let Some((path, p)) = update.loaded {
                             self.face_offset = None;
                             self.transform = None;
+                            self.nodes = None;
                             self.pivot = None;
                             self.camera = p.camera.clone();
                             self.snap = p.snapping;
@@ -640,7 +841,17 @@ impl OpenSketcher {
                                             )
                                         })
                                         .collect();
+                                    let nodes = self.nodes.clone();
                                     self.set_picks(picks);
+                                    self.nodes = nodes.filter(|n| {
+                                        self.model.bodies.iter().any(|b| {
+                                            b.id == n.body
+                                                && soft_selection::domain(b, n.face).is_some()
+                                        }) && self.committed_scene.iter().any(|g| {
+                                            g.0 == n.body
+                                                && soft_selection::net(&g.1, n.face).is_ok()
+                                        })
+                                    });
                                 }
                                 _ => {
                                     if let Some(edit) = &mut self.face_offset {
@@ -716,6 +927,7 @@ impl OpenSketcher {
         self.evaluator.cancel_preview();
         self.face_offset = None;
         self.transform = None;
+        self.nodes = None;
         self.pivot = None;
         self.finish_model_edit();
         self.selection = picks
@@ -930,6 +1142,17 @@ impl OpenSketcher {
         self.face_offset = Some(edit);
     }
     fn gizmo_pivot(&self) -> Option<Point3> {
+        if let Some(gesture) = &self.transform {
+            return Some(gesture.drag.pivot);
+        }
+        if let Some(nodes) = &self.nodes {
+            return self
+                .viewport
+                .scene
+                .iter()
+                .find(|g| g.0 == nodes.body)
+                .and_then(|g| nodes.pivot(&g.1));
+        }
         self.pivot.or_else(|| {
             let pivots: Vec<_> = self
                 .selection
@@ -1123,6 +1346,25 @@ fn evaluated_component_properties(ui: &mut egui::Ui, body: &mut Body, references
     let mut finished = false;
     let mut remove = None;
     for (index, edit) in body.component_edits.iter_mut().enumerate() {
+        if let Some(control) = &mut edit.control {
+            ui.push_id(("control_operation",index),|ui|{
+                ui.horizontal(|ui|{
+                    ui.label(match control.action {soft_selection::Action::Create{..}=>"Create control net",soft_selection::Action::Translate{..}=>"Soft node translation",soft_selection::Action::MoveFace{..}=>"Rigid control-face move"});
+                    if ui.small_button("Remove").clicked(){remove=Some(index);finished=true;}
+                });
+                match &mut control.action {
+                    soft_selection::Action::Translate{sources,locked,enabled,radius,delta}=>{
+                        ui.label(format!("Face {} · {} explicit · {} interior locks",edit.element+1,sources.len(),locked.len()));
+                        finished|=ui.checkbox(enabled,"Soft selection").changed();
+                        finished|=scalar(ui,"Radius · world mm",radius,0. ..=10000.);
+                        finished|=vector(ui,"Displacement · local mm",delta,-10000. ..=10000.);
+                    }
+                    soft_selection::Action::MoveFace{delta}=>{finished|=vector(ui,"Face displacement · local mm",delta,-10000. ..=10000.);}
+                    soft_selection::Action::Create{..}=>{ui.weak("Boundary nodes stay fixed to keep adjoining faces joined. Choose Face → Edit nodes to reshape.");}
+                }
+            });
+            continue;
+        }
         if let Some(face_operations::FaceEdit::Draft(operation)) = &mut edit.face_edit {
             ui.push_id(("evaluated_draft", index), |ui| {
                 ui.horizontal(|ui| {
@@ -1483,8 +1725,10 @@ impl eframe::App for OpenSketcher {
                         ] {
                             if ui.selectable_label(self.tool == tool, label).clicked() {
                                 self.transform = None;
+                                self.evaluator.cancel_preview();
                                 self.refresh();
                                 self.tool = tool;
+                                if !matches!(tool,Tool::Select|Tool::Move|Tool::Orbit) {self.nodes=None;}
                                 self.anchor = None;
                                 self.construction = None;
                                 self.finish_model_edit();
@@ -1497,11 +1741,13 @@ impl eframe::App for OpenSketcher {
                             ui.weak("Alt-click: set pivot").on_hover_text("Place the pivot on the view-aligned plane through its current position. A point needs an offset pivot to rotate.");
                             if ui.button("Reset pivot").clicked() {
                                 self.transform = None;
+                                self.evaluator.cancel_preview();
                                 self.pivot = None;
                                 self.refresh();
                             }
                         }
                         if ui.button("Add construction plane").clicked() {
+                            self.transform=None;self.nodes=None;self.evaluator.cancel_preview();self.refresh();
                             self.anchor=None;self.construction=None;self.construction_support=None;
                             self.tool=Tool::Select;
                             let mut plane=Body::new(Shape::Rectangle);plane.construction=true;plane.width=10.;plane.depth=10.;
@@ -1548,7 +1794,7 @@ impl eframe::App for OpenSketcher {
                             (View::Side, "Side"),
                         ] {
                             if ui
-                                .selectable_label(self.camera.view == view, label)
+                                .add_enabled(self.transform.is_none(),egui::Button::selectable(self.camera.view == view, label))
                                 .clicked()
                             {
                                 self.transform = None;
@@ -1615,12 +1861,19 @@ impl eframe::App for OpenSketcher {
                     if self.evaluator.pending() {ui.weak("Computing requested values…");}
                     else {ui.colored_label(egui::Color32::YELLOW,"Input not applied");ui.weak("Geometry, Save and Export use the last accepted values. Correct the input or press Escape to discard it.");}
                 }
-                if self.selection_mode!=SelectionMode::Volume {
+                self.node_properties(ui);
+                if self.nodes.is_none() && self.selection_mode!=SelectionMode::Volume {
                     ui.separator();
                     if let (Some(id),Some(element))=(self.selected,self.selected_element) {
                         ui.label(format!("{} {} · Object {}",self.selection_mode.label(),element+1,id));
                     }else{ui.label(format!("Pick a {} in the viewport.",self.selection_mode.label().to_lowercase()));}
                     ui.weak("Choose Move or Rotate and drag the gizmo to edit this component. Adjacent boundaries rebuild together.");
+                    if self.selection_mode==SelectionMode::Face && self.selection.len()==1 {
+                        ui.horizontal_wrapped(|ui|{
+                            if ui.add_enabled(!self.evaluator.pending(),egui::Button::new("Create control net")).clicked(){self.create_control_net();}
+                            if ui.add_enabled(!self.evaluator.pending(),egui::Button::new("Edit nodes")).clicked(){self.enter_nodes();}
+                        });
+                    }
                     self.offset_face_properties(ui);
                     if matches!(self.selection_mode,SelectionMode::Face|SelectionMode::Edge) && !self.selection.is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -1675,7 +1928,7 @@ impl eframe::App for OpenSketcher {
                         ui.weak("Open leaves a sheet. Cap closes planar openings. Heal extends supported neighboring planes.");
                     }
                     if self.selection_mode==SelectionMode::Point { ui.weak("Rotation around a point itself has no effect. Alt-click to place an offset pivot."); }
-                    if self.selection_mode==SelectionMode::Point {ui.weak("Points are topology vertices; deformation control nodes are separate future editing tools.");}
+                    if self.selection_mode==SelectionMode::Point {ui.weak("Points are topology vertices. Select a control face and choose Edit nodes for soft selection.");}
                 }
                 if self.selection_mode==SelectionMode::Volume && self.selection.len()==1
                     && self.committed_scene.iter().any(|(id,g)|Some(*id)==self.selected && !g.is_solid && !g.triangles.is_empty() && g.shell.is_some())
@@ -1778,7 +2031,7 @@ impl eframe::App for OpenSketcher {
                     if !draft.component_edits.is_empty() {
                         ui.label(format!("Component edits: {}",draft.component_edits.len()));
                         finished |= evaluated_component_properties(ui,&mut draft,&self.model.bodies);
-                        ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
+                        ui.weak("Control nets retain exact NURBS. Other unsupported component deformations use a regenerated faceted boundary.");
                         if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
                         ui.label("Source profile parameters");
                     }
@@ -1889,10 +2142,16 @@ impl eframe::App for OpenSketcher {
                     if delete {self.delete_selected();}
                 }
                 ui.separator();
-                if ui.button("Fit model").clicked(){self.camera.fit(&self.viewport.scene);}
+                if ui.add_enabled(self.transform.is_none(),egui::Button::new("Fit model")).clicked(){self.camera.fit(&self.viewport.scene);}
             });
         });
-        if !ui.input(|i| i.focused) {
+        if !ui.input(|i| i.focused)
+            || ui.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::PointerGone))
+            })
+        {
             self.finish_model_edit();
             if self.transform.take().is_some() {
                 self.evaluator.cancel();
@@ -1932,6 +2191,24 @@ impl eframe::App for OpenSketcher {
                         scene: self.viewport.scene.clone(),
                         selection: self.selection.clone(),
                         drag: gizmo::Drag::new(handle, point, pivot),
+                        nodes: self.nodes.clone(),
+                        weights: self.nodes.as_ref().and_then(|n| {
+                            self.committed_scene
+                                .iter()
+                                .find(|g| g.0 == n.body)
+                                .and_then(|g| soft_selection::net(&g.1, n.face).ok())
+                                .and_then(|surface| {
+                                    soft_selection::field(
+                                        &surface,
+                                        truck_modeling::Matrix4::from_scale(1.),
+                                        &n.sources,
+                                        &n.locked,
+                                        n.enabled,
+                                        n.radius,
+                                    )
+                                    .ok()
+                                })
+                        }),
                         valid: true,
                     });
                     self.error = None;
@@ -1940,13 +2217,37 @@ impl eframe::App for OpenSketcher {
                 if let Some(mut gesture) = self.transform.take() {
                     if let Some(point) = ui.input(|i| i.pointer.interact_pos()) {
                         gesture.drag.update(&self.camera, point, rect, self.snap);
-                        let result = components::transform_selection(
-                            &gesture.bodies,
-                            &gesture.scene,
-                            self.selection_mode,
-                            &gesture.selection,
-                            gesture.drag.matrix,
-                        );
+                        let result = if let Some(nodes) = &gesture.nodes {
+                            (|| {
+                                let body = gesture
+                                    .bodies
+                                    .iter()
+                                    .find(|b| b.id == nodes.body)
+                                    .ok_or("Missing node owner.")?;
+                                let geometry = &gesture
+                                    .scene
+                                    .iter()
+                                    .find(|g| g.0 == nodes.body)
+                                    .ok_or("Missing control geometry.")?
+                                    .1;
+                                let changed = nodes.translated(
+                                    body,
+                                    geometry,
+                                    gesture.drag.matrix.w.truncate().into(),
+                                )?;
+                                let mut preview = gesture.bodies.clone();
+                                *preview.iter_mut().find(|b| b.id == nodes.body).unwrap() = changed;
+                                Ok(preview)
+                            })()
+                        } else {
+                            components::transform_selection(
+                                &gesture.bodies,
+                                &gesture.scene,
+                                self.selection_mode,
+                                &gesture.selection,
+                                gesture.drag.matrix,
+                            )
+                        };
                         match result {
                             Ok(preview) => {
                                 if gesture.preview != preview {
@@ -1968,6 +2269,7 @@ impl eframe::App for OpenSketcher {
                         if gesture.valid {
                             self.request_change(evaluation::Change::Transform(gesture.preview));
                         } else {
+                            self.evaluator.cancel_preview();
                             self.refresh();
                         }
                     } else {
@@ -1980,9 +2282,25 @@ impl eframe::App for OpenSketcher {
                 {
                     match self.tool {
                         Tool::Select | Tool::Move | Tool::Rotate => {
-                            if transform_tool && ui.input(|i| i.modifiers.alt) {
+                            if transform_tool
+                                && self.nodes.is_none()
+                                && ui.input(|i| i.modifiers.alt)
+                            {
                                 if let Some(pivot) = self.gizmo_pivot() {
                                     self.pivot = self.camera.screen_plane(point, rect, pivot);
+                                }
+                            } else if let Some(nodes) = &mut self.nodes {
+                                if let Some((_, geometry)) =
+                                    self.committed_scene.iter().find(|g| g.0 == nodes.body)
+                                {
+                                    nodes.pick(
+                                        geometry,
+                                        self.viewport.query(),
+                                        &self.camera,
+                                        rect,
+                                        point,
+                                        ui.input(selection::extend),
+                                    );
                                 }
                             } else {
                                 let mode = self.selection_mode;
@@ -2042,6 +2360,19 @@ impl eframe::App for OpenSketcher {
                     egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
                     egui::Color32::WHITE,
                 );
+                if let Some(nodes) = &self.nodes
+                    && let Some((_, geometry)) =
+                        self.viewport.scene.iter().find(|g| g.0 == nodes.body)
+                {
+                    nodes.draw(
+                        geometry,
+                        self.viewport.query(),
+                        &self.camera,
+                        rect,
+                        ui,
+                        self.transform.as_ref().and_then(|g| g.weights.as_deref()),
+                    );
+                }
                 if self.selection_mode == SelectionMode::Point {
                     let painter = ui.painter().with_clip_rect(rect);
                     for (id, g) in &self.viewport.scene {

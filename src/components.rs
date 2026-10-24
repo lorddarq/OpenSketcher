@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use truck_modeling::{
     Edge, EuclideanSpace, InnerSpace, Matrix3, Matrix4, Point3, Shell, Solid, SquareMatrix,
-    Transform, Vector3, Vertex, Wire, builder,
+    Transform, Vector3, Vector4, Vertex, Wire, builder,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -20,6 +20,8 @@ pub struct Topology {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<crate::soft_selection::Operation>,
     /// False preserves legacy edits on the source; true edits the evaluated result.
     #[serde(default)]
     pub evaluated: bool,
@@ -29,6 +31,8 @@ pub struct ComponentEdit {
     pub convex_rebuild: bool,
     #[serde(default)]
     pub section_transform: bool,
+    #[serde(default)]
+    pub cap_rotation: bool,
     #[serde(default)]
     pub sweep: Option<[f64; 3]>,
     #[serde(default)]
@@ -287,6 +291,29 @@ fn transformed_many(
     if matrix == Matrix4::identity() {
         return Ok(result);
     }
+    if mode != SelectionMode::Volume && body.component_edits.iter().any(|e| e.control.is_some()) {
+        if mode == SelectionMode::Face
+            && elements.len() == 1
+            && let Some(domain) = crate::soft_selection::domain(body, elements[0])
+        {
+            if matrix.x != Vector4::unit_x()
+                || matrix.y != Vector4::unit_y()
+                || matrix.z != Vector4::unit_z()
+            {
+                return Err("Control-face editing currently supports translation; rotate the volume to preserve the control representation.".into());
+            }
+            let mut operation = domain.clone();
+            operation.action = crate::soft_selection::Action::MoveFace {
+                delta: crate::regions::transform(body)
+                    .invert()
+                    .ok_or("Invalid object placement.")?
+                    .transform_vector(matrix.w.truncate())
+                    .into(),
+            };
+            return crate::soft_selection::append(body, g, elements[0], operation);
+        }
+        return Err("This body has an authored control net. Edit its nodes, move its control face, or transform the volume to preserve editability.".into());
+    }
     if mode == SelectionMode::Volume {
         result.position = matrix.transform_point(Point3::from(body.position)).into();
         let delta = Matrix3::from_cols(
@@ -332,10 +359,12 @@ fn transformed_many(
                 && mode == SelectionMode::Face
                 && straight_planar_supports(g).is_ok());
         result.component_edits.push(ComponentEdit {
+            control: None,
             evaluated: true,
             retrim,
             convex_rebuild,
             section_transform,
+            cap_rotation: !retrim && !section_transform && mode == SelectionMode::Face,
             sweep: None,
             tangent_walls: false,
             prismatic_cut: false,
@@ -375,10 +404,12 @@ pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Resu
         .ok_or("Invalid source placement.")?
         .transform_vector(plane.normal * distance);
     changed.component_edits.push(ComponentEdit {
+        control: None,
         evaluated: true,
         retrim: false,
         convex_rebuild: false,
         section_transform: false,
+        cap_rotation: false,
         sweep: Some(vector.into()),
         tangent_walls: true,
         prismatic_cut: true,
@@ -465,9 +496,37 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
     if edits.len() > 100 {
         return Err("A body supports up to 100 component edits.".into());
     }
+    let mut control_domain = false;
     for (index, edit) in edits.iter().enumerate() {
+        if control_domain && edit.control.is_none() {
+            return Err("Control domains currently require subsequent edits to use node/rigid-face tools; remove the control features before other component operators.".into());
+        }
+        control_domain |= edit.control.is_some();
+        if let Some(control) = &edit.control {
+            control.validate()?;
+            if !edit.evaluated
+                || edit.mode != SelectionMode::Face
+                || !edit.elements.is_empty()
+                || edit.retrim
+                || edit.convex_rebuild
+                || edit.section_transform
+                || edit.cap_rotation
+                || edit.sweep.is_some()
+                || edit.face_edit.is_some()
+                || edit.edge_chamfer.is_some()
+                || edit.prism_chamfer
+                || edit.prism_bevel.is_some()
+                || edit.prism_curves
+                || edit.tangent_walls
+                || edit.prismatic_cut
+                || Matrix4::from(edit.matrix) != Matrix4::identity()
+            {
+                return Err("Control edits cannot combine with other component operators.".into());
+            }
+        }
         let m = Matrix4::from(edit.matrix);
-        if (edit.convex_rebuild && (!edit.evaluated || edit.mode != SelectionMode::Face || !edit.retrim && !matches!(edit.face_edit,Some(crate::face_operations::FaceEdit::Draft(_)))))
+        if (edit.cap_rotation && (!edit.evaluated || edit.mode!=SelectionMode::Face || edit.retrim || edit.section_transform || edit.sweep.is_some() || edit.face_edit.is_some() || edit.edge_chamfer.is_some() || edit.prism_bevel.is_some()))
+            || (edit.convex_rebuild && (!edit.evaluated || edit.mode != SelectionMode::Face || !edit.retrim && !matches!(edit.face_edit,Some(crate::face_operations::FaceEdit::Draft(_)))))
             || (edit.section_transform
             && (!edit.evaluated
                 || !matches!(edit.mode, SelectionMode::Face | SelectionMode::Edge)
@@ -583,6 +642,10 @@ fn apply_stage(
         if edit.topology != g.topology {
             return Err("An upstream edit changed component topology. Undo it or remove component edits before changing topology.".into());
         }
+        if let Some(control)=&edit.control {
+            *g=crate::soft_selection::apply(body,g,edit,control,placement)?;
+            return Ok(());
+        }
         if let Some(bevel)=edit.prism_bevel {
             let edges=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
             *g=crate::edge_treatments::bevel_prism(g,&edges,bevel,edit.prism_curves)?;
@@ -630,6 +693,10 @@ fn apply_stage(
         if edit.retrim {
             let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
             *g=retrim_faces(g,&faces,matrix,edit.convex_rebuild)?;
+            return Ok(());
+        }
+        if edit.cap_rotation {
+            *g=crate::section_edits::rotate_cap(g,&selected,matrix)?.ok_or("This curved-face rotation needs retained cap/neighbor surface reconstruction. Use an editable control domain; the display mesh was not modified.")?;
             return Ok(());
         }
         // A continuous cylinder wall can own every boundary vertex. This is
@@ -702,7 +769,7 @@ fn apply_stage(
         }
         weld_geometry(g);
         validate_boundary(g, if evaluated {old.is_solid} else {body.extrusion > 0. && body.shape != Shape::Line})?;
-        g.shell=None;g.circles.clear();
+        g.shell=None;g.circles.clear();g.triangle_normals.clear();
         Ok(())
         })().map_err(|reason:String|format!("Component operation {} · {} {}: {reason}",index+1,edit.mode.label(),edit.element.saturating_add(1)))?;
     }
@@ -1102,6 +1169,15 @@ pub(crate) fn validate_retrim_intersections(g: &Geometry) -> Result<(), String> 
 }
 
 pub fn map_geometry(g: &mut Geometry, matrix: Matrix4) {
+    use truck_modeling::Matrix;
+    if let Some(inverse) = matrix.invert() {
+        let normal_matrix = inverse.transpose();
+        for n in g.triangle_normals.iter_mut().flatten() {
+            *n = normal_matrix.transform_vector(*n).normalize();
+        }
+    } else {
+        g.triangle_normals.clear();
+    }
     if let Some(shell) = &mut g.shell {
         *shell = builder::transformed(shell, matrix);
     }

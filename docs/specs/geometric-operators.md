@@ -147,7 +147,7 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 - [x] Independently placed construction planes with XY/XZ/YZ presets, numeric/gizmo placement, explicit drawing activation, reference-centered grid, undo and project persistence.
 - [x] Live construction-plane neutral references for evaluated planar Draft, including later-created planes, automatic regeneration and validated deletion/conversion.
 - [x] Convex evaluated Draft may consume redundant chamfer/support faces and rebuild a surviving closed solid; preserve legacy Draft rejection through explicit history intent.
-- [ ] NURBS/control-cage editing and soft-selection falloff as specified separately.
+- [ ] Complete NURBS/control-cage editing and soft-selection falloff. Fixed-boundary control-net editing is implemented; see [current behavior and validation](soft-selection.md#delivered-control-net-editing-2026-10-24). Continuous cylindrical deformation, periodic seams and the high-definition surface workflow remain required.
 
 These researched capabilities inform the backlog; they do not authorize speculative frameworks or copying another product's implementation. Preserve Truck as the selected kernel, reuse existing model/selection/history paths, and add only the representation required by each delivered operator.
 

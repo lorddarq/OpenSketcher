@@ -1,6 +1,6 @@
 # OpenSketcher project format (.osk)
 
-Schema version: 41. Modeling semantics version: 41.
+Schema version: 42. Modeling semantics version: 42.
 
 An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. The extension is specific to OpenSketcher; the encoding is documented and does not encrypt the scene. The native project stores authored parameters, not only viewport triangles. Truck reevaluates the parameters to restore editable geometry.
 
@@ -9,8 +9,8 @@ An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. 
 | Field | Meaning |
 | --- | --- |
 | `format` | Required `OpenSketcher` identifier. |
-| `schema_version` | File layout version; currently 41. Versions 1–40 migrate on load. |
-| `modeling_version` | Evaluation semantics version; currently 41. |
+| `schema_version` | File layout version; currently 42. Versions 1–41 migrate on load. |
+| `modeling_version` | Evaluation semantics version; currently 42. |
 | `bodies` | Ordered scene objects with stable nonzero IDs. |
 | `camera` | Orthographic preset/free-view label, yaw, pitch, span, and target. Angles are radians; span is the visible vertical extent. |
 | `snapping` | Master geometry/grid snapping switch. |
@@ -23,7 +23,7 @@ Each object retains `id`, `shape`, `width`, `depth`, `extrusion`, `cuts_profiles
 
 Camera data includes `view` (`isometric`, `top`, `side`, or `free`), `yaw`, `pitch`, `span`, and `target`. It restores the actual camera orientation and framing, not just the preset label.
 
-All currently implemented scene properties are serialized. Materials, textures, independent saved scenes, NURBS cages, and deformation features do not yet exist in the application model; this version cannot encode those future features. Their introduction requires an explicit schema/modeling version decision and migration support. Do not silently drop unsupported fields.
+All currently implemented scene properties are serialized. Materials, textures, independent saved scenes and arbitrary custom cage bindings do not yet exist in the application model; this version cannot encode those future features. Their introduction requires an explicit schema/modeling version decision and migration support. Do not silently drop unsupported fields.
 
 ## Excluded transient state
 
@@ -357,3 +357,12 @@ New evaluated Draft operations on convex straight-edged planar input with at mos
 The convex half-space reconstruction already rebuilds corner incidence. The new intent additionally permits redundant supports to disappear from the retained solid: a shrinking wall can consume a chamfer band or even the original opposite cap while leaving valid closed material. Keep the authored source/treatment inputs and the input neutral reference in history. The output remains the intersection of the drafted and unchanged oriented support planes; it is not a deformation of the old display mesh. Verify retained material closure before committing. Concave/curved Draft and unsupported partitioned supports do not gain topology-changing reconstruction from this flag.
 
 Draft actions select their owning volume, and the inspector uses guarded pre-Draft neutral slots. Later output-face edits must be explicitly selected and retain their own input topology guards; changing the Draft so those guards no longer match rejects atomically. Existing undo/redo/removal and live construction-plane neutral semantics remain intact.
+
+
+## Authored control nets and soft selection (v42)
+
+An evaluated Face `component_edits` entry may contain `control`, mutually exclusive with other component flags. It requires an identity matrix, exactly one guarded input face and version 42 in both file versions. Missing `control` retains earlier replay. Its strict object fields are `domain` (stable nonzero body-local ID), `binding` (`rows`, `columns`, `uknots`, `vknots`), `version: 1` and `action`. Node identity is the `[row, column]` coordinate in that authored parameter lattice; knot/dimension changes and missing creation references fail rather than rebind.
+
+Actions are `{kind: "create", planar: boolean}`, `{kind: "translate", sources: [[row,column], ...], locked: [[row,column], ...], enabled: boolean, radius: number, delta: [x,y,z]}` and `{kind: "move_face", delta: [x,y,z]}`. `planar: true` creates a fixed 5×5 degree-four clamped planar NURBS definition from an exact parallelogram. False binds a supported existing full clamped NURBS patch and preserves its source weights, knots and degree. Subsequent operations refer to that creation's domain and binding. Boundary nodes are implicitly locked; `locked` captures additional interior locks. Radius is in world millimeters; `delta` is an owner-local displacement converted from the interactive world request. This coordinate choice carries deformation with owner rotation. V1 recomputes shortest world control-edge paths and nearest-source smoothstep from each operation's upstream state, including nonuniform placement scale. Enabled false and radius zero give hard selection.
+
+Replay retains source definitions, exact NURBS surfaces and trim wires. It never serializes display meshes, heatmap colors, active node selection, idle radius, hover or an in-progress drag. Control features currently form a contiguous suffix of component history; other component operators after domain creation reject rather than discard it. Other scene dependents continue through transactional evaluation. The [behavior specification](../specs/soft-selection.md#delivered-control-net-editing-2026-10-24) records supported geometry, validation limits and native evidence.

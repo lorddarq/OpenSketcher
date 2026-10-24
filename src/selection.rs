@@ -223,7 +223,7 @@ pub fn valid(pick: Pick, scene: &[(u64, Geometry)], mode: SelectionMode) -> bool
         })
 }
 
-fn triangle_hit(o: Point3, d: Vector3, tri: &[Point3; 3]) -> Option<f64> {
+pub(crate) fn triangle_hit(o: Point3, d: Vector3, tri: &[Point3; 3]) -> Option<f64> {
     let e1 = tri[1] - tri[0];
     let e2 = tri[2] - tri[0];
     let h = d.cross(e2);

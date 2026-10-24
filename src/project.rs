@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 41,
-            modeling_version: 41,
+            schema_version: 43,
+            modeling_version: 43,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,27 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=41) || !matches!(self.modeling_version, 1..=41) {
+        if !matches!(self.schema_version, 1..=43) || !matches!(self.modeling_version, 1..=43) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–41 and modeling versions 1–41."
+                "Unsupported .osk version. This application supports schema versions 1–43 and modeling versions 1–43."
                     .into(),
             );
+        }
+        if (self.schema_version < 43 || self.modeling_version < 43)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.cap_rotation))
+        {
+            return Err("Calculated cap rotations require .osk version 43.".into());
+        }
+        if (self.schema_version < 42 || self.modeling_version < 42)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.control.is_some()))
+        {
+            return Err("Authored control nets and soft selection require .osk version 42.".into());
         }
         if (self.schema_version < 39 || self.modeling_version < 39)
             && self.bodies.iter().any(|b| b.component_edits.iter().any(|e| matches!(e.face_edit, Some(crate::face_operations::FaceEdit::Draft(operation)) if operation.neutral_plane.is_some()))) {
@@ -465,8 +481,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 41;
-        project.modeling_version = 41;
+        project.schema_version = 43;
+        project.modeling_version = 43;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

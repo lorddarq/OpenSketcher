@@ -52,7 +52,7 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [x] Parametric modifier distances/radii, semantic source-face references, `.osk` persistence, and undo/redo for add/edit/remove.
 - [ ] Modifiers on partitioned/concave or component-deformed solids; arbitrary curved-face treatment and exact noncircular blends.
 - [ ] Persistent semantic face/edge references for dependent modeling features.
-- [ ] Whole-face NURBS/deformation-preserving movement and control-node soft selection with falloff, radius, and heatmap.
+- [x] Explicit control-net creation, fixed-boundary NURBS node editing with radius/falloff/heatmap, and shape-preserving movement of supported control faces. General trim/periodic-seam editing remains unsupported.
 
 ### Selection, viewport, and workspace
 
@@ -144,7 +144,7 @@ Selected flat profiles use a separate coplanar display pass to avoid flickering 
 - **Volume:** select the whole object, including standalone profiles and lines. Whole-object transforms and deletion are available here.
 - **Face:** select one modeling surface across its display triangles. Connected patches of the same cylinder form one wall.
 - **Edge:** select a shape boundary across its sampled curve segments. Circular rim arcs select as one edge; internal cylinder junctions and triangulation diagonals are not editable edges.
-- **Point:** show and pick visible topology vertices. These are not tessellation samples or NURBS deformation controls.
+- **Point:** show and pick visible topology vertices. These are not tessellation samples or NURBS deformation controls. For control editing, select a face, Create control net, then Edit nodes.
 
 Face, Edge, and Point support Move/Rotate gizmos for the selected component; adjacent boundaries rebuild to remain connected. Whole-object numeric properties and deletion remain in Volume mode. Changing mode clears the previous selection but keeps Move/Rotate active. Completed component transforms retain their selection, and undo/redo preserves it when its topology slot still exists. Empty-space clicks clear selection within the current mode. Occluded components are not selectable through opaque faces. Edge/point acquisition uses screen-space tolerances so zoom does not shrink the click target.
 
@@ -277,7 +277,7 @@ The pivot starts at the selected geometry's bounding-box center (the selected ve
 
 Snap defaults on: move offsets use 0.5-unit steps and rotation offsets use 15-degree steps. Turn Snap off for continuous changes. Volume numeric properties remain available for exact values.
 
-Component edits retain the source profile plus ordered local transform matrices in `.osk`; they do not save a baked mesh. Selected faces/edges move rigidly, while shared boundaries deform neighboring faces. Curved and nonplanar component results currently use a regenerated faceted boundary validated with Truck, not exact edited NURBS surfaces. This is separate from future control-node soft selection and its heatmap/radius controls. The Volume inspector can **Remove component edits** as an undoable action when a topology-changing source edit is needed.
+Component edits retain the source profile plus ordered local transform matrices in `.osk`; they do not save a baked mesh. Selected faces/edges move rigidly, while shared boundaries deform neighboring faces. Curved and nonplanar component results currently use a regenerated faceted boundary validated with Truck, not exact edited NURBS surfaces. Explicit control-net operations retain exact NURBS surfaces, editable node translations and heatmap/radius controls; see the soft-selection specification. The Volume inspector can **Remove component edits** as an undoable action when a topology-changing source edit is needed.
 
 Component edits on a profile that cuts another region are currently rejected; Volume transforms of that cutting profile remain available. Topology-changing edits and deletions that invalidate saved component references are rejected without replacing the last valid scene. General semantic CAD feature references and exact curved-surface reconstruction remain pending.
 
@@ -363,3 +363,10 @@ Convex planar face movement now rebuilds incompatible chamfer corners and redund
 New convex Draft operations can remove redundant chamfer faces or caps while retaining valid closed material (`.osk` v41). Earlier Draft histories keep their original rejection rules; recreate the operation to use the new evaluator. Source treatments remain in history and restore on Undo or removal.
 
 Interactive evaluated edits and bore travel/mode changes now reuse their unchanged source BRep/tessellation. Source parameters and resolved profile partitions still invalidate the cache, and late operators/reference guards always replay. A two-thread release diagnostic measured 118 ms warm versus 219 ms forced cold for 12 rounded-cylinder cap edits; this measures geometry evaluation, not total frame time. See the [CPU investigation](docs/performance/cpu-investigation-2026-10-24.md).
+
+
+### Control-net editing
+
+In Face mode select a planar parallelogram and choose **Create control net**, then **Edit nodes**. Click/Shift-click nodes or use the control-coordinate chooser. Set **Soft selection** and **Radius** in millimeters; boundary nodes stay locked to retain shared trims. Drag a world-axis/plane handle (or the center handle in the view plane), or enter relative world displacement and choose **Translate nodes**. The marker heatmap, percentage feedback and separate explicit/soft counts show influence. Radius zero and the disabled toggle give hard selection. Escape/focus loss cancels a gesture; an accepted gesture is one undo step.
+
+Leave node mode before **Move face** to preserve the entire deformation without falloff. Supported solid caps rebuild planar neighbors while fixing the opposite section; single-face sheets retain their translated trims. Saved `.osk` v42 features expose radius, local displacement and removal in the Volume inspector and remain editable after reopening. Periodic/interior-trimmed patches and unsupported adjacent geometry reject explicitly. See [soft selection](docs/specs/soft-selection.md) for eligibility, replay semantics and validation limits.

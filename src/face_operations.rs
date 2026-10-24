@@ -82,12 +82,14 @@ pub fn selected(
         } else {
             let mut body = body.clone();
             body.component_edits.push(ComponentEdit {
+                control: None,
                 evaluated: true,
                 retrim: false,
                 convex_rebuild: matches!(kind, FaceEdit::Draft(_))
                     && g.face_count <= 64
                     && crate::components::planar_supports(g).is_ok(),
                 section_transform: false,
+                cap_rotation: false,
                 sweep: None,
                 tangent_walls: false,
                 prismatic_cut: false,

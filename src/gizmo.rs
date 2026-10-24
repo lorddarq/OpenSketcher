@@ -5,6 +5,7 @@ use truck_modeling::{EuclideanSpace, InnerSpace, Matrix4, Point3, Rad, SquareMat
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Handle {
+    Free,
     Axis(usize),
     Plane(usize),
     Ring(usize),
@@ -45,6 +46,22 @@ impl Drag {
         let scale = camera.span as f64 / rect.height().max(1.) as f64;
         let quantize = |v: f64, step: f64| if snap { (v / step).round() * step } else { v };
         match self.handle {
+            Handle::Free => {
+                if let (Some(a), Some(b)) = (
+                    camera.screen_plane(self.start, rect, self.pivot),
+                    camera.screen_plane(point, rect, self.pivot),
+                ) {
+                    let mut delta = b - a;
+                    if snap && delta.magnitude() > 1e-10 {
+                        delta = delta.normalize() * quantize(delta.magnitude(), 0.5);
+                    }
+                    self.matrix = Matrix4::from_translation(delta);
+                    self.value = format!(
+                        "View plane · {:.3}, {:.3}, {:.3} mm",
+                        delta.x, delta.y, delta.z
+                    );
+                }
+            }
             Handle::Axis(axis) => {
                 let mut delta = Vector3::new(0., 0., 0.);
                 let parameter = |p| {
@@ -180,6 +197,18 @@ fn handles(camera: &Camera, rect: Rect, pivot: Point3, rotate: bool) -> Vec<(Han
             }
         }
     }
+    if !rotate {
+        let center = camera.project(pivot, rect).0;
+        handles.push((
+            Handle::Free,
+            vec![
+                center - egui::vec2(6., 6.),
+                center + egui::vec2(6., -6.),
+                center + egui::vec2(6., 6.),
+                center + egui::vec2(-6., 6.),
+            ],
+        ));
+    }
     handles
 }
 pub fn hit(
@@ -192,7 +221,7 @@ pub fn hit(
     handles(camera, rect, pivot, rotate)
         .iter()
         .filter_map(|(handle, points)| {
-            let distance = if matches!(handle, Handle::Plane(_)) {
+            let distance = if matches!(handle, Handle::Plane(_) | Handle::Free) {
                 if !inside(point, points) {
                     return None;
                 }
@@ -222,13 +251,24 @@ pub fn draw(
     for (handle, points) in handles(camera, rect, pivot, rotate) {
         let axis = match handle {
             Handle::Axis(i) | Handle::Plane(i) | Handle::Ring(i) => i,
+            Handle::Free => 0,
         };
         let color = if active == Some(handle) || hovered == Some(handle) {
             Color32::YELLOW
+        } else if handle == Handle::Free {
+            Color32::WHITE
         } else {
             COLORS[axis]
         };
         match handle {
+            Handle::Free => {
+                painter.rect_stroke(
+                    Rect::from_min_max(points[0], points[2]),
+                    1.,
+                    Stroke::new(1.5, color),
+                    egui::StrokeKind::Outside,
+                );
+            }
             Handle::Plane(_) => {
                 painter.add(egui::Shape::convex_polygon(
                     points,
@@ -298,6 +338,17 @@ mod tests {
                     }
                 }
             }
+            let start = camera.project(pivot, rect).0;
+            assert_eq!(hit(&camera, rect, pivot, false, start), Some(Handle::Free));
+            let mut free = Drag::new(Handle::Free, start, pivot);
+            free.update(&camera, start + egui::vec2(20., -30.), rect, false);
+            let end = camera.project(free.matrix.transform_point(pivot), rect).0;
+            assert!(
+                end.distance(start + egui::vec2(20., -30.)) < 0.01,
+                "{view:?}: {start:?} -> {end:?}"
+            );
+            free.update(&camera, start, rect, false);
+            assert_eq!(free.matrix, Matrix4::identity());
             assert!(hit(&camera, rect, pivot, true, Pos2::new(-100., -100.)).is_none());
         }
         let mut camera = Camera::default();

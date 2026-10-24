@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add explicit NURBS control-net creation and node editing with connected soft-selection falloff, world-unit radius, marker heatmap, locks, numeric/gizmo translation and transactional preview/history. Preserve supported control-face deformation during rigid movement and owner transforms; persist editable control features in `.osk` v42 with guarded domain/node references and invalid-surface rejection.
+
 - Reuse source BRep/tessellation across evaluated component edits and bore travel/mode changes by keying bases only on source-stage inputs. Preserve full validation, dependency replay and source/profile invalidation; add cold/warm equivalence and timing coverage.
 
 - Permit newly authored convex Draft to consume redundant chamfer/support faces and retain a valid closed material cell. Reuse convex reconstruction and history intent, preserving earlier Draft replay through `.osk` v41.

@@ -431,10 +431,12 @@ pub fn selected_operations(
                     let element = *edges.first().ok_or("No boundary edges selected.")?;
                     let mut body = source.clone();
                     body.component_edits.push(crate::components::ComponentEdit {
+                        control: None,
                         evaluated: true,
                         retrim: false,
                         convex_rebuild: false,
                         section_transform: false,
+                        cap_rotation: false,
                         sweep: None,
                         tangent_walls: false,
                         prismatic_cut: false,

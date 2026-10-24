@@ -9,6 +9,9 @@ use wgpu::util::DeviceExt;
 
 // Smooth render samples within a logical face, retaining sharp authored boundaries.
 fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
+    if g.shell.is_some() && g.triangle_normals.len() == g.triangles.len() {
+        return g.triangle_normals.clone();
+    }
     let key = |face, p: Point3| (face, [p.x, p.y, p.z].map(|v| (v * 1e6).round() as i64));
     let mut sums = std::collections::HashMap::new();
     for (t, face) in g.triangles.iter().zip(&g.triangle_faces) {

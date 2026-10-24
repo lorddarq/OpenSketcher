@@ -186,6 +186,10 @@ fn execute(request: Request, latest: &std::sync::atomic::AtomicU64) -> Result<Up
     let mut preview = None;
     let mut loaded = None;
     for change in &request.changes {
+        // A later committed action must never publish a discarded transform preview.
+        if !matches!(change, Change::Preview(_)) {
+            preview = None;
+        }
         current()?;
         match change {
             Change::Edit(body, live) => {
@@ -324,9 +328,11 @@ mod tests {
         plain
             .component_edits
             .push(crate::components::ComponentEdit {
+                control: None,
                 retrim: false,
                 convex_rebuild: false,
                 section_transform: false,
+                cap_rotation: false,
                 sweep: None,
                 tangent_walls: false,
                 prismatic_cut: false,
@@ -438,6 +444,22 @@ mod tests {
             model.bodies[0].width, 2.,
             "UI model stays untouched until acceptance"
         );
+        let mut discarded = model.bodies.clone();
+        discarded[0].width = 20.;
+        worker.request(&model, Change::Preview(discarded));
+        let mut committed = model.bodies[0].clone();
+        committed.width = 3.;
+        worker.request(&model, Change::Edit(Box::new(committed), false));
+        let accepted = loop {
+            assert!(std::time::Instant::now() < deadline);
+            if let Some(result) = worker.poll() {
+                break result.unwrap();
+            }
+            std::thread::yield_now();
+        };
+        let expected = evaluate_scene(&accepted.model.bodies).unwrap();
+        assert_eq!(accepted.scene[0].1.triangles, expected[0].1.triangles);
+        assert_eq!(accepted.model.bodies[0].width, 3.);
         // A second object's edit must not discard the first object's pending edit.
         let mut second = Body::new(Shape::Rectangle);
         second.id = 2;

@@ -185,6 +185,8 @@ pub struct CircularEdge {
 #[derive(Clone, Default)]
 pub struct Geometry {
     pub triangles: Vec<[Point3; 3]>,
+    // Kernel surface normals at tessellation samples, independent of triangle density.
+    pub triangle_normals: Vec<[Vector3; 3]>,
     pub edges: Vec<[Point3; 2]>,
     pub triangle_faces: Vec<usize>,
     pub edge_groups: Vec<usize>,
@@ -295,7 +297,7 @@ impl Geometry {
             })
             .collect()
     }
-    fn group_cylinder_patches(&mut self) {
+    pub(crate) fn group_cylinder_patches(&mut self) {
         self.face_groups = (0..self.face_count).collect();
         self.edge_aliases = (0..self.edge_count).collect();
         self.internal_edges.clear();
@@ -916,9 +918,19 @@ pub fn tessellate(shell: &Shell) -> Result<Geometry, String> {
         geometry.topology.faces.push(Vec::new());
         for tri in mesh.tri_faces() {
             let mut triangle = tri.map(|v| mesh.positions()[v.pos]);
+            let chord = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+            let mut normals = tri.map(|v| {
+                v.nor
+                    .and_then(|i| mesh.normals().get(i))
+                    .copied()
+                    .unwrap_or(chord)
+            });
             if !face.orientation() {
                 triangle.swap(1, 2);
+                normals.swap(1, 2);
+                normals = normals.map(|n| -n);
             }
+            geometry.triangle_normals.push(normals);
             geometry.triangles.push(triangle);
             geometry.triangle_faces.push(face_index);
         }
