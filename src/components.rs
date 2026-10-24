@@ -35,6 +35,9 @@ pub struct ComponentEdit {
     pub prismatic_cut: bool,
     #[serde(default)]
     pub face_edit: Option<crate::face_operations::FaceEdit>,
+    /// Source-local setbacks on the two adjacent evaluated support faces.
+    #[serde(default)]
+    pub edge_chamfer: Option<[f64; 2]>,
     pub mode: SelectionMode,
     pub element: usize,
     #[serde(default)]
@@ -327,6 +330,7 @@ fn transformed_many(
             tangent_walls: false,
             prismatic_cut: false,
             face_edit: None,
+            edge_chamfer: None,
             mode,
             element,
             elements: elements.iter().skip(1).copied().collect(),
@@ -365,6 +369,7 @@ pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Resu
         tangent_walls: true,
         prismatic_cut: true,
         face_edit: None,
+        edge_chamfer: None,
         mode: SelectionMode::Face,
         element: face,
         elements: Vec::new(),
@@ -460,6 +465,18 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
                     || edit.sweep.is_some()
                     || m != Matrix4::identity()
             })
+            || edit.edge_chamfer.is_some_and(|distances| {
+                !edit.evaluated
+                    || edit.mode != SelectionMode::Edge
+                    || edit.retrim
+                    || edit.section_transform
+                    || edit.face_edit.is_some()
+                    || edit.sweep.is_some()
+                    || m != Matrix4::identity()
+                    || distances
+                        .iter()
+                        .any(|d| !d.is_finite() || *d <= 1e-5 || *d > 10000.)
+            })
             || edit.sweep.is_some_and(|v| {
                 edit.mode != SelectionMode::Face
                     || !edit.evaluated
@@ -524,6 +541,11 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         (|| {
         if edit.topology != g.topology {
             return Err("An upstream edit changed component topology. Undo it or remove component edits before changing topology.".into());
+        }
+        if let Some(distances)=edit.edge_chamfer {
+            let edges=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
+            *g=crate::edge_treatments::chamfer_evaluated(g,&edges,distances)?;
+            return Ok(());
         }
         if let Some(kind)=edit.face_edit {
             let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();

@@ -330,6 +330,7 @@ mod tests {
                 tangent_walls: false,
                 prismatic_cut: false,
                 face_edit: None,
+                edge_chamfer: None,
                 evaluated: false,
                 mode: crate::selection::SelectionMode::Face,
                 element: 0,

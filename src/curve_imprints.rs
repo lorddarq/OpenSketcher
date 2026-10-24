@@ -799,6 +799,27 @@ mod tests {
                         .collect::<std::collections::BTreeSet<_>>(),
                     rim.into_iter().collect()
                 );
+                let picks = chain
+                    .iter()
+                    .map(|edge| (3, Some(*edge)))
+                    .collect::<Vec<_>>();
+                let changes = crate::edge_treatments::selected_operations(
+                    &bodies,
+                    &result,
+                    &picks,
+                    SelectionMode::Edge,
+                    crate::edge_treatments::Kind::Chamfer,
+                )
+                .unwrap();
+                let mut chamfered = bodies.clone();
+                chamfered[2] = changes[0].clone();
+                let changed = evaluate_scene(&chamfered).unwrap();
+                assert!(volume(&changed[2].1) < volume(g));
+                assert_eq!(
+                    changed[2].1.face_count,
+                    g.face_count + 1,
+                    "Split collinear edges share one chamfer band"
+                );
             }
             assert!(result[0].1.triangles.is_empty());
             assert!(result[1].1.edges.is_empty());

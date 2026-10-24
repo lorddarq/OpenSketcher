@@ -1,6 +1,6 @@
 # OpenSketcher project format (.osk)
 
-Schema version: 31. Modeling semantics version: 31.
+Schema version: 32. Modeling semantics version: 32.
 
 An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. The extension is specific to OpenSketcher; the encoding is documented and does not encrypt the scene. The native project stores authored parameters, not only viewport triangles. Truck reevaluates the parameters to restore editable geometry.
 
@@ -9,8 +9,8 @@ An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. 
 | Field | Meaning |
 | --- | --- |
 | `format` | Required `OpenSketcher` identifier. |
-| `schema_version` | File layout version; currently 31. Versions 1–30 migrate on load. |
-| `modeling_version` | Evaluation semantics version; currently 31. |
+| `schema_version` | File layout version; currently 32. Versions 1–31 migrate on load. |
+| `modeling_version` | Evaluation semantics version; currently 32. |
 | `bodies` | Ordered scene objects with stable nonzero IDs. |
 | `camera` | Orthographic preset/free-view label, yaw, pitch, span, and target. Angles are radians; span is the visible vertical extent. |
 | `snapping` | Master geometry/grid snapping switch. |
@@ -46,7 +46,7 @@ Current limits are 16 MiB per document, 1,000 objects, and one million evaluated
 
 Write a complete temporary file beside the destination, synchronize its contents, then atomically replace the target with `tempfile::NamedTempFile::persist`. On write/replacement failure, preserve the last valid destination and keep the project dirty. This avoids partial-file overwrites; it is not an autosave, backup, or guarantee against every filesystem/power-loss scenario.
 
-Schema and modeling versions 1–31 are supported. Older documents migrate to schema/modeling version 31 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 31; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
+Schema and modeling versions 1–32 are supported. Older documents migrate to schema/modeling version 32 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 32; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
 
 Component slots refer to faces, unique topology edges, or unique topology vertices in this model evaluation, never GPU triangles or sampled curve vertices. Validate slot bounds against regenerated geometry. They are selection state, not feature dependencies or a general solution to persistent topological naming. Component transforms retain slots while source connectivity is unchanged. Undo/redo keeps component selection when its slot remains valid; future dependent CAD face operations still require semantic references.
 
@@ -92,7 +92,7 @@ Version 5 allowed at most six perimeter entries, one per source face. Version 9 
 
 Replay reconstructs the source solid and applies all stored modifiers; pose is applied afterwards. Circular rims are built by revolving an authored radial section with lines or quarter-circle arcs. Other convex profile treatments use clipping and grouped transition surfaces. Render subdivisions and revolution patch seams are excluded from selectable topology; the base face and transition band remain separate surfaces. Exports consume the same evaluated result; current STEP output is still faceted.
 
-Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 31 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
+Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 32 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
 
 ## Multiple selection (schema/modeling version 5)
 
@@ -132,7 +132,7 @@ Rejected property drafts and contextual evaluation errors are transient. `.osk` 
 
 ### Version 10: sweep termination extents
 
-Current writers use schema/modeling version 31. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
+Current writers use schema/modeling version 32. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
 
 ### Evaluated planar face extrusion (version 11)
 
@@ -263,3 +263,12 @@ On negative travel reaching/passing the far cap, eligible straight prisms regene
 New volume Union/Subtract/Intersect operations persist `boolean.analytic_prisms: true`. Eligibility reuses the retained-surface straight-prism proof: paired homogeneous control rows must describe the same normal translation, with complete planar end sections. Tapered/twisted/intermediate-section solids and divided cap regions stay on the general path. When eligible equal-depth prisms use the cap-region shortcut, their cap set operation now uses the shared analytic wire arrangement. Circular/elliptical holes and curved trim edges survive as analytic boundaries instead of sampled polygons. The existing sweep builds the resulting solids from those retained regions.
 
 Missing/false retains the legacy prism evaluator; loading/migrating an older file does not opt its existing operations into the new topology. True is valid only for two volume operands and a set operation, requires schema/modeling version 31, and is rejected under older version declarations. Other ineligible volume operations retain their existing general kernel path. `analytic_faces` remains the separate intent for face-set operations.
+
+
+## Version 32: evaluated planar edge chamfers
+
+`component_edits[].edge_chamfer` optionally stores `[first_distance, second_distance]`, the positive finite setbacks along the two adjacent evaluated support faces, in owner-local units. The first support is the lower face slot in the guarded input topology; reversing distances swaps their values. An equal-distance chamfer has equal entries. Entries require `evaluated: true`, Edge mode, identity `matrix`, and no `retrim`, `section_transform`, `sweep` or `face_edit`. `element` plus `elements` contain explicit selected edges; one entry applies them together against one input topology signature.
+
+Evaluation recomputes exact cut planes from the retained convex planar boundary and reconstructs shared B-rep edges. It supports evaluated Boolean and prior treatment boundaries without writing a mesh snapshot. Unsupported curved/concave boundaries, missing/ambiguous adjacency, stale topology, invalid distances and consumed support faces reject transactionally. Subsequent face edits use the resulting real planar surfaces. Removing the entry replays the input; later entries retain their existing topology guards.
+
+Non-null `edge_chamfer` requires schema and modeling version 32. Missing/null leaves historical operations unchanged. Versions 1–31 migrate without creating new chamfers. Writers use version 32; older version declarations containing this field's non-null value reject explicitly.

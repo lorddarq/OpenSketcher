@@ -355,6 +355,103 @@ pub fn selected_operations(
     if picks.is_empty() || !matches!(mode, SelectionMode::Face | SelectionMode::Edge) {
         return Err("Select faces or edges to treat.".into());
     }
+    let mut changed = Vec::new();
+    for &(id, _) in picks {
+        if changed.iter().any(|b: &Body| b.id == id) {
+            continue;
+        }
+        let selected = picks
+            .iter()
+            .copied()
+            .filter(|p| p.0 == id)
+            .collect::<Vec<_>>();
+        match source_operations(bodies, scene, &selected, mode, kind) {
+            Ok(source) => changed.extend(source),
+            Err(source_error) if kind == Kind::Chamfer => {
+                let evaluated = (|| {
+                    let source = bodies.iter().find(|b| b.id == id).ok_or("Missing body.")?;
+                    let mut g = scene
+                        .iter()
+                        .find(|g| g.0 == id)
+                        .ok_or("Missing geometry.")?
+                        .1
+                        .clone();
+                    crate::components::map_geometry(
+                        &mut g,
+                        crate::regions::transform(source)
+                            .invert()
+                            .ok_or("Invalid placement.")?,
+                    );
+                    let mut edges = Vec::new();
+                    for (_, element) in &selected {
+                        let element = element.ok_or("Select a boundary element.")?;
+                        let candidates = if mode == SelectionMode::Face {
+                            g.topology
+                                .faces
+                                .iter()
+                                .enumerate()
+                                .filter(|(face, _)| g.face_group(*face) == g.face_group(element))
+                                .flat_map(|(_, edges)| edges.iter().copied())
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![element]
+                        };
+                        for edge in candidates {
+                            let edge = g.edge_group(edge);
+                            if !g.internal_edges.contains(&edge) && !edges.contains(&edge) {
+                                edges.push(edge);
+                            }
+                        }
+                    }
+                    let amount = g
+                        .topology
+                        .edges
+                        .iter()
+                        .map(|[a, b]| (g.points[*b] - g.points[*a]).magnitude() * 0.1)
+                        .fold(0.2, f64::min);
+                    chamfer_evaluated(&g, &edges, [amount; 2])?;
+                    let element = *edges.first().ok_or("No boundary edges selected.")?;
+                    let mut body = source.clone();
+                    body.component_edits.push(crate::components::ComponentEdit {
+                        evaluated: true,
+                        retrim: false,
+                        section_transform: false,
+                        sweep: None,
+                        tangent_walls: false,
+                        prismatic_cut: false,
+                        face_edit: None,
+                        edge_chamfer: Some([amount; 2]),
+                        mode: SelectionMode::Edge,
+                        element,
+                        elements: edges.into_iter().skip(1).collect(),
+                        topology: g.topology.clone(),
+                        matrix: truck_modeling::Matrix4::identity().into(),
+                    });
+                    body.validate()?;
+                    Ok(body)
+                })()
+                .map_err(|reason: String| {
+                    format!("Chamfer · body {id}: {source_error} Evaluated boundary: {reason}")
+                })?;
+                changed.push(evaluated);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(changed)
+}
+
+fn source_operations(
+    bodies: &[Body],
+    scene: &[(u64, Geometry)],
+    picks: &[crate::selection::Pick],
+    mode: crate::selection::SelectionMode,
+    kind: Kind,
+) -> Result<Vec<Body>, String> {
+    use crate::selection::SelectionMode;
+    if picks.is_empty() || !matches!(mode, SelectionMode::Face | SelectionMode::Edge) {
+        return Err("Select faces or edges to treat.".into());
+    }
     let mut changed: Vec<Body> = Vec::new();
     for &(id, element) in picks {
         (|| {
@@ -545,6 +642,83 @@ fn linear_polygons(
         });
     }
     Some(polygons)
+}
+
+/// Cut the selected straight support intersections on a retained convex solid.
+/// The cut planes and neighboring faces are reconstructed as shared B-rep edges.
+pub(crate) fn chamfer_evaluated(
+    g: &Geometry,
+    selected: &[usize],
+    distances: [f64; 2],
+) -> Result<Geometry, String> {
+    if selected.is_empty()
+        || distances
+            .iter()
+            .any(|d| !d.is_finite() || *d <= 1e-5 || *d > 10000.)
+    {
+        return Err("Select edges and supply finite positive chamfer setbacks.".into());
+    }
+    let planes = crate::components::planar_supports(g)?;
+    let shell = g
+        .shell
+        .as_ref()
+        .ok_or("Chamfer requires retained boundaries.")?;
+    if shell.connected_components().len() != 1 {
+        return Err("Chamfer requires one connected convex solid.".into());
+    }
+    let mut faces = linear_polygons(shell, g.surface_mapping()?, false)
+        .ok_or("Chamfer requires straight planar boundary loops.")?;
+    let mut cuts: Vec<(Vector3, f64)> = Vec::new();
+    for &edge in selected {
+        if edge >= g.edge_count || g.internal_edges.contains(&edge) {
+            return Err("Selected chamfer edge no longer exists.".into());
+        }
+        let [a, b] = g.topology.edges[edge];
+        let direction = g.points[b] - g.points[a];
+        if direction.magnitude2() < 1e-16 {
+            return Err("Chamfer edge is degenerate.".into());
+        }
+        let owners = g
+            .topology
+            .faces
+            .iter()
+            .enumerate()
+            .filter(|(_, edges)| edges.contains(&edge))
+            .map(|(face, _)| face)
+            .collect::<Vec<_>>();
+        let [first, second] = owners.as_slice() else {
+            return Err("Chamfer requires an edge shared by exactly two faces.".into());
+        };
+        let (n1, _) = planes[*first];
+        let (n2, _) = planes[*second];
+        let cosine = n1.dot(n2);
+        if cosine.abs() > 1. - 1e-8 {
+            return Err("Coplanar or folded boundaries do not define a chamfer corner.".into());
+        }
+        let p = g.points[a] - (n2 - n1 * cosine).normalize() * distances[0];
+        let q = g.points[a] - (n1 - n2 * cosine).normalize() * distances[1];
+        let mut normal = direction.cross(q - p).normalize();
+        if normal.dot(n1 + n2) < 0. {
+            normal = -normal;
+        }
+        let distance = normal.dot(p.to_vec());
+        if !cuts
+            .iter()
+            .any(|(n, d)| (*n - normal).magnitude() < 1e-8 && (*d - distance).abs() < 1e-7)
+        {
+            cuts.push((normal, distance));
+        }
+    }
+    for (i, (normal, distance)) in cuts.into_iter().enumerate() {
+        clip(&mut faces, normal, distance, g.face_count + i)?;
+    }
+    if (0..g.face_count).any(|group| !faces.iter().any(|f| f.group == group)) {
+        return Err("Chamfer consumes a support face; reduce the setbacks.".into());
+    }
+    let mut result = join_linear_faces(faces)?;
+    crate::components::planar_supports(&result)?;
+    result.retain_circles(&g.circles);
+    Ok(result)
 }
 
 /// Exact convex planar intersection, including coincident supports and unequal depths.
@@ -1339,6 +1513,202 @@ mod tests {
             .sum()
     }
     #[test]
+    fn evaluated_planar_chamfers_replay_edit_move_export_and_rollback() {
+        use crate::{booleans, components, selection::SelectionMode};
+        use truck_modeling::{Deg, Matrix4};
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.width = 4.;
+        a.depth = 4.;
+        a.extrusion = 3.;
+        let mut b = a.clone();
+        b.id = 2;
+        b.position[0] = 1.;
+        let mut bodies = vec![a, b];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut feature = Body::new(Shape::Rectangle);
+        feature.id = 3;
+        feature.boolean = Some(booleans::Boolean::new(
+            booleans::Kind::Intersect,
+            &[(1, None), (2, None)],
+            SelectionMode::Volume,
+            &scene,
+        ));
+        bodies.push(feature.clone());
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[2].1;
+        let edge = g
+            .topology
+            .edges
+            .iter()
+            .position(|[a, b]| (g.points[*a].z - g.points[*b].z).abs() > 2.9)
+            .unwrap();
+        let mut changes = selected_operations(
+            &bodies,
+            &scene,
+            &[(3, Some(edge))],
+            SelectionMode::Edge,
+            Kind::Chamfer,
+        )
+        .unwrap();
+        assert!(changes[0].edge_treatments.is_empty());
+        changes[0].component_edits.last_mut().unwrap().edge_chamfer = Some([0.2, 0.4]);
+        let mut model = Model::from_bodies(bodies.clone());
+        model.commit_changes(&changes).unwrap();
+        let evaluated = evaluate_scene(&model.bodies).unwrap();
+        let result = &evaluated[2].1;
+        assert_eq!(result.face_count, g.face_count + 1);
+        assert!((volume(g) - volume(result) - 0.5 * 0.2 * 0.4 * 3.).abs() < 1e-6);
+        assert!(result.shell.as_ref().unwrap().is_geometric_consistent());
+        // Both asymmetric distance order and non-right dihedral angles rebuild
+        // exact planar boundaries; retained chamfer faces stay movable.
+        let mut reversed = changes[0].clone();
+        reversed.component_edits.last_mut().unwrap().edge_chamfer = Some([0.4, 0.2]);
+        let mut reverse_bodies = bodies.clone();
+        reverse_bodies[2] = reversed;
+        let reverse = evaluate_scene(&reverse_bodies).unwrap();
+        assert!((volume(&reverse[2].1) - volume(result)).abs() < 1e-6);
+        assert_ne!(reverse[2].1.points, result.points);
+        let band = result.face_count - 1;
+        let normal = components::planar_supports(result).unwrap()[band].0;
+        let moved = components::transformed(
+            &changes[0],
+            result,
+            SelectionMode::Face,
+            Some(band),
+            Matrix4::from_translation(normal * 0.05),
+        )
+        .unwrap();
+        let mut moved_bodies = bodies.clone();
+        moved_bodies[2] = moved;
+        let moved_scene = evaluate_scene(&moved_bodies).unwrap();
+        assert!(volume(&moved_scene[2].1) > volume(result));
+        let rotated = components::transformed(
+            &changes[0],
+            result,
+            SelectionMode::Face,
+            Some(band),
+            Matrix4::from_angle_z(Deg(1.)),
+        )
+        .unwrap();
+        let mut rotated_bodies = bodies.clone();
+        rotated_bodies[2] = rotated;
+        assert!(evaluate_scene(&rotated_bodies).is_ok());
+        for format in [
+            crate::export::Format::Stl,
+            crate::export::Format::Glb,
+            crate::export::Format::Step,
+            crate::export::Format::Dxf,
+        ] {
+            assert!(
+                !crate::export::encode(&model.bodies, format)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chamfer.osk");
+        let project = Project::new(model.bodies.clone(), Camera::default(), true, Some(3));
+        project.save(&path).unwrap();
+        assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+        let mut old = serde_json::to_value(&project).unwrap();
+        old["schema_version"] = 31.into();
+        old["modeling_version"] = 31.into();
+        assert!(
+            serde_json::from_value::<Project>(old)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .contains("version 32")
+        );
+        let mut invalid = changes[0].clone();
+        invalid.component_edits.last_mut().unwrap().edge_chamfer = Some([20.; 2]);
+        let before = model.bodies.clone();
+        assert!(model.commit(invalid).is_err());
+        assert_eq!(model.bodies, before);
+        model.undo();
+        assert_eq!(model.bodies, bodies);
+        model.redo();
+        assert_eq!(model.bodies, before);
+        let mut removed = changes[0].clone();
+        removed.component_edits.clear();
+        model.commit(removed).unwrap();
+        assert!((volume(&evaluate_scene(&model.bodies).unwrap()[2].1) - volume(g)).abs() < 1e-6);
+        let mut invalid = changes[0].clone();
+        invalid.component_edits.last_mut().unwrap().edge_chamfer = Some([f64::NAN, 0.2]);
+        assert!(invalid.validate().is_err());
+        let top = components::planar_supports(g)
+            .unwrap()
+            .iter()
+            .position(|(n, _)| n.z > 0.99)
+            .unwrap();
+        let perimeter = selected_operations(
+            &bodies,
+            &scene,
+            &[(3, Some(top))],
+            SelectionMode::Face,
+            Kind::Chamfer,
+        )
+        .unwrap();
+        assert_eq!(
+            perimeter[0].component_edits.last().unwrap().elements.len(),
+            3
+        );
+        let mut perimeter_bodies = bodies.clone();
+        perimeter_bodies[2] = perimeter[0].clone();
+        assert_eq!(
+            evaluate_scene(&perimeter_bodies).unwrap()[2].1.face_count,
+            10
+        );
+        assert!(
+            selected_operations(
+                &bodies,
+                &scene,
+                &[(3, Some(edge)), (3, Some(usize::MAX))],
+                SelectionMode::Edge,
+                Kind::Chamfer
+            )
+            .is_err()
+        );
+        // Nonuniform source placement is inverted before applying local setbacks.
+        let mut source = bodies[0].clone();
+        source.position = [2., -1., 4.];
+        source.rotation = [13., 19., 27.];
+        source.scale = [1.5, 0.75, 2.];
+        source
+            .edge_treatments
+            .push(Modifier::new(Kind::Chamfer, FaceTarget::Top, &source));
+        let source_scene = evaluate_scene(&[source.clone()]).unwrap();
+        let transition = (0..source_scene[0].1.edge_count)
+            .find(|edge| box_edge(&source, &source_scene[0].1, *edge).is_err())
+            .unwrap();
+        let change = selected_operations(
+            &[source.clone()],
+            &source_scene,
+            &[(1, Some(transition))],
+            SelectionMode::Edge,
+            Kind::Chamfer,
+        )
+        .unwrap();
+        assert!(volume(&evaluate(&change[0]).unwrap()) < volume(&source_scene[0].1));
+        let mut stale = change[0].clone();
+        stale
+            .component_edits
+            .last_mut()
+            .unwrap()
+            .topology
+            .edges
+            .pop();
+        assert!(evaluate_scene(&[stale]).is_err());
+        if let Some(path) = std::env::var_os("OSK_EVALUATED_CHAMFER_REVIEW_PROJECT") {
+            let mut review = Project::new(bodies.clone(), Camera::default(), true, Some(3));
+            review.selection_mode = SelectionMode::Edge;
+            review.selected_element = Some(edge);
+            review.selection = vec![(3, Some(edge))];
+            review.save(std::path::Path::new(&path)).unwrap();
+        }
+    }
+    #[test]
     fn planar_intersection_handles_coincident_unequal_depth_and_affine_inputs() {
         use truck_modeling::{Deg, Matrix4};
         let mut a = Body::new(Shape::Rectangle);
@@ -1446,16 +1816,23 @@ mod tests {
             let transition = (0..geometry.edge_count)
                 .find(|edge| box_edge(&changes[0], &geometry, *edge).is_err())
                 .unwrap();
+            let further = selected_operations(
+                &changes,
+                &[(1, geometry.clone())],
+                &[(1, Some(transition))],
+                SelectionMode::Edge,
+                Kind::Chamfer,
+            )
+            .unwrap();
             assert!(
-                selected_operations(
-                    &changes,
-                    &[(1, geometry)],
-                    &[(1, Some(transition))],
-                    SelectionMode::Edge,
-                    Kind::Chamfer
-                )
-                .is_err()
+                further[0]
+                    .component_edits
+                    .last()
+                    .unwrap()
+                    .edge_chamfer
+                    .is_some()
             );
+            assert!(volume(&evaluate(&further[0]).unwrap()) < volume(&geometry));
         }
         let picks: Vec<_> = (0..12).map(|edge| (1, Some(edge))).collect();
         let changes = selected_operations(

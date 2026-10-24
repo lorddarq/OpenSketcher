@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.2.0 — 2026-10-24
+
+- Add exact evaluated planar chamfers with editable setbacks, reversal, removal and independently editable chamfer faces.
+- Add optional analytic tangent-chain selection with whole-chain Shift-click toggling.
+- Expand exact face movement, extrusion, Imprint, Replace Face and pocket/notch healing while preserving analytic boundaries.
+- Improve ordered Booleans, boring, automatic sweep extents, shelling, drafting and CAD exports.
+- Reduce geometry, picking and shading work during interactive edits; fix extrusion drag stability and cylindrical seams.
+- Fix Windows save/load test fixtures and add atomic replacement/locked-file regression checks.
+- Save current parametric histories in `.osk` v32 while preserving older-file replay.
+
+Development release. General concave/curved edge treatments, arbitrary fillets and other unchecked operator requirements remain pending. Windows/Linux runtime and external CAD importer acceptance remain pending.
+
+### Detailed changes
+
+- Add exact chamfers on retained convex planar evaluated edges and face perimeters, including Boolean results and prior treatment boundaries. Expose editable/reversible setbacks and removal on source and Boolean owners; preserve guarded replay and selectable chamfer faces in `.osk` v32.
+
 - Add optional tangent-chain Edge selection using retained analytic curves. Preserve clicked-edge priority, toggle chains with Shift-click, and stop at sharp or ambiguous joins. General edge-treatment geometry remains pending.
 
 - Heal complete external notches across planar supports, preserving unrelated curved walls and holes. Keep analytic cap regions in new equal-depth prism Booleans via `.osk` v31 intent; retain legacy replay for older operations.

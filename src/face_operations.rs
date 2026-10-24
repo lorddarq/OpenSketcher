@@ -85,6 +85,7 @@ pub fn selected(
                 tangent_walls: false,
                 prismatic_cut: false,
                 face_edit: Some(kind),
+                edge_chamfer: None,
                 mode: SelectionMode::Face,
                 element: face,
                 elements: faces.into_iter().filter(|other| *other != face).collect(),

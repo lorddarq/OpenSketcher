@@ -1008,6 +1008,38 @@ fn history_shortcut(input: &mut egui::InputState) -> Option<bool> {
     }
 }
 
+fn evaluated_chamfers(ui: &mut egui::Ui, body: &mut Body) -> bool {
+    let mut finished = false;
+    let mut remove = None;
+    for (index, edit) in body.component_edits.iter_mut().enumerate() {
+        let Some(distances) = &mut edit.edge_chamfer else {
+            continue;
+        };
+        ui.push_id(("evaluated_chamfer", index), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Chamfer · {} edges · local units",
+                    edit.elements.len() + 1
+                ));
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            finished |= scalar(ui, "First distance", &mut distances[0], 0.00002..=10000.);
+            finished |= scalar(ui, "Second distance", &mut distances[1], 0.00002..=10000.);
+            if ui.small_button("Reverse distances").clicked() {
+                distances.swap(0, 1);
+                finished = true;
+            }
+        });
+    }
+    if let Some(index) = remove {
+        body.component_edits.remove(index);
+        finished = true;
+    }
+    finished
+}
+
 fn scalar(
     ui: &mut egui::Ui,
     label: &str,
@@ -1446,7 +1478,10 @@ impl eframe::App for OpenSketcher {
                     ui.label(format!("{} · {}",operation.kind.label(),operation.references()));
                     if !replacing {ui.checkbox(&mut operation.keep_tools,"Keep tools");}
                     if ui.button("Swap operands").clicked() {operation.operands.swap(0,1);operation.topology.swap(0,1);}
-                    if body!=before {self.request_change(evaluation::Change::Edit(Box::new(body.clone()),false));}
+                    let operation_changed=body!=before;
+                    let finished=evaluated_chamfers(ui,&mut body);
+                    if body!=before {self.request_change(evaluation::Change::Edit(Box::new(body.clone()),!operation_changed));}
+                    if finished {self.finish_model_edit();}
                     if ui.button(if replacing {"Remove replacement / restore source"}else if imprinting {"Remove imprint / restore inputs"}else{"Remove Boolean / restore inputs"}).clicked() {self.request_change(evaluation::Change::Delete(vec![body.id]));}
                     self.draft=Some(body);
                 } else if let Some(mut draft)=self.draft.take() {
@@ -1528,6 +1563,7 @@ impl eframe::App for OpenSketcher {
                     }
                     if !draft.component_edits.is_empty() {
                         ui.label(format!("Component edits: {}",draft.component_edits.len()));
+                        finished |= evaluated_chamfers(ui,&mut draft);
                         ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
                         if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
                         ui.label("Source profile parameters");

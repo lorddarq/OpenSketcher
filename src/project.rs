@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 31,
-            modeling_version: 31,
+            schema_version: 32,
+            modeling_version: 32,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,19 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=31) || !matches!(self.modeling_version, 1..=31) {
+        if !matches!(self.schema_version, 1..=32) || !matches!(self.modeling_version, 1..=32) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–31 and modeling versions 1–31."
+                "Unsupported .osk version. This application supports schema versions 1–32 and modeling versions 1–32."
                     .into(),
             );
+        }
+        if (self.schema_version < 32 || self.modeling_version < 32)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.edge_chamfer.is_some()))
+        {
+            return Err("Evaluated edge chamfers require .osk version 32.".into());
         }
         if (self.schema_version < 28 || self.modeling_version < 28)
             && self.bodies.iter().any(|body| {
@@ -375,8 +383,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 31;
-        project.modeling_version = 31;
+        project.schema_version = 32;
+        project.modeling_version = 32;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
