@@ -112,3 +112,9 @@ The user localized the CPU spikes to dragging dimensions or extrusion. Inspectio
 BVH construction now computes each tolerant triangle bounding box once, instead of repeating it at every tree level. The existing triangle ordering, split comparator and ray intersection tests are unchanged. Temporary bounds storage costs 48 bytes per triangle (about 28 MiB for 614600 triangles), released after construction; persistent index size is unchanged.
 
 Release measurements: index construction for 25 cylinders fell from 54–55 ms to 28–33 ms; 100 cylinders fell from 246–250 ms to 132.8–133.0 ms. These measure index construction, not application latency. The exhaustive/indexed hit-equivalence regression passed; all three evaluator tests passed, including stale request rejection, rapid edit coalescing, cancellation and error recovery. No native drag-rate measurement was performed for these changes.
+
+## Follow-up: analytic-cylinder shading avoids unused accumulation
+
+The normal helper previously accumulated a hash map of triangle normals for every face, including cylinder walls whose output normals come entirely from their exact extrusion support. It now skips accumulation for those supported walls. Other faces still use the existing accumulation, and cylinder normals still use the same analytic formula. This reduces work without adding a cache or changing geometry, lighting, selection or serialized data. All five viewport regression checks passed, including sharp-boundary smoothing and clipped-cylinder seam coverage; Clippy passed.
+
+The release timing check measured normal calculation at 11.9–12.9 ms for 25 cylinders and 51.1–57.0 ms for 100, compared with approximately 33 ms / 130 ms before skipping the discarded accumulation. The application build overlapped the end of this run, so these are diagnostic component timings rather than controlled end-to-end latency measurements.

@@ -339,6 +339,17 @@ fn prisms(op: &Boolean, a: &Geometry, b: &Geometry) -> Result<Option<Geometry>, 
     crate::operators::geometry(&solid).map(Some)
 }
 fn volumes(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
+    let mut result = volume_geometry(kind, a, b)?;
+    result.retain_circles(
+        &a.circles
+            .iter()
+            .chain(&b.circles)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    Ok(result)
+}
+fn volume_geometry(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
     if !a.is_solid || !b.is_solid {
         return Err(
             "Volume Booleans require two closed solids. Use Face selection for sheets.".into(),

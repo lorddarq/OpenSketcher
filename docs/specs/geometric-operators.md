@@ -106,7 +106,8 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 - [x] Cylindrical-wall Offset face changes radius without moving the axis; equal X/Y scale required, independent Z scale allowed. An elliptic cylinder is rejected because its parallel offset is not an ellipse.
 - [x] Exact planar face Translate/Rotate on convex planar solids with retained adjacent planes, exact shared edges/faces, guarded connectivity and analytic STEP.
 - [x] Exact complete-cap/rim translation on retained two-section solids, including circular/semicircular, through-pipe and concave Boolean caps; preserve the opposite cap and analytic boundaries.
-- [ ] General face Translate/Rotate beyond convex planar solids, including concave/curved neighbors and rigid curved/deformed face preservation.
+- [x] Exact face Translate/Rotate on retained concave planar solids with straight edges, including Boolean notches and through-holes; preserve ordered outer/inner loops and adjacent support planes, and reject boundary crossings. Limited to 4–256 planar faces and a bounded intersection check.
+- [ ] General face Translate/Rotate with curved neighbors and rigid curved/deformed face preservation; arbitrary topology-changing planar moves remain pending.
 - [ ] Arbitrary selected-edge chamfer/fillet, including concave edges and already edited solids. Original box edges now have edge-local treatment; Boolean-result/concave edges and exact general fillets remain pending.
 - [x] Multiple supported face/edge operation inputs across one or several source bodies, applied atomically in one undo step.
 - [ ] Optional tangent-chain propagation beyond the existing complete circular rim.
@@ -125,7 +126,9 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 
 - [x] Delete Face · Open on retained boundaries, planar Delete Face · Cap / Cap openings with nested loops, and convex-planar Delete Face · Heal with ordered history, rollback and persistence.
 - [x] Live planar Replace Face on convex planar solids and original circular/semicircular prism caps, with ordered source/reference picks, construction-plane references and mixed Boolean/replacement chains.
-- [ ] General curved/concave Replace Face and Delete Face · Heal; nonplanar opening closure.
+- [x] Replace Face on retained concave planar solids with straight boundaries, including notch and through-hole walls; preserve adjacent planes and live reference regeneration.
+- [x] Delete Face · Heal for complete internal pocket/bore wall sets, including blind floors and through-holes with analytic planar or curved walls; extend surviving support surfaces by removing complete inner trim loops.
+- [ ] General curved Replace Face, arbitrary concave/curved Delete Face · Heal and nonplanar opening closure.
 - [x] Exact inward Shell/thickness for source boxes (any of six planar openings), cylinders and semicylinders (either cap). Thickness/opening remain editable/removable with undo, serialization and export.
 - [x] Exact source-prism Draft for boxes, cylinders and semicylinders, with signed angle, top/bottom neutral cap, exact curved surfaces/corner trims, editable/removable history and export.
 - [x] Exact outward Shell for source boxes, cylinders and semicylinders; fixed cavity/opening, editable direction, semantic outer supports, cap editing, history and `.osk` persistence.
@@ -464,3 +467,37 @@ A negative sweep of a partial planar cap can share existing curved walls. For an
 Do not infer prism eligibility from endpoints alone. All vertices must lie on the two cap levels, planar sides must be axis-parallel, and spline/rational sides must prove constant homogeneous-control translation between those levels. Blind cuts, tapered/oblique/intermediate-section solids and unsupported surface families retain existing behavior. The `prismatic_reconstruction_requires_a_complete_parallel_through_cut` check protects these exclusions. New evaluated sweeps save `prismatic_cut: true` in `.osk` v30; missing/false preserves existing saved evaluation and output references. The shared-rim Imprint check covers through-subtraction of either half, four exports, persistence and a version downgrade rejection. General curved/concave inward trimming remains pending.
 
 Native macOS release review opened a cylinder cap partitioned by a same-radius semicircle rotated 17°, selected one independent cap region and entered −4 on the 3-unit cylinder. It produced the remaining half-cylinder promptly. Undo restored both cap regions; Redo restored the cut. Save persisted the −4 sweep, `tangent_walls: true`, `prismatic_cut: true`, and schema/modeling 30. The isolated app is `dist/OpenSketcher Shared Rim Imprint Review.app`; the saved review model is `/tmp/osk-shared-rim-imprint-review.osk`. This is macOS evidence only.
+
+### Concave planar face movement
+
+Move/Rotate on a planar face of a retained straight-edged solid now authors an exact retrim operation. Existing complete-cap translations retain their section-map path. For concave boundaries, the evaluator intersects incident support planes at each guarded vertex and rebuilds the original ordered kernel loops, including holes. It does not sort concave vertices around a centroid or assume all solid vertices lie behind every support plane. Adjacent planes stay fixed; their trimmed boundaries change together.
+
+The operation retains topology and requires one retained planar surface per guarded face. Collapsed edges, reversed faces, coincident unrelated vertices, boundary crossings and edge/face intersections are rejected. Checks are bounded to 2,000,000 edge/triangle pairs. More than 256 faces, topology-changing movement and general curved-neighbor reconstruction remain outside this path. An invalid edit leaves the committed model and undo stack unchanged. No new serialized property is required: this extends the existing explicit `retrim` operation; previously valid convex retrims keep their prior reconstruction path.
+
+`concave_planar_faces_retrim_with_loops_history_and_collision_rejection` covers notch and through-hole walls, translation and rotation, exact retained neighbors, kernel consistency, stable guarded topology, all four exports, save/load, undo/redo and a move crossing the outer wall. This is code-level verification; native gizmo review is separate.
+
+### Concave planar Replace Face
+
+Replace Face uses the same exact ordered-loop retrim as concave planar Move/Rotate when the entire source solid has straight-edged planar faces. The second selected face supplies a live support plane; its finite outline does not trim the replaced face. Reference normal direction is adjusted to retain the source orientation. All existing guarded reference, intersection, topology-preservation and operation-budget checks apply. A reference moved beyond a valid closed result is rejected atomically. Existing curved-prism cap replacement remains on its own analytic path. General curved replacement and concave Delete Face · Heal remain pending.
+
+The concave face regression also covers angled Replace Face on both notch and through-hole walls, subsequent reference movement, four export formats, persistence, undo/redo and invalid reference rollback. Native interaction review remains separate from these model checks.
+
+### Healing complete internal features
+
+Delete Face · Heal now handles complete internal pocket or bore walls on one connected closed retained boundary. The user selects every wall of the unwanted feature and its floor for a blind pocket. A continuous circular wall remains one modeling face; selection expands its kernel patches through the existing face groups. The evaluator removes those faces and the complete matching inner trim loops on surviving support faces. Outer boundary loops, unrelated holes and surviving analytic surfaces remain intact. This does not approximate a curved wall or fill a hole with a triangulated cap.
+
+Partial inner-loop selections, attempts to remove an outer support loop, empty results, open or geometrically inconsistent boundaries and disconnected source boundaries are rejected. Existing convex planar constraint healing retains its previous path. More general adjacent-face extension, external notch healing, disconnected/enclosed-void healing and nonplanar caps remain pending. The existing serialized Heal operation and topology guards are reused; no new property or dependency was added.
+
+`complete_pocket_and_bore_walls_heal_without_flattening_supports` checks rectangular and circular blind pockets and through-bores, preservation of a second unselected circular hole, original material volume and surviving face/ring counts, retained kernel consistency, four exports, save/load, undo/redo and rejection of incomplete wall selections without consuming history. Native tool interaction has not yet been reviewed for this path.
+
+Healing preserves each retained curve on its original support surface; it does not call Truck's `is_geometric_consistent` on intersection-generated trims, because the pinned kernel has an unimplemented `IncludeCurve<IntersectionCurve>` branch. Retained-loop construction, closed-boundary checks and solid orientation/volume validation still run. The two-hole regression exercises this intersection-curve case and confirms that only the selected hole disappears, while the other through-hole retains its inner trim loops. General CSG circle metadata is now restored from surviving input references and generating bore profiles using the shared retained-loop validator described below.
+
+### Circle inference after Boolean cuts
+
+Volume Union/Intersect/Subtract and internal-feature healing now share circle/ellipse inference validation against retained closed face wires and complete open-shell boundary loops. Exposed rims assembled across curved surface patches remain valid candidates. Input circle candidates are kept only when curve evaluations lie on that ellipse within 1e-6 world units and the closed loop winds once around its center. Equivalent parameter bases are deduplicated. Display-triangle proximity is no longer the retention criterion, so partial arcs and nearby offset rings cannot acquire a full-circle center/rim reference from that old tolerance.
+
+Circular bore profiles additionally supply projected circle/ellipse candidates on evaluated planar supports. This recovers actual entry and exit references after subsequent cuts, including after general kernel CSG discards transient metadata. Downstream cylinder-wall grouping and snapping reuse the restored references. Removed/healed circles are filtered out. CAD curves, solids, raw topology guards and the file schema are unchanged. These are numerically validated disposable inference references, not persistent semantic names or an exact symbolic conic-recognition proof. New general intersection conics without a generating input/profile reference remain outside this restoration path.
+
+Checks: `circle_metadata_requires_complete_retained_loops_and_deduplicates_bases` covers affine ellipses, rotated parameter bases, nearby offset candidates and semicircular rejection. The two-hole healing regression now requires four bore references before healing and exactly the surviving hole's two references afterward, in addition to preserving that hole's material and trims.
+
+Circle-inference verification: the full regression run passed 87 tests (2 manual timing checks ignored). The subsequent exposed-rim regression also passed. Native snapping review remains outstanding.

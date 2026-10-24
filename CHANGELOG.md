@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Restore surviving circle/ellipse inference after volume Booleans and subsequent circular bores. Validate complete retained trim loops, deduplicate references, reject partial/nearby rings, and keep snapping and cylinder-wall grouping after healing one of several holes.
+
+- Heal complete internal pocket and bore wall selections, including blind floors and through-holes, by restoring retained support surfaces and removing their inner trims. Preserve analytic boundaries and reject partial wall sets atomically.
+
+- Support live Replace Face references on concave planar solids, reusing exact ordered-loop reconstruction and collision rejection for Boolean notches and through-hole walls.
+
+- Extend exact face movement and rotation to retained concave planar solids, including Boolean notches and through-holes. Preserve boundary loops and neighbor planes; reject crossing edits without consuming undo history.
+
 - Accelerate point visibility, picking and snapping with a shared triangle index built on the geometry worker. Preserve occlusion/silhouette and coincident selection rules; reuse the index across camera/selection changes and clear it on New.
 
 - Reconstruct remaining cap material for proven straight-prism through-cuts, including imprinted half-cylinder regions sharing outer walls. Preserve analytic curves, tangent wall grouping, four exports and legacy replay through `.osk` v30 sweep intent.

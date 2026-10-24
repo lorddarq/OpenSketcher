@@ -680,6 +680,29 @@ fn resolved_extent(
     Ok((travel, end))
 }
 
+fn restore_profile_circles(profile: &Body, geometry: &mut Geometry) {
+    if profile.shape != Shape::Circle {
+        return;
+    }
+    let transform = crate::regions::transform(profile);
+    let center = transform.transform_point(Point3::new(0., 0., 0.));
+    let u = transform.transform_vector(Vector3::unit_x() * profile.width / 2.);
+    let v = transform.transform_vector(Vector3::unit_y() * profile.width / 2.);
+    let axis = transform.transform_vector(Vector3::unit_z()).normalize();
+    let candidates = (0..geometry.face_count)
+        .filter_map(|face| {
+            let plane = crate::snapping::Plane::face(geometry, face)?;
+            let projection = plane.projection_along(axis)?;
+            Some(crate::model::CircularEdge {
+                center: projection.transform_point(center),
+                u: projection.transform_vector(u),
+                v: projection.transform_vector(v),
+            })
+        })
+        .collect::<Vec<_>>();
+    geometry.retain_circles(&candidates);
+}
+
 pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), String> {
     let mut modified_targets = std::collections::HashSet::new();
     let mut profiles: Vec<_> = bodies.iter().filter(|b| b.bore.is_some()).collect();
@@ -732,6 +755,7 @@ pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(),
                     } else {
                         difference(target_geometry, &tool)?
                     };
+                    restore_profile_circles(&resolved, &mut scene[target_index].1);
                     scene[target_index].1.is_solid = true;
                     modified_targets.insert(target.id);
                     for id in &bore.through_targets {
@@ -749,6 +773,7 @@ pub fn apply_bores(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(),
                             }
                         }
                         scene[index].1=if let Some(g)=direct {g}else{difference(&scene[index].1,&tool).map_err(|e|format!("Through-all body {id}: {e}"))?};
+                        restore_profile_circles(&resolved,&mut scene[index].1);
                         scene[index].1.is_solid=true;modified_targets.insert(*id);
                     }
                 }
@@ -1025,6 +1050,11 @@ pub(crate) fn geometry(solid: &Solid) -> Result<Geometry, String> {
 }
 
 pub fn difference(target: &Geometry, tool: &Shell) -> Result<Geometry, String> {
+    let mut result = difference_geometry(target, tool)?;
+    result.retain_circles(&target.circles);
+    Ok(result)
+}
+fn difference_geometry(target: &Geometry, tool: &Shell) -> Result<Geometry, String> {
     if target.triangles.is_empty() {
         return Ok(target.clone());
     }

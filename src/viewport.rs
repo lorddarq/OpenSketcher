@@ -12,6 +12,11 @@ fn surface_normals(g: &Geometry) -> Vec<[Vector3; 3]> {
     let key = |face, p: Point3| (face, [p.x, p.y, p.z].map(|v| (v * 1e6).round() as i64));
     let mut sums = std::collections::HashMap::new();
     for (t, face) in g.triangles.iter().zip(&g.triangle_faces) {
+        // These faces use their analytic support below; their accumulated
+        // triangle normals would be calculated, stored and then discarded.
+        if g.cylinder_supports.get(*face).is_some_and(Option::is_some) {
+            continue;
+        }
         let normal = (t[1] - t[0]).cross(t[2] - t[0]);
         for p in t {
             *sums

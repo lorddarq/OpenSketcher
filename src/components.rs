@@ -315,6 +315,10 @@ fn transformed_many(
         let section_transform = !retrim
             && matches!(mode, SelectionMode::Face | SelectionMode::Edge)
             && crate::section_edits::translation(g, &selected, matrix)?.is_some();
+        let retrim = retrim
+            || (!section_transform
+                && mode == SelectionMode::Face
+                && straight_planar_supports(g).is_ok());
         result.component_edits.push(ComponentEdit {
             evaluated: true,
             retrim,
@@ -632,11 +636,10 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
     map_geometry(g, placement);
     Ok(())
 }
-// Convex planar boundaries admit exact neighbor extension/retrim. Curved or
-// concave geometry must not be flattened into this representation.
-pub(crate) fn convex_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
+// Extract planar supports without approximating curved/deformed faces.
+fn face_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
     if !g.is_solid || g.face_count > 256 || g.face_count < 4 {
-        return Err("Exact face retrim requires a convex planar solid (4–256 faces).".into());
+        return Err("Exact face retrim requires a planar solid (4–256 faces).".into());
     }
     let mut planes = Vec::new();
     for face in 0..g.face_count {
@@ -654,16 +657,29 @@ pub(crate) fn convex_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, Strin
             .iter()
             .flat_map(|t| t.iter())
             .any(|p| (n.dot(p.to_vec()) - d).abs() > 1e-6)
-            || g.points.iter().any(|p| n.dot(p.to_vec()) > d + 1e-6)
         {
-            return Err("Exact face retrim requires planar faces bounding a convex solid.".into());
+            return Err("Exact face retrim requires planar faces.".into());
         }
         planes.push((n, d));
     }
     Ok(planes)
 }
+pub(crate) fn convex_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
+    let planes = face_supports(g)?;
+    if planes
+        .iter()
+        .any(|(n, d)| g.points.iter().any(|p| n.dot(p.to_vec()) > d + 1e-6))
+    {
+        return Err("Operation requires a convex planar solid.".into());
+    }
+    Ok(planes)
+}
 pub(crate) fn planar_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
-    let planes = convex_supports(g)?;
+    convex_supports(g)?;
+    straight_planar_supports(g)
+}
+pub(crate) fn straight_planar_supports(g: &Geometry) -> Result<Vec<(Vector3, f64)>, String> {
+    let planes = face_supports(g)?;
     for (segment, group) in g.edges.iter().zip(&g.edge_groups) {
         let [a, b] = g.topology.edges[*group];
         let ab = g.points[b] - g.points[a];
@@ -682,7 +698,8 @@ pub(crate) fn retrim_faces(
     faces: &[usize],
     matrix: Matrix4,
 ) -> Result<Geometry, String> {
-    let mut planes = planar_supports(g)?;
+    let mut planes = straight_planar_supports(g)?;
+    let convex = convex_supports(g).is_ok();
     for face in faces {
         let t = g
             .triangles
@@ -749,7 +766,7 @@ pub(crate) fn retrim_faces(
         if incident
             .iter()
             .any(|f| (planes[*f].0.dot(p.to_vec()) - planes[*f].1).abs() > 1e-6)
-            || planes.iter().any(|(n, d)| n.dot(p.to_vec()) > *d + 1e-6)
+            || (convex && planes.iter().any(|(n, d)| n.dot(p.to_vec()) > *d + 1e-6))
         {
             return Err("Face retrim consumes a face or changes corner connectivity; reduce the movement/rotation.".into());
         }
@@ -772,41 +789,103 @@ pub(crate) fn retrim_faces(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut shell = Shell::default();
-    for (face, (normal, _)) in planes.iter().enumerate() {
-        let mut indices = crate::components::vertices(g, SelectionMode::Face, Some(face));
-        let center =
-            indices.iter().map(|i| points[*i].to_vec()).sum::<Vector3>() / indices.len() as f64;
-        let u = (points[indices[0]].to_vec() - center).normalize();
-        let v = normal.cross(u);
-        indices.sort_by(|a, b| {
-            let a = points[*a].to_vec() - center;
-            let b = points[*b].to_vec() - center;
-            a.dot(v)
-                .atan2(a.dot(u))
-                .total_cmp(&b.dot(v).atan2(b.dot(u)))
-        });
-        let wire: Wire = (0..indices.len())
-            .map(|i| {
-                let a = indices[i];
-                let b = indices[(i + 1) % indices.len()];
-                let edge = g.topology.faces[face]
-                    .iter()
-                    .find(|e| {
-                        let pair = g.topology.edges[**e];
-                        pair == [a, b] || pair == [b, a]
-                    })
-                    .ok_or("Face retrim changes boundary connectivity.")?;
-                Ok(if g.topology.edges[*edge] == [a, b] {
-                    edges[*edge].clone()
-                } else {
-                    edges[*edge].inverse()
+    if !convex {
+        // Preserve concave outlines and hole winding from the retained BRep.
+        // Sorting all vertices around a centroid loses both of these.
+        let source = g
+            .shell
+            .as_ref()
+            .ok_or("Concave face retrim requires a retained boundary.")?;
+        let roles = g.surface_mapping()?;
+        if source.len() != g.face_count
+            || roles
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != g.face_count
+        {
+            return Err(
+                "Concave face retrim requires one planar support per retained face.".into(),
+            );
+        }
+        for face in 0..g.face_count {
+            let source = &source[roles
+                .iter()
+                .position(|role| *role == face)
+                .ok_or("Missing support face.")?];
+            let wires = source
+                .boundaries()
+                .iter()
+                .map(|wire| {
+                    wire.iter()
+                        .map(|old| {
+                            let vertex = |p: Point3| {
+                                g.points
+                                    .iter()
+                                    .position(|v| (*v - p).magnitude() < 1e-7)
+                                    .ok_or("Missing boundary vertex.")
+                            };
+                            let a = vertex(old.front().point())?;
+                            let b = vertex(old.back().point())?;
+                            let index = g.topology.faces[face]
+                                .iter()
+                                .find(|e| {
+                                    let pair = g.topology.edges[**e];
+                                    pair == [a, b] || pair == [b, a]
+                                })
+                                .ok_or("Missing boundary edge.")?;
+                            Ok(if g.topology.edges[*index] == [a, b] {
+                                edges[*index].clone()
+                            } else {
+                                edges[*index].inverse()
+                            })
+                        })
+                        .collect::<Result<Wire, &str>>()
                 })
-            })
-            .collect::<Result<Wire, &str>>()?;
-        shell.push(
-            builder::try_attach_plane(&[wire])
-                .map_err(|e| format!("Cannot retrim planar face: {e}"))?,
-        );
+                .collect::<Result<Vec<_>, _>>()?;
+            shell.push(
+                builder::try_attach_plane(&wires)
+                    .map_err(|e| format!("Cannot retrim concave face: {e}"))?,
+            );
+        }
+    } else {
+        for (face, (normal, _)) in planes.iter().enumerate() {
+            let mut indices = crate::components::vertices(g, SelectionMode::Face, Some(face));
+            let center =
+                indices.iter().map(|i| points[*i].to_vec()).sum::<Vector3>() / indices.len() as f64;
+            let u = (points[indices[0]].to_vec() - center).normalize();
+            let v = normal.cross(u);
+            indices.sort_by(|a, b| {
+                let a = points[*a].to_vec() - center;
+                let b = points[*b].to_vec() - center;
+                a.dot(v)
+                    .atan2(a.dot(u))
+                    .total_cmp(&b.dot(v).atan2(b.dot(u)))
+            });
+            let wire: Wire = (0..indices.len())
+                .map(|i| {
+                    let a = indices[i];
+                    let b = indices[(i + 1) % indices.len()];
+                    let edge = g.topology.faces[face]
+                        .iter()
+                        .find(|e| {
+                            let pair = g.topology.edges[**e];
+                            pair == [a, b] || pair == [b, a]
+                        })
+                        .ok_or("Face retrim changes boundary connectivity.")?;
+                    Ok(if g.topology.edges[*edge] == [a, b] {
+                        edges[*edge].clone()
+                    } else {
+                        edges[*edge].inverse()
+                    })
+                })
+                .collect::<Result<Wire, &str>>()?;
+            shell.push(
+                builder::try_attach_plane(&[wire])
+                    .map_err(|e| format!("Cannot retrim planar face: {e}"))?,
+            );
+        }
     }
     solid_parts(&shell)?;
     let mut result = crate::model::tessellate(&shell)?;
@@ -822,7 +901,111 @@ pub(crate) fn retrim_faces(
         .collect();
     result.edge_groups = (0..result.edge_count).collect();
     result.is_solid = true;
+    if !convex {
+        for (triangle, face) in result.triangles.iter().zip(&result.triangle_faces) {
+            if (triangle[1] - triangle[0])
+                .cross(triangle[2] - triangle[0])
+                .dot(planes[*face].0)
+                <= 0.
+            {
+                return Err(
+                    "Face retrim reverses a boundary; reduce the movement/rotation.".into(),
+                );
+            }
+        }
+        validate_retrim_intersections(&result)?;
+    }
     Ok(result)
+}
+
+// Connectivity alone cannot detect a concave wall crossing another wall.
+// Check straight boundaries and their intersections with triangulated planar faces.
+fn validate_retrim_intersections(g: &Geometry) -> Result<(), String> {
+    const EPS: f64 = 1e-7;
+    let invalid = "Face retrim crosses or touches another boundary; reduce the movement/rotation.";
+    if g.edges.len().saturating_mul(g.triangles.len()) > 2_000_000 {
+        return Err("Planar retrim exceeds its boundary-intersection budget.".into());
+    }
+    for (i, a) in g.points.iter().enumerate() {
+        if g.points
+            .iter()
+            .skip(i + 1)
+            .any(|b| (*a - *b).magnitude() < EPS)
+        {
+            return Err(invalid.into());
+        }
+    }
+    for (i, [a, b]) in g.topology.edges.iter().copied().enumerate() {
+        let p = g.points[a];
+        let ab = g.points[b] - p;
+        for [c, d] in g.topology.edges.iter().copied().skip(i + 1) {
+            let q = g.points[c];
+            let cd = g.points[d] - q;
+            let cross = ab.cross(cd);
+            let det = cross.magnitude2();
+            let shared = [a, b].iter().any(|v| [c, d].contains(v));
+            if det > 1e-20 * ab.magnitude2() * cd.magnitude2() {
+                let t = (q - p).cross(cd).dot(cross) / det;
+                let u = (q - p).cross(ab).dot(cross) / det;
+                if (-EPS..=1. + EPS).contains(&t)
+                    && (-EPS..=1. + EPS).contains(&u)
+                    && (p + ab * t - q - cd * u).magnitude() < EPS
+                    && !shared
+                {
+                    return Err(invalid.into());
+                }
+            } else if (q - p).cross(ab).magnitude() < EPS * ab.magnitude() {
+                let first = (q - p).dot(ab) / ab.magnitude2();
+                let last = (q + cd - p).dot(ab) / ab.magnitude2();
+                let overlap = first.max(last).min(1.) - first.min(last).max(0.);
+                if overlap * ab.magnitude() > EPS || (overlap >= -EPS && !shared) {
+                    return Err(invalid.into());
+                }
+            }
+        }
+        for (triangle, face) in g.triangles.iter().zip(&g.triangle_faces) {
+            if g.topology.faces[*face].contains(&i) {
+                continue;
+            }
+            let [x, y, z] = *triangle;
+            let u = y - x;
+            let v = z - x;
+            let normal = u.cross(v);
+            let normal_length = normal.magnitude();
+            if normal_length < 1e-16 {
+                continue;
+            }
+            let denominator = ab.dot(normal);
+            let inside = |point: Point3, strict: bool| {
+                let delta = point - x;
+                let alpha = delta.cross(v).dot(normal) / normal.magnitude2();
+                let beta = u.cross(delta).dot(normal) / normal.magnitude2();
+                let margin = if strict { 1e-8 } else { -1e-8 };
+                alpha > margin && beta > margin && alpha + beta < 1. - margin
+            };
+            if denominator.abs() > 1e-12 * normal_length * ab.magnitude() {
+                let t = (x - p).dot(normal) / denominator;
+                if (-EPS..=1. + EPS).contains(&t) {
+                    let hit = p + ab * t;
+                    let shared = g.topology.faces[*face].iter().any(|edge| {
+                        g.topology.edges[*edge]
+                            .iter()
+                            .any(|vertex| (g.points[*vertex] - hit).magnitude() < EPS)
+                    });
+                    if !shared && inside(hit, false) {
+                        return Err(invalid.into());
+                    }
+                }
+            } else if (p - x).dot(normal).abs() < EPS * normal_length
+                && [p, p + ab * 0.5, p + ab]
+                    .iter()
+                    .any(|point| inside(*point, true))
+            {
+                return Err(invalid.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn map_geometry(g: &mut Geometry, matrix: Matrix4) {
@@ -1465,6 +1648,156 @@ mod tests {
             body
         );
     }
+    #[test]
+    fn concave_planar_faces_retrim_with_loops_history_and_collision_rejection() {
+        use crate::booleans::{Boolean, Kind};
+        for hole in [false, true] {
+            let mut a = Body::new(Shape::Rectangle);
+            a.id = 1;
+            a.width = 6.;
+            a.depth = 6.;
+            a.extrusion = 3.;
+            let mut b = Body::new(Shape::Rectangle);
+            b.id = 2;
+            b.width = if hole { 2. } else { 4. };
+            b.depth = 2.;
+            b.extrusion = 3.;
+            b.position[0] = if hole { 0. } else { 2. };
+            let mut bodies = vec![a, b];
+            let scene = evaluate_scene(&bodies).unwrap();
+            let mut difference = Body::new(Shape::Rectangle);
+            difference.id = 3;
+            difference.boolean = Some(Boolean::new(
+                Kind::Subtract,
+                &[(1, None), (2, None)],
+                SelectionMode::Volume,
+                &scene,
+            ));
+            bodies.push(difference.clone());
+            let scene = evaluate_scene(&bodies).unwrap();
+            let g = &scene[2].1;
+            assert!(convex_supports(g).is_err());
+            let face = (0..g.face_count)
+                .find(|face| {
+                    crate::snapping::Plane::face(g, *face).is_some_and(|p| {
+                        p.normal.x > 0.99 && (p.origin.x - if hole { -1. } else { 0. }).abs() < 1e-6
+                    })
+                })
+                .unwrap();
+            let pivot = pivot(g, SelectionMode::Face, Some(face)).unwrap();
+            for matrix in [
+                Matrix4::from_translation(Vector3::unit_x() * 0.3),
+                Matrix4::from_translation(pivot.to_vec())
+                    * Matrix4::from_angle_z(Deg(7.))
+                    * Matrix4::from_translation(-pivot.to_vec()),
+            ] {
+                let changed =
+                    transformed(&difference, g, SelectionMode::Face, Some(face), matrix).unwrap();
+                assert!(changed.component_edits.last().unwrap().retrim);
+                let mut model = Model::from_bodies(bodies.clone());
+                model.commit(changed.clone()).unwrap();
+                let out = evaluate_scene(&model.bodies).unwrap();
+                let out = &out[2].1;
+                assert!(out.shell.as_ref().unwrap().is_geometric_consistent());
+                assert_eq!(out.topology, g.topology);
+                let before = straight_planar_supports(g).unwrap();
+                let after = straight_planar_supports(out).unwrap();
+                for (i, ((n, d), (new_n, new_d))) in before.iter().zip(&after).enumerate() {
+                    if i != face {
+                        assert!((*n - *new_n).magnitude() < 1e-6 && (*d - *new_d).abs() < 1e-6);
+                    }
+                }
+                for format in crate::export::Format::ALL {
+                    assert!(
+                        !crate::export::encode(&model.bodies, format)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("concave.osk");
+                Project::new(model.bodies.clone(), Camera::default(), true, Some(3))
+                    .save(&path)
+                    .unwrap();
+                assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+                model.undo();
+                assert_eq!(model.bodies, bodies);
+                model.redo();
+                assert_eq!(model.bodies[2], changed);
+            }
+            // Replace Face follows the same retained-loop reconstruction with
+            // a live support reference, rather than flattening a Boolean result.
+            let mut reference = Body::new(Shape::Rectangle);
+            reference.id = 4;
+            reference.construction = true;
+            reference.rotation = [0., 90., 7.];
+            reference.position[0] = if hole { -0.7 } else { 0.3 };
+            let mut replaced = bodies.clone();
+            replaced.push(reference);
+            let scene = evaluate_scene(&replaced).unwrap();
+            let mut feature = Body::new(Shape::Rectangle);
+            feature.id = 5;
+            feature.boolean = Some(Boolean::new(
+                Kind::ReplaceFace,
+                &[(3, Some(face)), (4, Some(0))],
+                SelectionMode::Face,
+                &scene,
+            ));
+            replaced.push(feature);
+            let mut model = Model::from_bodies(replaced);
+            for shift in [0., 0.2] {
+                if shift != 0. {
+                    let mut reference = model.bodies[3].clone();
+                    reference.position[0] += shift;
+                    model.commit(reference).unwrap();
+                }
+                let out = evaluate_scene(&model.bodies).unwrap();
+                let target = crate::snapping::Plane::face(&out[3].1, 0).unwrap();
+                let cap = crate::snapping::Plane::face(&out[4].1, face).unwrap();
+                assert!((cap.origin - target.origin).dot(target.normal).abs() < 1e-6);
+                assert!(cap.normal.dot(target.normal).abs() > 1. - 1e-7);
+                assert_eq!(out[4].1.topology, g.topology);
+                assert!(out[4].1.shell.as_ref().unwrap().is_geometric_consistent());
+                for format in crate::export::Format::ALL {
+                    assert!(
+                        !crate::export::encode(&model.bodies, format)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("concave-replace.osk");
+                Project::new(model.bodies.clone(), Camera::default(), true, Some(5))
+                    .save(&path)
+                    .unwrap();
+                assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+            }
+            model.undo();
+            assert_eq!(model.bodies[3].position[0], if hole { -0.7 } else { 0.3 });
+            model.redo();
+            assert!(
+                (model.bodies[3].position[0] - (if hole { -0.7 } else { 0.3 }) - 0.2).abs() < 1e-8
+            );
+            let before = model.bodies.clone();
+            let mut invalid_reference = model.bodies[3].clone();
+            invalid_reference.position[0] = -5.;
+            assert!(model.commit(invalid_reference).is_err());
+            assert_eq!(model.bodies, before);
+            let crossing = transformed(
+                &difference,
+                g,
+                SelectionMode::Face,
+                Some(face),
+                Matrix4::from_translation(-Vector3::unit_x() * 4.),
+            )
+            .unwrap();
+            let mut model = Model::from_bodies(bodies.clone());
+            assert!(model.commit(crossing).is_err());
+            assert_eq!(model.bodies, bodies);
+            assert!(!model.can_undo());
+        }
+    }
+
     #[test]
     fn convex_planar_face_moves_retrim_neighbors_and_preserve_exact_history() {
         use crate::edge_treatments::{FaceTarget, Kind, Modifier};

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use truck_meshalgo::tessellation::MeshableShape;
 use truck_modeling::{
-    EuclideanSpace, InnerSpace, Point3, Rad, Shell, Solid, Transform, Vector3, Wire, builder,
+    BoundedCurve, EuclideanSpace, InnerSpace, ParametricCurve, Point3, Rad, Shell, Solid,
+    Transform, Vector3, Wire, builder,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,6 +204,78 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// Disposable inference metadata: require a complete retained trim loop,
+    /// never just proximity to the tessellated display edges.
+    pub(crate) fn retain_circles(&mut self, candidates: &[CircularEdge]) {
+        let Some(shell) = &self.shell else {
+            self.circles.clear();
+            return;
+        };
+        let loops: Vec<_> = shell
+            .iter()
+            .flat_map(|face| face.boundaries())
+            .chain(shell.extract_boundaries())
+            .collect();
+        let mut retained = Vec::<CircularEdge>::new();
+        for ring in self.circles.iter().chain(candidates) {
+            let uu = ring.u.dot(ring.u);
+            let uv = ring.u.dot(ring.v);
+            let vv = ring.v.dot(ring.v);
+            let det = uu * vv - uv * uv;
+            if det <= 1e-20 {
+                continue;
+            }
+            let duplicate = retained.iter().any(|old| {
+                (old.center - ring.center).magnitude() < 1e-6
+                    && (0..3).all(|i| {
+                        (0..3).all(|j| {
+                            let a = old.u[i] * old.u[j] + old.v[i] * old.v[j];
+                            let b = ring.u[i] * ring.u[j] + ring.v[i] * ring.v[j];
+                            (a - b).abs() < 1e-8 * (1. + a.abs().max(b.abs()))
+                        })
+                    })
+            });
+            if duplicate {
+                continue;
+            }
+            let matches = loops.iter().any(|wire| {
+                if !wire.is_closed() {
+                    return false;
+                }
+                let mut previous: Option<[f64; 2]> = None;
+                let mut winding = 0.;
+                for edge in wire {
+                    let curve = edge.oriented_curve();
+                    let (lo, hi) = curve.range_tuple();
+                    for n in 0..=16 {
+                        let p = curve.subs(lo + (hi - lo) * n as f64 / 16.);
+                        let delta = p - ring.center;
+                        let a = (delta.dot(ring.u) * vv - delta.dot(ring.v) * uv) / det;
+                        let b = (delta.dot(ring.v) * uu - delta.dot(ring.u) * uv) / det;
+                        let radius = a.hypot(b);
+                        if radius < 1e-12
+                            || (delta - ring.u * (a / radius) - ring.v * (b / radius)).magnitude()
+                                > 1e-6
+                        {
+                            return false;
+                        }
+                        let current = [a / radius, b / radius];
+                        if let Some(last) = previous {
+                            winding += (last[0] * current[1] - last[1] * current[0])
+                                .atan2(last[0] * current[0] + last[1] * current[1]);
+                        }
+                        previous = Some(current);
+                    }
+                }
+                (winding.abs() - std::f64::consts::TAU).abs() < 1e-5
+            });
+            if matches {
+                retained.push(ring.clone());
+            }
+        }
+        self.circles = retained;
+    }
+
     pub fn face_group(&self, face: usize) -> usize {
         self.face_groups.get(face).copied().unwrap_or(face)
     }
@@ -1148,6 +1221,44 @@ mod tests {
             assert_eq!(model.bodies, before);
         }
     }
+    #[test]
+    fn circle_metadata_requires_complete_retained_loops_and_deduplicates_bases() {
+        let mut body = Body::new(Shape::Circle);
+        body.width = 4.;
+        body.extrusion = 3.;
+        body.rotation = [17., 23., 31.];
+        body.position = [2., -3., 1.];
+        body.scale = [2., 0.5, 1.2];
+        let mut g = evaluate(&body).unwrap();
+        let rings = g.circles.clone();
+        assert_eq!(rings.len(), 2);
+        let mut candidates = rings.clone();
+        for ring in &rings {
+            candidates.push(CircularEdge {
+                center: ring.center,
+                u: (ring.u + ring.v) * std::f64::consts::FRAC_1_SQRT_2,
+                v: (ring.v - ring.u) * std::f64::consts::FRAC_1_SQRT_2,
+            });
+            candidates.push(CircularEdge {
+                center: ring.center + ring.u.normalize() * 0.001,
+                ..ring.clone()
+            });
+        }
+        g.circles.clear();
+        g.retain_circles(&candidates);
+        assert_eq!(g.circles.len(), 2);
+        for (a, b) in g.circles.iter().zip(&rings) {
+            assert!((a.center - b.center).magnitude() < 1e-8);
+        }
+        body.shape = Shape::Semicircle;
+        let mut half = evaluate(&body).unwrap();
+        half.retain_circles(&rings);
+        assert!(
+            half.circles.is_empty(),
+            "A partial arc and its diameter cannot provide a complete circle snap reference"
+        );
+    }
+
     #[test]
     fn base_cache_reuses_unchanged_bodies_and_invalidates_profile_dependencies() {
         cache_scene(&[], &[]);

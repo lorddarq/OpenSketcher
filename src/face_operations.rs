@@ -100,7 +100,11 @@ pub fn selected(
 
 pub(crate) fn apply(g: &Geometry, selected: &[usize], kind: FaceEdit) -> Result<Geometry, String> {
     if kind == FaceEdit::Heal {
-        return crate::edge_treatments::heal_planar_faces(g, selected);
+        return if crate::components::planar_supports(g).is_ok() {
+            crate::edge_treatments::heal_planar_faces(g, selected)
+        } else {
+            heal_internal_walls(g, selected)
+        };
     }
     let source = g
         .shell
@@ -146,23 +150,80 @@ pub(crate) fn apply(g: &Geometry, selected: &[usize], kind: FaceEdit) -> Result<
     crate::edge_treatments::merge_surfaces(&mut result, &roles);
     result.is_solid =
         shell.extract_boundaries().is_empty() && crate::components::solid_parts(&shell).is_ok();
-    // Snap references are disposable: keep only complete rings on surviving edges.
-    result.circles = g
-        .circles
+    result.retain_circles(&g.circles);
+    Ok(result)
+}
+
+/// Heal a complete internal pocket/bore by removing its trim loops from the
+/// surviving supports. No approximation or new surface is needed.
+fn heal_internal_walls(g: &Geometry, selected: &[usize]) -> Result<Geometry, String> {
+    let source = g
+        .shell
+        .as_ref()
+        .ok_or("Heal requires retained boundaries.")?;
+    if !g.is_solid || source.connected_components().len() != 1 {
+        return Err("Internal-wall healing requires one connected closed boundary.".into());
+    }
+    let mapping = g.surface_mapping()?;
+    let removed: std::collections::HashSet<_> = source
         .iter()
-        .filter(|ring| {
-            (0..32).all(|i| {
-                let angle = std::f64::consts::TAU * i as f64 / 32.;
-                let p = ring.center + ring.u * angle.cos() + ring.v * angle.sin();
-                result.edges.iter().any(|[a, b]| {
-                    let ab = *b - *a;
-                    let t = ((p - *a).dot(ab) / ab.magnitude2()).clamp(0., 1.);
-                    (p - (*a + ab * t)).magnitude2() < 0.0004
-                })
-            })
-        })
-        .cloned()
+        .zip(mapping)
+        .filter(|(_, role)| selected.contains(role))
+        .flat_map(|(face, _)| face.edge_iter().map(|e| e.id()))
         .collect();
+    let mut shell = Shell::default();
+    let mut roles = Vec::new();
+    let mut healed = 0;
+    for (face, role) in source.iter().zip(mapping) {
+        if selected.contains(role) {
+            continue;
+        }
+        let mut wires = Vec::new();
+        for (index, wire) in face.boundaries().into_iter().enumerate() {
+            let count = wire
+                .iter()
+                .filter(|edge| removed.contains(&edge.id()))
+                .count();
+            if count == 0 {
+                wires.push(wire);
+                continue;
+            }
+            if count != wire.len() {
+                return Err(
+                    "Select the complete pocket/bore wall set, including its floor when present."
+                        .into(),
+                );
+            }
+            if index == 0 {
+                return Err(
+                    "Heal cannot remove an outer support boundary; select complete internal walls."
+                        .into(),
+                );
+            }
+            healed += 1;
+        }
+        if wires.is_empty() {
+            return Err("No support remains to heal.".into());
+        }
+        let rebuilt = truck_modeling::Face::try_new(wires, face.oriented_surface())
+            .map_err(|e| format!("Cannot heal the retained support: {e}"))?;
+        roles.push(*role);
+        shell.push(rebuilt);
+    }
+    if healed == 0 || shell.is_empty() {
+        return Err("Selected faces do not bound a complete internal pocket or bore.".into());
+    }
+    // Every retained curve is unchanged on its original support. Truck's
+    // include-curve consistency check panics for IntersectionCurve, so do not
+    // re-test that invariant via the unsupported API. Check closure and solids.
+    if !shell.extract_boundaries().is_empty() {
+        return Err("The selected walls do not heal to a closed consistent solid.".into());
+    }
+    crate::components::solid_parts(&shell)?;
+    let mut result = crate::model::tessellate(&shell)?;
+    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    result.is_solid = true;
+    result.retain_circles(&g.circles);
     Ok(result)
 }
 
@@ -378,7 +439,7 @@ pub(crate) fn replace(
     if !source.is_solid || source.shell.is_none() {
         return Err("Replace Face requires a closed source solid with a retained boundary.".into());
     }
-    if crate::components::planar_supports(source).is_ok() {
+    if crate::components::straight_planar_supports(source).is_ok() {
         let normal = if plane.normal.dot(target.normal) < 0. {
             -target.normal
         } else {
@@ -1606,6 +1667,142 @@ mod tests {
         assert_eq!(model.bodies, committed);
     }
     #[test]
+    fn complete_pocket_and_bore_walls_heal_without_flattening_supports() {
+        use crate::operators::{Bore, BoreMode};
+        for shape in [Shape::Rectangle, Shape::Circle] {
+            for through in [false, true] {
+                let mut base = Body::new(shape);
+                base.id = 1;
+                base.width = 6.;
+                base.depth = 6.;
+                base.extrusion = 3.;
+                let mut tool = Body::new(shape);
+                tool.id = 2;
+                tool.width = 2.;
+                tool.depth = 2.;
+                tool.position[2] = 3.;
+                let mut bore = Bore::new(&base, FaceTarget::Top).unwrap();
+                bore.mode = BoreMode::Borer;
+                bore.travel = if through { -4. } else { -2. };
+                tool.bore = Some(bore);
+                let bodies = vec![base.clone(), tool];
+                let scene = evaluate_scene(&bodies).unwrap();
+                let g = &scene[0].1;
+                let inner = (0..g.face_count)
+                    .filter(|face| {
+                        let vertices =
+                            crate::components::vertices(g, SelectionMode::Face, Some(*face));
+                        !vertices.is_empty()
+                            && vertices.iter().all(|i| {
+                                g.points[*i].x.abs() <= 1.000001 && g.points[*i].y.abs() <= 1.000001
+                            })
+                    })
+                    .map(|face| (1, Some(g.face_group(face))))
+                    .collect::<Vec<_>>();
+                assert!(!inner.is_empty());
+                let healed = selected(&bodies, &scene, &inner, FaceEdit::Heal)
+                    .unwrap()
+                    .remove(0);
+                let mut model = Model::from_bodies(bodies.clone());
+                model.commit(healed.clone()).unwrap();
+                let out = evaluate_scene(&model.bodies).unwrap();
+                let out = &out[0].1;
+                assert!(out.is_solid && out.shell.as_ref().unwrap().is_geometric_consistent());
+                let original = evaluate(&base).unwrap();
+                assert!((volume(out) - volume(&original)).abs() < 0.03);
+                assert_eq!(out.face_count, original.face_count);
+                assert_eq!(out.circles.len(), original.circles.len());
+                for format in crate::export::Format::ALL {
+                    assert!(
+                        !crate::export::encode(&model.bodies, format)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let file = tempfile::NamedTempFile::new().unwrap();
+                Project::new(model.bodies.clone(), Camera::default(), true, Some(1))
+                    .save(file.path())
+                    .unwrap();
+                assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+                model.undo();
+                assert_eq!(model.bodies, bodies);
+                model.redo();
+                assert_eq!(model.bodies[0], healed);
+                if shape == Shape::Rectangle || !through {
+                    let partial = selected(&bodies, &scene, &inner[..1], FaceEdit::Heal)
+                        .unwrap()
+                        .remove(0);
+                    let mut unchanged = Model::from_bodies(bodies.clone());
+                    assert!(unchanged.commit(partial).is_err());
+                    assert_eq!(unchanged.bodies, bodies);
+                    assert!(!unchanged.can_undo());
+                }
+            }
+        }
+        // Healing one of two holes must preserve the other hole and its trims.
+        let mut base = Body::new(Shape::Rectangle);
+        base.id = 1;
+        base.width = 6.;
+        base.depth = 6.;
+        base.extrusion = 3.;
+        let mut bodies = vec![base];
+        for (id, x) in [(2, -1.5), (3, 1.5)] {
+            let mut tool = Body::new(Shape::Circle);
+            tool.id = id;
+            tool.width = 1.;
+            tool.position = [x, 0., 3.];
+            let mut bore = Bore::new(&bodies[0], FaceTarget::Top).unwrap();
+            bore.mode = BoreMode::Borer;
+            bore.travel = -4.;
+            tool.bore = Some(bore);
+            bodies.push(tool);
+        }
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[0].1;
+        assert_eq!(
+            g.circles.len(),
+            4,
+            "Both bores retain entry and exit circle references"
+        );
+        let inner = (0..g.face_count)
+            .filter(|face| {
+                let vertices = crate::components::vertices(g, SelectionMode::Face, Some(*face));
+                !vertices.is_empty()
+                    && vertices.iter().all(|i| {
+                        (g.points[*i].x + 1.5).abs() <= 0.500001 && g.points[*i].y.abs() <= 0.500001
+                    })
+            })
+            .map(|face| (1, Some(g.face_group(face))))
+            .collect::<Vec<_>>();
+        assert!(!inner.is_empty());
+        let changed = selected(&bodies, &scene, &inner, FaceEdit::Heal)
+            .unwrap()
+            .remove(0);
+        bodies[0] = changed;
+        let out = evaluate_scene(&bodies).unwrap();
+        let healed = &out[0].1;
+        assert!((volume(healed) - (108. - std::f64::consts::PI * 0.75)).abs() < 0.03);
+        assert_eq!(
+            healed
+                .shell
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|face| face.boundaries().len() - 1)
+                .sum::<usize>(),
+            2,
+            "The other through-hole keeps its top and bottom inner loops"
+        );
+        assert_eq!(healed.circles.len(), 2);
+        assert!(
+            healed
+                .circles
+                .iter()
+                .all(|ring| (ring.center.x - 1.5).abs() < 1e-7)
+        );
+    }
+
+    #[test]
     fn delete_open_cap_and_heal_keep_ordered_history_and_exact_boundaries() {
         for shape in [Shape::Rectangle, Shape::Circle, Shape::Semicircle] {
             let mut body = Body::new(shape);
@@ -1627,6 +1824,13 @@ mod tests {
                 .unwrap()
                 .remove(0);
             let open = evaluate(&opened).unwrap();
+            if shape == Shape::Circle {
+                assert_eq!(
+                    open.circles.len(),
+                    scene[0].1.circles.len(),
+                    "An exposed open rim remains a circular inference target"
+                );
+            }
             assert!(!open.is_solid);
             assert_eq!(open.face_count, scene[0].1.face_count - 1);
             assert!(!open.shell.as_ref().unwrap().extract_boundaries().is_empty());
