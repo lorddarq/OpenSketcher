@@ -433,6 +433,7 @@ pub fn selected_operations(
                     body.component_edits.push(crate::components::ComponentEdit {
                         evaluated: true,
                         retrim: false,
+                        convex_rebuild: false,
                         section_transform: false,
                         sweep: None,
                         tangent_walls: false,

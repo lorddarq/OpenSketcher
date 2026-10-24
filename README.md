@@ -45,6 +45,8 @@ Checked items are implemented; platform runtime verification is tracked separate
 - [ ] General trimmed/deformed-face supports and uneven exit handling.
 - [x] Editable/removable face Chamfer: all six rectangular-solid faces and top/bottom rims of cylinders and semicircular extrusions.
 - [x] Evaluated inward/outward Shell for convex planar chamfered, Boolean and moved solids, with editable openings, closed cavities and exact retained walls.
+- [x] Draft selected evaluated planar walls, including concave notches, holes and pockets, with editable absolute angle, neutral input face or live construction plane and exact retained geometry.
+- [x] Convex planar face Move/Rotate can rebuild corner topology and consume redundant faces, with guarded history and a return to volume selection.
 - [x] Editable/removable Bevel with user-selected rounded or flat style; circular rims can also be selected in Edge mode.
 - [x] Exact local prism-corner chamfers and analytic rounded/flat bevels on evaluated geometry, including inner/outer notch and rectangular-hole corners.
 - [x] Parametric modifier distances/radii, semantic source-face references, `.osk` persistence, and undo/redo for add/edit/remove.
@@ -351,3 +353,13 @@ Point overlays, picking and snapping use a shared spatial triangle index, built 
 
 
 Evaluated Shell: select a planar face on supported convex geometry and choose **Shell**. The owner inspector exposes wall thickness, direction, closure, the source opening face and removal. This appends after existing operations and persists in `.osk` v36. Geometry with 4–64 planar supports is supported; general concave/curved shelling remains pending.
+
+Face-mode **Draft faces** tilts selected planar walls about their intersection with an editable neutral input face. Angle is absolute: zero makes walls perpendicular; positive widens on the negative side of the oriented neutral plane. Changes apply automatically and support Remove and undo. Convex v37 histories retain their original replay; new `.osk` v38 operations also preserve concave notches, rectangular through-holes and pocket loops. Touching or consuming edits reject without changing the committed model. Curved Draft and concave topology-changing support consumption remain pending.
+
+Use **Draft using plane** or choose a construction plane in the Draft neutral selector to keep its position/orientation live (`.osk` v39). Planes may be created after the solid. Moving or rotating one regenerates its dependents; remove or rebind Draft before deleting its reference. Construction planes remain excluded from exports.
+
+Convex planar face movement now rebuilds incompatible chamfer corners and redundant supports (`.osk` v40). Existing topology-preserving edits retain their path. If component topology changes, the editor returns to volume selection so old face/edge slots cannot silently select different geometry. General concave topology changes and curved-neighbor edits remain pending.
+
+New convex Draft operations can remove redundant chamfer faces or caps while retaining valid closed material (`.osk` v41). Earlier Draft histories keep their original rejection rules; recreate the operation to use the new evaluator. Source treatments remain in history and restore on Undo or removal.
+
+Interactive evaluated edits and bore travel/mode changes now reuse their unchanged source BRep/tessellation. Source parameters and resolved profile partitions still invalidate the cache, and late operators/reference guards always replay. A two-thread release diagnostic measured 118 ms warm versus 219 ms forced cold for 12 rounded-cylinder cap edits; this measures geometry evaluation, not total frame time. See the [CPU investigation](docs/performance/cpu-investigation-2026-10-24.md).

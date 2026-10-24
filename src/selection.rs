@@ -33,6 +33,24 @@ impl SelectionMode {
 
 pub type Pick = (u64, Option<usize>);
 
+/// Component slots cannot be reused safely after their owner's topology changes.
+pub fn topology_changed(
+    picks: &[Pick],
+    before: &[(u64, Geometry)],
+    after: &[(u64, Geometry)],
+) -> bool {
+    picks.iter().any(|(id, element)| {
+        element.is_some()
+            && match (
+                before.iter().find(|p| p.0 == *id),
+                after.iter().find(|p| p.0 == *id),
+            ) {
+                (Some((_, a)), Some((_, b))) => a.topology != b.topology,
+                _ => true,
+            }
+    })
+}
+
 /// Normal click replaces; Shift-click toggles. Shift-clicking empty space preserves selection.
 pub fn extend(input: &egui::InputState) -> bool {
     // Shift may be released before this frame is painted; use the click event's modifiers.

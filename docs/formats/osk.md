@@ -1,6 +1,6 @@
 # OpenSketcher project format (.osk)
 
-Schema version: 36. Modeling semantics version: 36.
+Schema version: 41. Modeling semantics version: 41.
 
 An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. The extension is specific to OpenSketcher; the encoding is documented and does not encrypt the scene. The native project stores authored parameters, not only viewport triangles. Truck reevaluates the parameters to restore editable geometry.
 
@@ -9,8 +9,8 @@ An `.osk` file is a UTF-8 JSON document identified by `format: "OpenSketcher"`. 
 | Field | Meaning |
 | --- | --- |
 | `format` | Required `OpenSketcher` identifier. |
-| `schema_version` | File layout version; currently 36. Versions 1–35 migrate on load. |
-| `modeling_version` | Evaluation semantics version; currently 36. |
+| `schema_version` | File layout version; currently 41. Versions 1–40 migrate on load. |
+| `modeling_version` | Evaluation semantics version; currently 41. |
 | `bodies` | Ordered scene objects with stable nonzero IDs. |
 | `camera` | Orthographic preset/free-view label, yaw, pitch, span, and target. Angles are radians; span is the visible vertical extent. |
 | `snapping` | Master geometry/grid snapping switch. |
@@ -46,7 +46,7 @@ Current limits are 16 MiB per document, 1,000 objects, and one million evaluated
 
 Write a complete temporary file beside the destination, synchronize its contents, then atomically replace the target with `tempfile::NamedTempFile::persist`. On write/replacement failure, preserve the last valid destination and keep the project dirty. This avoids partial-file overwrites; it is not an autosave, backup, or guarantee against every filesystem/power-loss scenario.
 
-Schema and modeling versions 1–36 are supported. Older documents migrate to schema/modeling version 36 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 36; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
+Schema and modeling versions 1–41 are supported. Older documents migrate to schema/modeling version 41 in memory, defaulting missing `component_edits` to an empty list and drawing preferences to their defaults. Existing profiles from modeling versions 2–3 receive `cuts_profiles: true`, preserving their automatic partitioning. Version 1 retains independent geometry with cutting flags false. New profiles default to `cuts_profiles: false`, and `drawing.cut_on_creation` remains false until explicitly enabled. Modeling version 1 retains independent geometry; its component selection resets to Volume for compatibility. Version 2 component selections remain intact. The existing file is not rewritten until Save. New saves use schema/modeling version 41; nonempty component edits cannot be saved under versions earlier than 3. Unsupported versions are rejected without changing the open scene. Keep the format identifier and both version fields when writing a project.
 
 Component slots refer to faces, unique topology edges, or unique topology vertices in this model evaluation, never GPU triangles or sampled curve vertices. Validate slot bounds against regenerated geometry. They are selection state, not feature dependencies or a general solution to persistent topological naming. Component transforms retain slots while source connectivity is unchanged. Undo/redo keeps component selection when its slot remains valid; future dependent CAD face operations still require semantic references.
 
@@ -92,7 +92,7 @@ Version 5 allowed at most six perimeter entries, one per source face. Version 9 
 
 Replay reconstructs the source solid and applies all stored modifiers; pose is applied afterwards. Circular rims are built by revolving an authored radial section with lines or quarter-circle arcs. Other convex profile treatments use clipping and grouped transition surfaces. Render subdivisions and revolution patch seams are excluded from selectable topology; the base face and transition band remain separate surfaces. Exports consume the same evaluated result; current STEP output is still faceted.
 
-Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 36 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
+Schema/modeling versions earlier than 5 reject nonempty modifiers. Legacy files migrate to version 41 with an empty list, preserving existing geometry and cutting semantics. Add/edit/remove and style changes use the existing body-level undo history.
 
 ## Multiple selection (schema/modeling version 5)
 
@@ -132,7 +132,7 @@ Rejected property drafts and contextual evaluation errors are transient. `.osk` 
 
 ### Version 10: sweep termination extents
 
-Current writers use schema/modeling version 36. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
+Current writers use schema/modeling version 41. `bore.extent` is a tagged object: `{ "type": "distance" }` (default), `{ "type": "through_all" }`, `{ "type": "up_to_next", "target": 2 }`, or `{ "type": "up_to_face", "target": 2, "face": "bottom" }`. End-body references must precede the profile ID, preventing cycles. Through all includes `bore.target` and optional version 21 scope IDs; end targets in other modes are termination references, not additional cutting targets. Missing extents preserve Distance behavior; earlier version declarations reject automatic extents. `travel` retains manual distance and supplies direction in automatic modes. A zero manual value defaults outward for New body and inward for boring modes. Resolved distance is regenerated from dependencies and not serialized.
 
 ### Evaluated planar face extrusion (version 11)
 
@@ -311,4 +311,49 @@ Shell offsets the input's retained convex planar supports (4–64 planes) and su
 
 Consolidate cavity triangles into retained planar regions before subtraction, then preserve one face per connected region and canonicalize the output solid. Subsequent topology-preserving planar face edits can address inner and outer faces. Concave/curved inputs, consumed cavities, missing openings and invalid boundaries reject transactionally. Source `hollow` definitions keep their existing evaluation; an evaluated Shell is appended after prior component edits rather than inserted before them.
 
-Non-null Shell face edits require schema/modeling version 36. Versions 1–35 migrate without adding a shell. Current writers use version 36; older version declarations containing this variant reject explicitly.
+Non-null Shell face edits require schema/modeling version 36. Versions 1–35 migrate without adding a shell. Current writers use version 41; older version declarations containing this variant reject explicitly.
+
+
+## Version 37: evaluated planar Draft
+
+Evaluated Draft uses an existing evaluated Face `component_edits` entry: `face_edit: {"draft": {"degrees": 3.0, "neutral": 0}}`. `element` and `elements` identify the walls; `neutral` is a distinct zero-based face slot in the guarded **pre-draft** input topology. The transform is identity. Store operator inputs, not evaluated mesh snapshots. Source `taper` remains unchanged and keeps its v15 semantics.
+
+For retained convex straight-edged planar solids with 4–64 supports, rotate selected wall supports about their original intersection lines with the neutral support. Degrees is an **absolute** angle relative to perpendicular to that support, within ±80 degrees. Positive widens away from the neutral plane toward the solid's interior; negative narrows; zero makes selected walls perpendicular, even if they were already drafted. Distances and angles are evaluated in owner-local space before object scaling. Untouched support planes and the neutral trace remain fixed. Reconstruct exact retained planar faces and canonicalize output for later guarded edits.
+
+Reject nonfinite/out-of-range angles, missing or selected neutral slots, parallel wall/neutral planes, consumed supports, invalid solid reconstruction and unsupported curved/concave geometry. A failed live edit retains last accepted geometry/history. New Draft payloads require both version fields ≥37; versions 1–36 migrate without adding operations. Current writers use version 41.
+
+
+## Version 38: loop-preserving evaluated Draft
+
+New evaluated Draft payloads also store `planar_loops: true`, for example `face_edit: {"draft": {"degrees": 5.0, "neutral": 0, "planar_loops": true}}`. This enables straight-edged planar input with 4–256 supports, including concave Boolean notches, through-holes and blind pockets. Missing/false retains the original v37 convex-only evaluator, with its existing plane reconstruction and output ordering. This flag requires both version fields ≥38; it is not inferred while migrating older files.
+
+Convex inputs with at most 64 supports continue to use convex support reconstruction. Other enabled planar inputs reuse the existing ordered-loop retrimming solver: preserve shared vertices/edges and outer/inner boundary winding, solve intersections of the replacement support planes, and reject collapsed/reversed/crossing loops or incompatible multi-plane corners. If a logical face consists of multiple retained planar patches, consolidate those patches into one connected face before solving. The requested face and neutral slots still refer to the guarded original input. Canonicalize the final retained boundary for downstream guarded edits. The boundary-intersection safety budget remains two million edge/triangle pairs.
+
+Angles remain owner-local and absolute relative to the oriented neutral plane. Positive expands material on the negative side of that plane; on the other side the same signed slope contracts it. This matters when choosing an internal pocket floor or a reference whose extension crosses a concave body. Untouched support planes remain fixed, but their trim loops rebuild. General curved Draft, support-consuming topology changes and construction-plane neutral references remain pending.
+
+
+## Version 39: live construction-plane Draft neutral references
+
+Evaluated Draft optionally stores `neutral_plane: 9` beside `degrees`, `neutral` and `planar_loops`. The ID identifies an authored construction plane; it is not a snapshot of a normal, origin or display mesh. Missing/null preserves the existing input-face neutral semantics. While non-null, the stored `neutral` face slot is inactive. An external reference may therefore be used even when that inactive slot is missing or belongs to the selected wall set. Switching back to a source face chooses an explicit valid input-face slot. Non-null plane IDs require schema/modeling version 39; zero IDs reject. Older files migrate without adding a reference.
+
+Resolve the plane from the complete authored body list on every evaluated component replay, for source and Boolean owners. Transform its XY support into owner-local space using `inverse(owner) * reference`, derive its oriented normal from the transformed X/Y tangents and ignore its finite drawing dimensions. The neutral support is infinite. Plane translation/rotation and normal reversal remain live; positive in-plane sizing does not change the support. Preserve absolute-angle and signed-side semantics from v38.
+
+Construction planes cannot own modelling operations, so they may precede or follow the referencing solid without creating dependency cycles. Reject a removed reference or an ID belonging to ordinary geometry rather than silently rebinding to a face. Scene validation blocks deletion or conversion of a referenced plane while keeping the committed scene/history intact. Remove the Draft operation or choose another neutral reference before deleting that plane. Evaluation/export/save use the complete scene; standalone evaluation of a body with an external reference reports that the plane is missing. Construction references continue to be excluded from exported geometry.
+
+
+## Version 40: topology-changing convex face transforms
+
+New Face Move/Rotate component edits on convex straight-edged planar input with at most 64 supports store `convex_rebuild: true`, alongside `evaluated: true`, `retrim: true`, the selected face slots, guarded input topology and owner-local affine matrix. Missing/false preserves the original corner-connectivity solver. True requires an evaluated Face retrim operation and schema/modeling versions ≥40; other combinations reject.
+
+First attempt the existing topology-preserving retrim. If it fails on eligible convex input, transform the selected support planes and rebuild the intersection of the complete half-space set. This can split incompatible multi-plane corners, change edges/vertices and omit planes that become redundant. Consolidate actual retained planar support faces and canonicalize the output boundary for downstream guarded replay. Original source treatments remain in history; a later transform may temporarily consume their faces. Empty/invalid results reject atomically. Existing concave and curved movement paths remain unchanged; general semantic naming across changing topology is not implied.
+
+Component slots refer to the guarded input. Preview selection highlighting is hidden when those slots no longer match the output topology. After a committed transform or history change alters a selected component owner's topology, return the selection to its volume; never reuse an old face/edge/point slot as a different component. The user can then explicitly select a surviving output face for another operation.
+
+
+## Version 41: convex Draft support consumption
+
+New evaluated Draft operations on convex straight-edged planar input with at most 64 supports reuse the component entry's existing `convex_rebuild: true` field. The `face_edit.draft` payload remains unchanged. In v41, this flag may accompany an evaluated Face Draft with identity matrix and `retrim: false`; its v40 Face Move/Rotate use remains unchanged. Flagged Draft requires schema/modeling versions ≥41, while flagged Move/Rotate still requires ≥40. Missing/false retains the earlier Draft face-count rejection. Recreate an older Draft operation to opt into this new evaluator rather than silently upgrading saved histories.
+
+The convex half-space reconstruction already rebuilds corner incidence. The new intent additionally permits redundant supports to disappear from the retained solid: a shrinking wall can consume a chamfer band or even the original opposite cap while leaving valid closed material. Keep the authored source/treatment inputs and the input neutral reference in history. The output remains the intersection of the drafted and unchanged oriented support planes; it is not a deformation of the old display mesh. Verify retained material closure before committing. Concave/curved Draft and unsupported partitioned supports do not gain topology-changing reconstruction from this flag.
+
+Draft actions select their owning volume, and the inspector uses guarded pre-Draft neutral slots. Later output-face edits must be explicitly selected and retain their own input topology guards; changing the Draft so those guards no longer match rejects atomically. Existing undo/redo/removal and live construction-plane neutral semantics remain intact.

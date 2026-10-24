@@ -384,6 +384,58 @@ impl OpenSketcher {
             Err(error) => self.error = Some(error),
         }
     }
+    fn apply_draft(&mut self, neutral_plane: Option<u64>) {
+        let result = (|| {
+            let id = self
+                .selection
+                .first()
+                .ok_or("Select planar walls to draft.")?
+                .0;
+            if self.selection_mode != SelectionMode::Face
+                || self.selection.iter().any(|p| p.0 != id || p.1.is_none())
+            {
+                return Err("Select planar walls on one body to draft.".to_owned());
+            }
+            if let Some(id) = neutral_plane {
+                return Ok(drafting::EvaluatedDraft {
+                    degrees: 3.,
+                    neutral: 0,
+                    planar_loops: true,
+                    neutral_plane: Some(id),
+                });
+            }
+            let body = self
+                .model
+                .bodies
+                .iter()
+                .find(|b| b.id == id)
+                .ok_or("Body no longer exists.")?;
+            let mut local = self
+                .committed_scene
+                .iter()
+                .find(|g| g.0 == id)
+                .ok_or("Geometry no longer exists.")?
+                .1
+                .clone();
+            use truck_modeling::SquareMatrix;
+            components::map_geometry(
+                &mut local,
+                regions::transform(body)
+                    .invert()
+                    .ok_or("Invalid source placement.")?,
+            );
+            let faces = self
+                .selection
+                .iter()
+                .filter_map(|p| p.1)
+                .collect::<Vec<_>>();
+            drafting::EvaluatedDraft::new(&local, &faces)
+        })();
+        match result {
+            Ok(operation) => self.apply_face_operation(face_operations::FaceEdit::Draft(operation)),
+            Err(error) => self.error = Some(error),
+        }
+    }
     fn apply_shell(&mut self) {
         let result = (|| {
             if self.selection_mode != SelectionMode::Face || self.selection.len() != 1 {
@@ -494,15 +546,25 @@ impl OpenSketcher {
                     self.error = None;
                     if let evaluation::Change::Preview(bodies) = &update.change {
                         if self.transform.is_some() {
+                            let changed = selection::topology_changed(
+                                &self.selection,
+                                &self.committed_scene,
+                                &update.scene,
+                            );
                             self.viewport.update_scene(
                                 bodies,
                                 update.scene,
                                 update.display,
-                                &self.selection,
+                                if changed { &[] } else { &self.selection },
                                 self.selection_mode,
                             );
                         }
                     } else {
+                        let topology_changed = selection::topology_changed(
+                            &self.selection,
+                            &self.committed_scene,
+                            &update.scene,
+                        );
                         self.model = update.model;
                         self.committed_scene = update.scene;
                         self.committed_display = update.display;
@@ -561,10 +623,15 @@ impl OpenSketcher {
                                 evaluation::Change::Delete(_) => self.select(None),
                                 evaluation::Change::History(_)
                                 | evaluation::Change::Transform(_) => {
+                                    if topology_changed {
+                                        self.selection_mode = SelectionMode::Volume;
+                                    }
                                     let picks = self
                                         .selection
                                         .iter()
-                                        .copied()
+                                        .map(|&(id, element)| {
+                                            (id, if topology_changed { None } else { element })
+                                        })
                                         .filter(|p| {
                                             selection::valid(
                                                 *p,
@@ -1052,10 +1119,37 @@ fn shell_controls(
     finished
 }
 
-fn evaluated_component_properties(ui: &mut egui::Ui, body: &mut Body) -> bool {
+fn evaluated_component_properties(ui: &mut egui::Ui, body: &mut Body, references: &[Body]) -> bool {
     let mut finished = false;
     let mut remove = None;
     for (index, edit) in body.component_edits.iter_mut().enumerate() {
+        if let Some(face_operations::FaceEdit::Draft(operation)) = &mut edit.face_edit {
+            ui.push_id(("evaluated_draft", index), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Draft · {} faces", edit.elements.len() + 1));
+                    if ui.small_button("Remove").clicked() { remove = Some(index); }
+                });
+                finished |= scalar(ui, "Angle · degrees", &mut operation.degrees, -80. ..=80.);
+                egui::ComboBox::from_id_salt("evaluated_draft_neutral")
+                    .selected_text(match operation.neutral_plane {
+                        Some(id)=>references.iter().find(|b|b.id==id).map_or_else(||format!("Missing plane {id}"),Body::label),
+                        None=>format!("Neutral · source Face {}",operation.neutral+1),
+                    })
+                    .show_ui(ui, |ui| {
+                        for face in 0..edit.topology.faces.len() {
+                            if face != edit.element && !edit.elements.contains(&face)
+                                && ui.selectable_label(operation.neutral_plane.is_none() && operation.neutral==face,format!("Face {}",face+1)).clicked() {
+                                operation.neutral=face;operation.neutral_plane=None;finished=true;
+                            }
+                        }
+                        for plane in references.iter().filter(|b|b.construction) {
+                            finished |= ui.selectable_value(&mut operation.neutral_plane,Some(plane.id),plane.label()).changed();
+                        }
+                    });
+                ui.weak("Neutral intersection stays fixed. Zero makes walls perpendicular; reverse the angle to reverse the taper.");
+            });
+            continue;
+        }
         if let Some(face_operations::FaceEdit::Shell(operation)) = &mut edit.face_edit {
             ui.push_id(("evaluated_shell", index), |ui| {
                 ui.horizontal(|ui| {
@@ -1529,10 +1623,17 @@ impl eframe::App for OpenSketcher {
                     ui.weak("Choose Move or Rotate and drag the gizmo to edit this component. Adjacent boundaries rebuild together.");
                     self.offset_face_properties(ui);
                     if matches!(self.selection_mode,SelectionMode::Face|SelectionMode::Edge) && !self.selection.is_empty() {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Chamfer").clicked() { self.apply_edge_treatment(edge_treatments::Kind::Chamfer); }
                             if ui.button("Bevel").clicked() { self.apply_edge_treatment(edge_treatments::Kind::Bevel); }
                             if self.selection_mode==SelectionMode::Face && self.selection.len()==1 && ui.button("Shell").clicked() {self.apply_shell();}
+                            if self.selection_mode==SelectionMode::Face && ui.button("Draft faces").clicked() {self.apply_draft(None);}
+                            if self.selection_mode==SelectionMode::Face {
+                                let planes=self.model.bodies.iter().filter(|b|b.construction).map(|b|(b.id,b.label())).collect::<Vec<_>>();
+                                if !planes.is_empty() {ui.menu_button("Draft using plane",|ui|{
+                                    for (id,label) in planes {if ui.button(label).clicked(){self.apply_draft(Some(id));ui.close();}}
+                                });}
+                            }
                         });
                         ui.weak("Shift-select faces or edges. Box edges are treated individually; circular rims use their full perimeter. One action creates one undo step.");
                     }
@@ -1592,7 +1693,7 @@ impl eframe::App for OpenSketcher {
                     if !replacing {ui.checkbox(&mut operation.keep_tools,"Keep tools");}
                     if ui.button("Swap operands").clicked() {operation.operands.swap(0,1);operation.topology.swap(0,1);}
                     let operation_changed=body!=before;
-                    let finished=evaluated_component_properties(ui,&mut body);
+                    let finished=evaluated_component_properties(ui,&mut body,&self.model.bodies);
                     if body!=before {self.request_change(evaluation::Change::Edit(Box::new(body.clone()),!operation_changed));}
                     if finished {self.finish_model_edit();}
                     if ui.button(if replacing {"Remove replacement / restore source"}else if imprinting {"Remove imprint / restore inputs"}else{"Remove Boolean / restore inputs"}).clicked() {self.request_change(evaluation::Change::Delete(vec![body.id]));}
@@ -1676,7 +1777,7 @@ impl eframe::App for OpenSketcher {
                     }
                     if !draft.component_edits.is_empty() {
                         ui.label(format!("Component edits: {}",draft.component_edits.len()));
-                        finished |= evaluated_component_properties(ui,&mut draft);
+                        finished |= evaluated_component_properties(ui,&mut draft,&self.model.bodies);
                         ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
                         if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
                         ui.label("Source profile parameters");

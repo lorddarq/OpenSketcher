@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Reuse source BRep/tessellation across evaluated component edits and bore travel/mode changes by keying bases only on source-stage inputs. Preserve full validation, dependency replay and source/profile invalidation; add cold/warm equivalence and timing coverage.
+
+- Permit newly authored convex Draft to consume redundant chamfer/support faces and retain a valid closed material cell. Reuse convex reconstruction and history intent, preserving earlier Draft replay through `.osk` v41.
+
+- Rebuild convex planar face Move/Rotate operations when corner topology changes or supports become redundant. Preserve legacy replay through `.osk` v40 intent and reset stale component selection after topology changes.
+
+- Add live construction-plane neutral references for evaluated Draft. Resolve authored plane transforms during scene replay, regenerate on plane movement/rotation, validate dependencies and persist IDs in `.osk` v39.
+
+- Extend evaluated Draft to concave planar notches, through-holes and blind pockets. Reuse ordered-loop trimming, preserve cap holes and untouched supports, and retain v37 replay through explicit `.osk` v38 intent.
+
+- Draft selected evaluated convex planar walls after chamfers, Booleans and face edits. Preserve the neutral intersection and untouched supports; expose absolute signed angle, input neutral face and removal, with `.osk` v37 history.
+
 ## v0.2.1 — 2026-10-24
 
 - Shell evaluated convex planar solids after chamfers, Booleans and face edits. Add editable inward/outward thickness, source-face openings and closed cavities; retain exact inner/outer faces and ordered `.osk` v36 history.

@@ -599,7 +599,8 @@ impl Geometry {
 pub fn evaluate(body: &Body) -> Result<Geometry, String> {
     body.validate()?;
     let mut geometry = build_checked(body, None)?;
-    crate::components::apply_evaluated(body, &mut geometry).map_err(|e| body.error(e))?;
+    crate::components::apply_evaluated(body, &mut geometry, std::slice::from_ref(body))
+        .map_err(|e| body.error(e))?;
     geometry.group_cylinder_patches();
     Ok(geometry)
 }
@@ -687,11 +688,15 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
                 return Ok((body.id, Geometry::default()));
             }
             let loops = crate::regions::boundaries(body, bodies).map_err(|e| body.error(e))?;
+            // Bores and evaluated edits run after construction; keep only source-stage inputs.
+            let mut base_body = body.clone();
+            base_body.component_edits.retain(|edit| !edit.evaluated);
+            base_body.bore = None;
             let cached = BASE_CACHE.with(|cache| {
                 cache
                     .borrow()
                     .iter()
-                    .find(|base| base.body == *body && base.loops == loops)
+                    .find(|base| base.body == base_body && base.loops == loops)
                     .map(|base| base.geometry.clone())
             });
             let geometry = match cached {
@@ -699,7 +704,7 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
                 None => build_checked(body, loops.clone())?,
             };
             bases.push(BaseGeometry {
-                body: body.clone(),
+                body: base_body,
                 loops,
                 geometry: geometry.clone(),
             });
@@ -709,7 +714,8 @@ fn build_scene(bodies: &[Body]) -> Result<Vec<(u64, Geometry)>, String> {
     crate::operators::apply_bores(bodies, &mut scene)?;
     for (body, (_, geometry)) in bodies.iter().zip(&mut scene) {
         if body.boolean.is_none() {
-            crate::components::apply_evaluated(body, geometry).map_err(|e| body.error(e))?;
+            crate::components::apply_evaluated(body, geometry, bodies)
+                .map_err(|e| body.error(e))?;
         }
     }
     crate::booleans::apply(bodies, &mut scene)?;
@@ -1327,6 +1333,244 @@ mod tests {
         assert!(evaluate_scene(&[invalid]).is_err());
         assert!(evaluate_scene(&[]).unwrap().is_empty());
         BASE_CACHE.with(|cache| assert!(cache.borrow().is_empty()));
+    }
+
+    #[test]
+    fn evaluated_component_edits_reuse_base_without_skipping_validation() {
+        use crate::{
+            components,
+            edge_treatments::{FaceTarget, Kind, Modifier},
+            selection::SelectionMode,
+        };
+        use truck_modeling::{InnerSpace, Matrix4, Vector3};
+        cache_scene(&[], &[]);
+        let mut source = Body::new(Shape::Circle);
+        source.id = 1;
+        source.width = 10.;
+        source.extrusion = 3.;
+        let mut bevel = Modifier::new(Kind::Bevel, FaceTarget::Top, &source);
+        bevel.amount = 0.2;
+        source.edge_treatments.push(bevel);
+        let scene = evaluate_scene(&[source.clone()]).unwrap();
+        let geometry = &scene[0].1;
+        let face = (0..geometry.face_count)
+            .find(|f| crate::edge_treatments::target(&source, geometry, *f) == Ok(FaceTarget::Top))
+            .unwrap();
+        let base_id =
+            || BASE_CACHE.with(|cache| cache.borrow()[0].geometry.shell.as_ref().unwrap()[0].id());
+        let initial = base_id();
+        let candidates = (1..=12)
+            .map(|i| components::sweep_face(&source, geometry, face, i as f64 * 0.03).unwrap())
+            .collect::<Vec<_>>();
+        let mut model = Model::from_bodies(vec![source.clone()]);
+        let mut ids = Vec::new();
+        let mut outputs = Vec::new();
+        let mut warm = std::time::Duration::ZERO;
+        for candidate in &candidates {
+            let start = std::time::Instant::now();
+            model.edit(candidate.clone()).unwrap();
+            let output = evaluate_scene(&model.bodies).unwrap();
+            warm += start.elapsed();
+            assert!(output[0].1.is_solid);
+            crate::components::solid_parts(output[0].1.shell.as_ref().unwrap()).unwrap();
+            outputs.push(output);
+            ids.push(base_id());
+        }
+        let mut invalid = candidates.last().unwrap().clone();
+        invalid
+            .component_edits
+            .last_mut()
+            .unwrap()
+            .topology
+            .faces
+            .clear();
+        let accepted = model.bodies.clone();
+        assert!(model.edit(invalid).is_err());
+        assert_eq!(
+            model.bodies, accepted,
+            "A base hit must not bypass the component topology guard"
+        );
+        let same_points = |a: &Geometry, b: &Geometry| {
+            let points = |g: &Geometry| {
+                let mut points = g
+                    .triangles
+                    .iter()
+                    .flat_map(|t| t.iter())
+                    .map(|p| [p.x, p.y, p.z].map(|n| (n * 1e9).round() as i64))
+                    .collect::<Vec<_>>();
+                points.sort_unstable();
+                points
+            };
+            assert_eq!(a.topology, b.topology);
+            assert_eq!(points(a), points(b));
+        };
+        let mut cold = std::time::Duration::ZERO;
+        let mut cold_model = Model::from_bodies(vec![source.clone()]);
+        for (candidate, output) in candidates.iter().zip(&outputs) {
+            BASE_CACHE.with(|c| c.borrow_mut().clear());
+            SCENE_CACHE.with(|c| *c.borrow_mut() = None);
+            let start = std::time::Instant::now();
+            cold_model.edit(candidate.clone()).unwrap();
+            let geometry = evaluate_scene(&cold_model.bodies).unwrap();
+            cold += start.elapsed();
+            same_points(&output[0].1, &geometry[0].1);
+        }
+        eprintln!(
+            "component base cache: 12 evaluated circular-cap edits warm={warm:?}, cold={cold:?}; reused={}/12",
+            ids.iter().filter(|id| **id == initial).count()
+        );
+        assert!(
+            ids.iter().all(|id| *id == initial),
+            "Changing only evaluated edit parameters must retain the primitive kernel base"
+        );
+        // Source dimensions still invalidate the key.
+        let previous = base_id();
+        let mut resized = candidates.last().unwrap().clone();
+        resized.width += 0.1;
+        evaluate_scene(&[resized]).unwrap();
+        assert_ne!(base_id(), previous);
+        // A legacy source edit belongs to the base and must remain in its key.
+        let mut cube = Body::new(Shape::Rectangle);
+        cube.id = 1;
+        cube.extrusion = 3.;
+        let initial = evaluate_scene(&[cube.clone()]).unwrap();
+        let previous = base_id();
+        let mut shifted = components::transform_selection(
+            &[cube.clone()],
+            &initial,
+            SelectionMode::Point,
+            &(0..initial[0].1.points.len())
+                .map(|p| (1, Some(p)))
+                .collect::<Vec<_>>(),
+            Matrix4::from_translation(Vector3::unit_x() * 0.1),
+        )
+        .unwrap()
+        .remove(0);
+        shifted.component_edits.last_mut().unwrap().evaluated = false;
+        let shifted_scene = evaluate_scene(&[shifted.clone()]).unwrap();
+        assert_ne!(base_id(), previous);
+        assert!(
+            (shifted_scene[0].1.points[0] - initial[0].1.points[0] - Vector3::unit_x() * 0.1)
+                .magnitude()
+                < 1e-7
+        );
+        let previous = base_id();
+        let face = (0..shifted_scene[0].1.face_count)
+            .find(|f| {
+                crate::snapping::Plane::face(&shifted_scene[0].1, *f)
+                    .is_some_and(|p| p.normal.z > 0.99)
+            })
+            .unwrap();
+        let edited = components::sweep_face(&shifted, &shifted_scene[0].1, face, 0.2).unwrap();
+        let result = evaluate_scene(std::slice::from_ref(&edited)).unwrap();
+        assert_eq!(base_id(), previous);
+        assert!(result[0].1.points.iter().any(|p| (p.z - 3.2).abs() < 1e-7));
+        BASE_CACHE.with(|cache| {
+            assert_eq!(
+                cache.borrow()[0]
+                    .body
+                    .component_edits
+                    .iter()
+                    .filter(|e| !e.evaluated)
+                    .count(),
+                1
+            )
+        });
+        // A saved late edit must replay against a fresh base identically.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cached-component.osk");
+        crate::project::Project::new(
+            vec![edited.clone()],
+            crate::viewport::Camera::default(),
+            true,
+            Some(1),
+        )
+        .save(&path)
+        .unwrap();
+        cache_scene(&[], &[]);
+        assert_eq!(
+            crate::project::Project::load(&path).unwrap().bodies,
+            vec![edited]
+        );
+        // Bore travel/mode also run after profile-base construction.
+        cache_scene(&[], &[]);
+        let mut target = Body::new(Shape::Circle);
+        target.id = 1;
+        target.width = 4.;
+        target.extrusion = 3.;
+        let mut profile = Body::new(Shape::Circle);
+        profile.id = 2;
+        profile.width = 2.;
+        profile.position[2] = 3.;
+        profile.bore = Some(crate::operators::Bore::new(&target, FaceTarget::Top).unwrap());
+        evaluate_scene(&[target.clone(), profile.clone()]).unwrap();
+        let profile_id = || {
+            BASE_CACHE.with(|c| {
+                c.borrow()
+                    .iter()
+                    .find(|b| b.body.id == 2)
+                    .unwrap()
+                    .geometry
+                    .shell
+                    .as_ref()
+                    .unwrap()[0]
+                    .id()
+            })
+        };
+        let initial = profile_id();
+        for travel in [0.5, 1., 2.] {
+            profile.bore.as_mut().unwrap().travel = travel;
+            let scene = evaluate_scene(&[target.clone(), profile.clone()]).unwrap();
+            assert!(
+                scene[1]
+                    .1
+                    .points
+                    .iter()
+                    .any(|p| (p.z - 3. - travel).abs() < 1e-7)
+            );
+            assert_eq!(
+                profile_id(),
+                initial,
+                "Bore travel must reuse the authored profile base"
+            );
+        }
+        profile.bore.as_mut().unwrap().mode = crate::operators::BoreMode::GeneratorAndBorer;
+        profile.bore.as_mut().unwrap().travel = -4.;
+        let scene = evaluate_scene(&[target.clone(), profile.clone()]).unwrap();
+        assert_eq!(profile_id(), initial);
+        assert!(scene[0].1.is_solid && scene[1].1.is_solid);
+        for (_, g) in &scene {
+            crate::components::solid_parts(g.shell.as_ref().unwrap()).unwrap();
+        }
+        assert!(
+            scene[1]
+                .1
+                .points
+                .iter()
+                .all(|p| p.z >= -1. - 1e-7 && p.z <= 1e-7)
+        );
+        profile.bore.as_mut().unwrap().travel = f64::NAN;
+        assert!(evaluate_scene(&[target, profile]).is_err());
+        if let Some(path) = std::env::var_os("OSK_COMPONENT_CACHE_REVIEW_PROJECT") {
+            let bodies = vec![candidates[0].clone()];
+            let scene = evaluate_scene(&bodies).unwrap();
+            let face = (0..scene[0].1.face_count)
+                .find(|f| {
+                    crate::snapping::Plane::face(&scene[0].1, *f)
+                        .is_some_and(|p| p.normal.z > 0.99 && (p.origin.z - 3.03).abs() < 1e-6)
+                })
+                .unwrap();
+            let mut project = crate::project::Project::new(
+                bodies,
+                crate::viewport::Camera::default(),
+                true,
+                Some(1),
+            );
+            project.selection_mode = SelectionMode::Face;
+            project.selected_element = Some(face);
+            project.selection = vec![(1, Some(face))];
+            project.save(std::path::Path::new(&path)).unwrap();
+        }
     }
 
     #[test]

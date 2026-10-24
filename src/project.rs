@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 36,
-            modeling_version: 36,
+            schema_version: 41,
+            modeling_version: 41,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,31 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=36) || !matches!(self.modeling_version, 1..=36) {
+        if !matches!(self.schema_version, 1..=41) || !matches!(self.modeling_version, 1..=41) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–36 and modeling versions 1–36."
+                "Unsupported .osk version. This application supports schema versions 1–41 and modeling versions 1–41."
                     .into(),
             );
+        }
+        if (self.schema_version < 39 || self.modeling_version < 39)
+            && self.bodies.iter().any(|b| b.component_edits.iter().any(|e| matches!(e.face_edit, Some(crate::face_operations::FaceEdit::Draft(operation)) if operation.neutral_plane.is_some()))) {
+            return Err("Construction-plane Draft references require .osk version 39.".into());
+        }
+        if (self.schema_version < 38 || self.modeling_version < 38)
+            && self.bodies.iter().any(|b| b.component_edits.iter().any(|e| matches!(e.face_edit, Some(crate::face_operations::FaceEdit::Draft(operation)) if operation.planar_loops))) {
+            return Err("Loop-preserving planar drafts require .osk version 38.".into());
+        }
+        if (self.schema_version < 37 || self.modeling_version < 37)
+            && self.bodies.iter().any(|b| {
+                b.component_edits.iter().any(|e| {
+                    matches!(
+                        e.face_edit,
+                        Some(crate::face_operations::FaceEdit::Draft(_))
+                    )
+                })
+            })
+        {
+            return Err("Evaluated planar drafts require .osk version 37.".into());
         }
         if (self.schema_version < 36 || self.modeling_version < 36)
             && self.bodies.iter().any(|b| {
@@ -345,6 +365,32 @@ impl Project {
         {
             return Err("Analytic prism Booleans require .osk version 31.".into());
         }
+        if (self.schema_version < 40 || self.modeling_version < 40)
+            && self.bodies.iter().any(|b| {
+                b.component_edits.iter().any(|e| {
+                    e.convex_rebuild
+                        && !matches!(
+                            e.face_edit,
+                            Some(crate::face_operations::FaceEdit::Draft(_))
+                        )
+                })
+            })
+        {
+            return Err("Topology-changing convex face edits require .osk version 40.".into());
+        }
+        if (self.schema_version < 41 || self.modeling_version < 41)
+            && self.bodies.iter().any(|b| {
+                b.component_edits.iter().any(|e| {
+                    e.convex_rebuild
+                        && matches!(
+                            e.face_edit,
+                            Some(crate::face_operations::FaceEdit::Draft(_))
+                        )
+                })
+            })
+        {
+            return Err("Topology-changing convex Draft requires .osk version 41.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
@@ -419,8 +465,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 36;
-        project.modeling_version = 36;
+        project.schema_version = 41;
+        project.modeling_version = 41;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

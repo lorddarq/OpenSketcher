@@ -227,7 +227,7 @@ pub fn apply(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), Strin
                         .collect::<Vec<_>>(),
                 );
             }
-            crate::components::apply_evaluated(body, &mut result)?;
+            crate::components::apply_evaluated(body, &mut result, bodies)?;
             scene.iter_mut().find(|g| g.0 == body.id).unwrap().1 = result;
             if op.kind == Kind::ReplaceFace {
                 suppressed.push((op.operands[0].0, None));

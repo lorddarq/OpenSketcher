@@ -607,6 +607,7 @@ pub(crate) fn evaluated_sweep(
                         g,
                         &[element],
                         truck_modeling::Matrix4::from_translation(vector),
+                        false,
                     )
                 };
             }

@@ -26,6 +26,8 @@ pub struct ComponentEdit {
     #[serde(default)]
     pub retrim: bool,
     #[serde(default)]
+    pub convex_rebuild: bool,
+    #[serde(default)]
     pub section_transform: bool,
     #[serde(default)]
     pub sweep: Option<[f64; 3]>,
@@ -315,6 +317,7 @@ fn transformed_many(
         }
         let placement = crate::regions::transform(body);
         let retrim = mode == SelectionMode::Face && planar_supports(g).is_ok();
+        let convex_rebuild = retrim && g.face_count <= 64;
         let mut selected = elements
             .iter()
             .flat_map(|element| vertices(g, mode, Some(*element)))
@@ -331,6 +334,7 @@ fn transformed_many(
         result.component_edits.push(ComponentEdit {
             evaluated: true,
             retrim,
+            convex_rebuild,
             section_transform,
             sweep: None,
             tangent_walls: false,
@@ -373,6 +377,7 @@ pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Resu
     changed.component_edits.push(ComponentEdit {
         evaluated: true,
         retrim: false,
+        convex_rebuild: false,
         section_transform: false,
         sweep: Some(vector.into()),
         tangent_walls: true,
@@ -462,7 +467,8 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
     }
     for (index, edit) in edits.iter().enumerate() {
         let m = Matrix4::from(edit.matrix);
-        if (edit.section_transform
+        if (edit.convex_rebuild && (!edit.evaluated || edit.mode != SelectionMode::Face || !edit.retrim && !matches!(edit.face_edit,Some(crate::face_operations::FaceEdit::Draft(_)))))
+            || (edit.section_transform
             && (!edit.evaluated
                 || !matches!(edit.mode, SelectionMode::Face | SelectionMode::Edge)
                 || edit.retrim
@@ -477,6 +483,7 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
                     || edit.sweep.is_some()
                     || m != Matrix4::identity()
                     || matches!(kind,crate::face_operations::FaceEdit::Shell(operation) if operation.validate().is_err())
+                    || matches!(kind,crate::face_operations::FaceEdit::Draft(operation) if operation.validate().is_err() || operation.neutral_plane.is_none() && (operation.neutral >= edit.topology.faces.len() || operation.neutral == edit.element || edit.elements.contains(&operation.neutral)))
             })
             || edit.edge_chamfer.is_some_and(|distances| {
                 !edit.evaluated
@@ -545,12 +552,17 @@ pub fn has_source_edits(body: &Body) -> bool {
     body.component_edits.iter().any(|edit| !edit.evaluated)
 }
 pub fn apply(body: &Body, g: &mut Geometry) -> Result<(), String> {
-    apply_stage(body, g, false)
+    apply_stage(body, g, false, &[])
 }
-pub fn apply_evaluated(body: &Body, g: &mut Geometry) -> Result<(), String> {
-    apply_stage(body, g, true)
+pub fn apply_evaluated(body: &Body, g: &mut Geometry, bodies: &[Body]) -> Result<(), String> {
+    apply_stage(body, g, true, bodies)
 }
-fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), String> {
+fn apply_stage(
+    body: &Body,
+    g: &mut Geometry,
+    evaluated: bool,
+    bodies: &[Body],
+) -> Result<(), String> {
     if !body
         .component_edits
         .iter()
@@ -586,7 +598,10 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         if let Some(kind)=edit.face_edit {
             let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
             if faces.iter().any(|f|*f>=g.face_count) {return Err("Selected face no longer exists.".into());}
-            *g=crate::face_operations::apply(g,&faces,kind).map_err(|e|format!("{}: {e}",kind.label()))?;
+            *g=if let crate::face_operations::FaceEdit::Draft(operation)=kind {
+                let reference=operation.neutral_plane.map(|id|crate::drafting::reference_plane(body,bodies,id)).transpose()?;
+                crate::drafting::evaluated_with_plane(g,&faces,operation,reference,edit.convex_rebuild)
+            }else{crate::face_operations::apply(g,&faces,kind)}.map_err(|e|format!("{}: {e}",kind.label()))?;
             return Ok(());
         }
         let mut selected = Vec::new();
@@ -614,7 +629,7 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         }
         if edit.retrim {
             let faces=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
-            *g=retrim_faces(g,&faces,matrix)?;
+            *g=retrim_faces(g,&faces,matrix,edit.convex_rebuild)?;
             return Ok(());
         }
         // A continuous cylinder wall can own every boundary vertex. This is
@@ -755,9 +770,9 @@ pub(crate) fn retrim_faces(
     g: &Geometry,
     faces: &[usize],
     matrix: Matrix4,
+    convex_rebuild: bool,
 ) -> Result<Geometry, String> {
     let mut planes = straight_planar_supports(g)?;
-    let convex = convex_supports(g).is_ok();
     for face in faces {
         let t = g
             .triangles
@@ -770,6 +785,26 @@ pub(crate) fn retrim_faces(
         let n = (b - a).cross(c - a).normalize();
         planes[*face] = (n, n.dot(a.to_vec()));
     }
+    match retrim_planes(g, &planes) {
+        Ok(result) => Ok(result),
+        Err(error) if convex_rebuild && planes.len() <= 64 && convex_supports(g).is_ok() => {
+            let indexed = planes.into_iter().enumerate().collect::<Vec<_>>();
+            let result = crate::edge_treatments::convex_from_planes(&indexed)
+                .and_then(crate::edge_treatments::planar_regions)
+                .map_err(|reason| format!("{error} Convex rebuild: {reason}"))?;
+            crate::operators::geometry(&crate::operators::solid(&result)?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Rebuild shared vertices and ordered outer/inner trims from replacement supports.
+/// Callers derive these planes from the existing straight planar input.
+pub(crate) fn retrim_planes(g: &Geometry, planes: &[(Vector3, f64)]) -> Result<Geometry, String> {
+    if planes.len() != g.face_count {
+        return Err("Missing replacement support planes.".into());
+    }
+    let convex = convex_supports(g).is_ok();
     let mut points = Vec::new();
     for vertex in 0..g.points.len() {
         let incident = (0..g.face_count)
@@ -1857,6 +1892,251 @@ mod tests {
     }
 
     #[test]
+    fn convex_face_rebuild_splits_corners_consumes_supports_and_replays() {
+        use crate::{
+            booleans,
+            edge_treatments::{self, FaceTarget, Kind, Modifier},
+            selection,
+        };
+        let volume = |g: &Geometry| {
+            g.triangles
+                .iter()
+                .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                .sum::<f64>()
+        };
+        for boolean in [false, true] {
+            for affine in [false, true] {
+                if boolean && affine {
+                    continue;
+                }
+                let mut body = Body::new(Shape::Rectangle);
+                body.id = 1;
+                body.width = 6.;
+                body.depth = 6.;
+                body.extrusion = 4.;
+                if affine {
+                    body.position = [2., -1., 3.];
+                    body.rotation = [11., 17., 23.];
+                    body.scale = [1.5, 0.75, 2.];
+                }
+                if !boolean {
+                    let mut modifier = Modifier::new(Kind::Chamfer, FaceTarget::Top, &body);
+                    modifier.amount = 0.3;
+                    body.edge_treatments.push(modifier);
+                }
+                let mut bodies = vec![body.clone()];
+                if boolean {
+                    let mut tool = body.clone();
+                    tool.id = 2;
+                    tool.position[0] = 1.;
+                    bodies.push(tool);
+                    let scene = evaluate_scene(&bodies).unwrap();
+                    let mut feature = Body::new(Shape::Rectangle);
+                    feature.id = 3;
+                    feature.boolean = Some(booleans::Boolean::new(
+                        booleans::Kind::Intersect,
+                        &[(1, None), (2, None)],
+                        SelectionMode::Volume,
+                        &scene,
+                    ));
+                    bodies.push(feature);
+                    let scene = evaluate_scene(&bodies).unwrap();
+                    let g = &scene[2].1;
+                    let top = planar_supports(g)
+                        .unwrap()
+                        .iter()
+                        .position(|(n, _)| n.z > 0.99)
+                        .unwrap();
+                    let changes = edge_treatments::selected_operations(
+                        &bodies,
+                        &scene,
+                        &[(3, Some(top))],
+                        SelectionMode::Face,
+                        Kind::Chamfer,
+                    )
+                    .unwrap();
+                    bodies[2] = changes[0].clone();
+                }
+                let owner = bodies.last().unwrap();
+                let id = owner.id;
+                let placement = crate::regions::transform(owner);
+                let inverse = placement.invert().unwrap();
+                let scene = evaluate_scene(&bodies).unwrap();
+                let g = &scene.last().unwrap().1;
+                let mut local = g.clone();
+                map_geometry(&mut local, inverse);
+                let supports = planar_supports(&local).unwrap();
+                let band = supports
+                    .iter()
+                    .position(|(n, _)| n.x > 0.3 && n.z > 0.3 && n.y.abs() < 1e-6)
+                    .unwrap();
+                let (normal, distance) = supports[band];
+                let center = pivot(&local, SelectionMode::Face, Some(band)).unwrap();
+                for operation in 0..4 {
+                    let matrix = if operation == 3 {
+                        Matrix4::from_translation(center.to_vec())
+                            * Matrix4::from_angle_z(Deg(5.))
+                            * Matrix4::from_translation(-center.to_vec())
+                    } else {
+                        Matrix4::from_translation(normal * [-0.08, 0.08, 1.][operation])
+                    };
+                    let world = placement * matrix * inverse;
+                    let changed =
+                        transformed(owner, g, SelectionMode::Face, Some(band), world).unwrap();
+                    assert!(changed.component_edits.last().unwrap().convex_rebuild);
+                    let mut legacy = changed.clone();
+                    legacy.component_edits.last_mut().unwrap().convex_rebuild = false;
+                    let mut old = bodies.clone();
+                    *old.last_mut().unwrap() = legacy;
+                    assert!(
+                        evaluate_scene(&old).is_err(),
+                        "The legacy corner solver cannot rebuild this edit"
+                    );
+                    let mut model = Model::from_bodies(bodies.clone());
+                    model.commit(changed.clone()).unwrap();
+                    let output = evaluate_scene(&model.bodies).unwrap();
+                    let result = &output.last().unwrap().1;
+                    assert!(result.is_solid);
+                    assert!(result.shell.as_ref().unwrap().is_geometric_consistent());
+                    solid_parts(result.shell.as_ref().unwrap()).unwrap();
+                    assert_eq!(result.shell.as_ref().unwrap().len(), result.face_count);
+                    assert_ne!(result.topology, g.topology);
+                    assert!(selection::topology_changed(
+                        &[(id, Some(band))],
+                        &scene,
+                        &output
+                    ));
+                    assert!(!selection::topology_changed(&[(id, None)], &scene, &output));
+                    assert!(!selection::topology_changed(
+                        &[(id, Some(band))],
+                        &scene,
+                        &scene
+                    ));
+                    assert!(selection::topology_changed(
+                        &[(id, Some(band))],
+                        &scene,
+                        &[]
+                    ));
+                    let mut local_out = result.clone();
+                    map_geometry(&mut local_out, inverse);
+                    let after = planar_supports(&local_out).unwrap();
+                    for (face, (n, d)) in supports.iter().enumerate().filter(|(f, _)| *f != band) {
+                        assert!(
+                            after.iter().any(
+                                |(m, e)| (*m - *n).magnitude() < 1e-6 && (*e - *d).abs() < 1e-6
+                            ),
+                            "Unchanged support {face}"
+                        );
+                    }
+                    let selected_triangle = local
+                        .triangles
+                        .iter()
+                        .zip(&local.triangle_faces)
+                        .find(|(_, f)| **f == band)
+                        .unwrap()
+                        .0
+                        .map(|p| matrix.transform_point(p));
+                    let n = (selected_triangle[1] - selected_triangle[0])
+                        .cross(selected_triangle[2] - selected_triangle[0])
+                        .normalize();
+                    let d = n.dot(selected_triangle[0].to_vec());
+                    if operation == 2 {
+                        assert_eq!(result.face_count, g.face_count - 1);
+                        assert!(
+                            !after
+                                .iter()
+                                .any(|(m, e)| (*m - n).magnitude() < 1e-6 && (*e - d).abs() < 1e-6),
+                            "The redundant blend support disappears"
+                        );
+                    } else {
+                        assert!(
+                            after
+                                .iter()
+                                .any(|(m, e)| (*m - n).magnitude() < 1e-6 && (*e - d).abs() < 1e-6)
+                        );
+                        assert_eq!(result.face_count, g.face_count);
+                    }
+                    if operation < 3 {
+                        assert!(
+                            (volume(&local_out) - volume(&local))
+                                * if operation == 0 { -1. } else { 1. }
+                                > 1e-6
+                        );
+                        assert!((d - distance - [-0.08, 0.08, 1.][operation]).abs() < 1e-6);
+                    }
+                    for format in crate::export::Format::ALL {
+                        assert!(
+                            !crate::export::encode(&model.bodies, format)
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("convex-rebuild.osk");
+                    let project =
+                        Project::new(model.bodies.clone(), Camera::default(), true, Some(id));
+                    project.save(&path).unwrap();
+                    assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+                    let mut old = serde_json::to_value(&project).unwrap();
+                    old["schema_version"] = 39.into();
+                    old["modeling_version"] = 39.into();
+                    assert!(
+                        serde_json::from_value::<Project>(old)
+                            .unwrap()
+                            .validate()
+                            .unwrap_err()
+                            .contains("version 40")
+                    );
+                    let accepted = model.bodies.clone();
+                    model.undo();
+                    assert_eq!(model.bodies, bodies);
+                    model.redo();
+                    assert_eq!(model.bodies, accepted);
+                    let top = after.iter().position(|(n, _)| n.z > 0.99).unwrap();
+                    let next = transformed(
+                        &changed,
+                        result,
+                        SelectionMode::Face,
+                        Some(top),
+                        placement * Matrix4::from_translation(Vector3::unit_z() * 0.05) * inverse,
+                    )
+                    .unwrap();
+                    model.commit(next).unwrap();
+                    Project::new(model.bodies.clone(), Camera::default(), true, Some(id))
+                        .save(&path)
+                        .unwrap();
+                    assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+                    if !boolean
+                        && !affine
+                        && operation == 1
+                        && let Some(path) = std::env::var_os("OSK_CONVEX_REBUILD_REVIEW_PROJECT")
+                    {
+                        let mut review =
+                            Project::new(bodies.clone(), Camera::default(), true, Some(id));
+                        review.selection_mode = SelectionMode::Face;
+                        review.selected_element = Some(band);
+                        review.selection = vec![(id, Some(band))];
+                        review.save(std::path::Path::new(&path)).unwrap();
+                    }
+                }
+                let top = supports.iter().position(|(n, _)| n.z > 0.99).unwrap();
+                let invalid = transformed(
+                    owner,
+                    g,
+                    SelectionMode::Face,
+                    Some(top),
+                    placement * Matrix4::from_translation(-Vector3::unit_z() * 10.) * inverse,
+                )
+                .unwrap();
+                let mut model = Model::from_bodies(bodies.clone());
+                assert!(model.commit(invalid).is_err());
+                assert_eq!(model.bodies, bodies);
+                assert!(!model.can_undo());
+            }
+        }
+    }
+
+    #[test]
     fn convex_planar_face_moves_retrim_neighbors_and_preserve_exact_history() {
         use crate::edge_treatments::{FaceTarget, Kind, Modifier};
         for chamfer in [false, true] {
@@ -1935,6 +2215,10 @@ mod tests {
                     .as_object_mut()
                     .unwrap()
                     .remove("retrim");
+                legacy["bodies"][0]["component_edits"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("convex_rebuild");
                 std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
                 assert!(!Project::load(&path).unwrap().bodies[0].component_edits[0].retrim);
                 for format in [
@@ -2054,6 +2338,7 @@ mod tests {
                 for edit in old["bodies"][0]["component_edits"].as_array_mut().unwrap() {
                     edit.as_object_mut().unwrap().remove("tangent_walls");
                     edit.as_object_mut().unwrap().remove("prismatic_cut");
+                    edit.as_object_mut().unwrap().remove("convex_rebuild");
                 }
                 old["schema_version"] = 18.into();
                 old["modeling_version"] = 18.into();

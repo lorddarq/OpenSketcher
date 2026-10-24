@@ -325,6 +325,7 @@ mod tests {
             .component_edits
             .push(crate::components::ComponentEdit {
                 retrim: false,
+                convex_rebuild: false,
                 section_transform: false,
                 sweep: None,
                 tangent_walls: false,

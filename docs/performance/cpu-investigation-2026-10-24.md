@@ -118,3 +118,21 @@ Release measurements: index construction for 25 cylinders fell from 54–55 ms t
 The normal helper previously accumulated a hash map of triangle normals for every face, including cylinder walls whose output normals come entirely from their exact extrusion support. It now skips accumulation for those supported walls. Other faces still use the existing accumulation, and cylinder normals still use the same analytic formula. This reduces work without adding a cache or changing geometry, lighting, selection or serialized data. All five viewport regression checks passed, including sharp-boundary smoothing and clipped-cylinder seam coverage; Clippy passed.
 
 The release timing check measured normal calculation at 11.9–12.9 ms for 25 cylinders and 51.1–57.0 ms for 100, compared with approximately 33 ms / 130 ms before skipping the discarded accumulation. The application build overlapped the end of this run, so these are diagnostic component timings rather than controlled end-to-end latency measurements.
+
+
+## Follow-up: source-stage keys for late edits
+
+A second base-cache miss was reproduced through actual `Model::edit` evaluated cap extrusion on a rounded cylinder. The cache compared the complete `Body`, so changing a late evaluated operation rebuilt the identical source BRep and tessellation. Bore travel and mode caused the same unnecessary profile-base rebuild. Both late stages execute after base construction.
+
+The key now retains exact source-stage parameters, non-evaluated source edits and resolved profile boundaries, while excluding evaluated component histories and `bore` metadata. The original authored body is still validated and used on misses; late operations and dependencies always replay. Whole-scene cache matching remains exact on full bodies. Source changes and profile partitions still invalidate bases, and the cache still retains only the latest successful scene. This also avoids keeping evaluated-history topology guards in the source-key snapshots; it does not establish or fix a memory leak.
+
+Before the fix, the deterministic regression rebuilt the kernel base on all 12 revisions: debug warm 2.226 s versus forced-cold 2.205 s, 0/12 reused. Afterward it retained 12/12 bases: debug warm 1.276 s versus forced-cold 2.232 s in one run. A separate release run limited to two Rayon threads measured warm 117.772 ms versus forced-cold 219.133 ms, approximately 46.3% less geometry-evaluation time. Timing regions perform the same `Model::edit` and scene retrieval in both paths; geometry assertions and comparisons are outside them. These are local diagnostics, not universal speedups, native frame-rate measurements or total UI/CSG costs.
+
+```sh
+RAYON_NUM_THREADS=2 cargo test --offline --release evaluated_component_edits_reuse_base -- --nocapture
+```
+
+The test also verifies identical warm/cold topology and triangle samples at 1e-9 coordinate precision, source invalidation, retained legacy source edits, topology-guard rejection, cold save/load, live bore travel/mode, Generator + borer output and invalid-travel rejection. Full downstream Boolean/reference replay remains a separate performance gap; source extrusion dimensions still legitimately rebuild the base. No dependencies or serialization semantics changed.
+
+
+The cache-key bug was prevented from recurring with kernel-face-identity assertions at the actual `Model::edit` seam, plus cold geometry comparisons and invalid late-input tests. This is a stage-boundary correction, not a new dependency graph or cache framework. A second two-thread release run measured 106.665 ms warm versus 196.047 ms forced cold with 12/12 bases reused. Full suite: 101 passed, two manual timing tests ignored; Clippy, formatting and release build passed. Native numeric extrusion, Undo/Redo and saving were reviewed using `/tmp/osk-component-cache-review.osk`; native CPU/frame-time profiling was not performed in that acceptance check.

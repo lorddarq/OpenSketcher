@@ -18,6 +18,7 @@ pub enum FaceEdit {
     Heal,
     CapOpenings,
     Shell(crate::shelling::EvaluatedShell),
+    Draft(crate::drafting::EvaluatedDraft),
 }
 impl FaceEdit {
     pub fn label(self) -> &'static str {
@@ -27,6 +28,7 @@ impl FaceEdit {
             Self::Heal => "Delete face · Heal",
             Self::CapOpenings => "Cap openings",
             Self::Shell(_) => "Shell",
+            Self::Draft(_) => "Draft",
         }
     }
 }
@@ -82,6 +84,9 @@ pub fn selected(
             body.component_edits.push(ComponentEdit {
                 evaluated: true,
                 retrim: false,
+                convex_rebuild: matches!(kind, FaceEdit::Draft(_))
+                    && g.face_count <= 64
+                    && crate::components::planar_supports(g).is_ok(),
                 section_transform: false,
                 sweep: None,
                 tangent_walls: false,
@@ -107,6 +112,9 @@ pub fn selected(
 pub(crate) fn apply(g: &Geometry, selected: &[usize], kind: FaceEdit) -> Result<Geometry, String> {
     if let FaceEdit::Shell(operation) = kind {
         return crate::shelling::evaluated(g, selected, operation);
+    }
+    if let FaceEdit::Draft(operation) = kind {
+        return crate::drafting::evaluated(g, selected, operation);
     }
     if kind == FaceEdit::Heal {
         return if crate::components::planar_supports(g).is_ok() {
@@ -620,7 +628,7 @@ pub(crate) fn replace(
         let moved = rotation.transform_point(plane.origin);
         let matrix =
             Matrix4::from_translation(normal * (target.origin - moved).dot(normal)) * rotation;
-        return crate::components::retrim_faces(source, &[face], matrix);
+        return crate::components::retrim_faces(source, &[face], matrix, false);
     }
     // Reuse exact variable-height prism construction for analytic curved walls.
     let body = bodies
