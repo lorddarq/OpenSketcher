@@ -51,16 +51,143 @@ pub fn extend(input: &egui::InputState) -> bool {
         .unwrap_or(input.modifiers.shift)
 }
 pub fn click(picks: &mut Vec<Pick>, picked: Option<Pick>, extend: bool) {
+    click_many(picks, picked.as_slice(), extend);
+}
+/// The last item is the clicked primary. Shift toggles the whole chain together.
+pub fn click_many(picks: &mut Vec<Pick>, picked: &[Pick], extend: bool) {
+    let remove = extend && picked.last().is_some_and(|primary| picks.contains(primary));
     if !extend {
         picks.clear();
     }
-    if let Some(pick) = picked {
-        if let Some(index) = picks.iter().position(|p| *p == pick) {
-            picks.remove(index);
-        } else {
-            picks.push(pick);
+    if remove {
+        picks.retain(|p| !picked.contains(p));
+    } else {
+        for pick in picked {
+            if !picks.contains(pick) {
+                picks.push(*pick);
+            }
         }
     }
+}
+
+/// Expand a logical edge along analytic tangent runs, stopping at ambiguous joins.
+/// Display samples only disambiguate retained-edge identity; curve derivatives
+/// determine tangency through the same helper used for swept-wall grouping.
+pub fn tangent_chain(g: &Geometry, seed: usize) -> Vec<usize> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use truck_modeling::{ParametricCurve, SearchParameter, VertexID};
+    if seed >= g.edge_count || g.internal_edges.contains(&seed) {
+        return Vec::new();
+    }
+    let seed = g.edge_group(seed);
+    let Some(shell) = &g.shell else {
+        return vec![seed];
+    };
+    let key = |p: Point3| [p.x, p.y, p.z].map(|v| (v * 1e6).round() as i64);
+    let pair = |a: Point3, b: Point3| {
+        let (a, b) = (key(a), key(b));
+        if a < b { (a, b) } else { (b, a) }
+    };
+    let mut candidates = HashMap::<_, Vec<usize>>::new();
+    let mut probes = g
+        .topology
+        .edges
+        .iter()
+        .map(|[a, b]| g.points[*a] + (g.points[*b] - g.points[*a]) * 0.5)
+        .collect::<Vec<_>>();
+    let mut distances = vec![0.; probes.len()];
+    for (i, [a, b]) in g.topology.edges.iter().enumerate() {
+        candidates
+            .entry(pair(g.points[*a], g.points[*b]))
+            .or_default()
+            .push(i);
+    }
+    for (edge, group) in g.edges.iter().zip(&g.edge_groups) {
+        let Some([a, b]) = g.topology.edges.get(*group) else {
+            continue;
+        };
+        let ab = g.points[*b] - g.points[*a];
+        for p in edge {
+            let delta = *p - g.points[*a];
+            let distance = if ab.magnitude2() > 1e-20 {
+                delta.cross(ab).magnitude2() / ab.magnitude2()
+            } else {
+                delta.magnitude2()
+            };
+            if distance > distances[*group] + 1e-20 {
+                probes[*group] = *p;
+                distances[*group] = distance;
+            }
+        }
+    }
+    let mut edges = HashMap::new();
+    let mut seen = HashSet::new();
+    for edge in shell.edge_iter() {
+        if !seen.insert(edge.id()) {
+            continue;
+        }
+        let Some(raw) = candidates.get(&pair(edge.front().point(), edge.back().point())) else {
+            continue;
+        };
+        let curve = edge.oriented_curve();
+        let matches = raw
+            .iter()
+            .filter(|index| !g.internal_edges.contains(index))
+            .filter(|index| {
+                curve
+                    .search_parameter(probes[**index], None, 64)
+                    .is_some_and(|t| (curve.subs(t) - probes[**index]).magnitude() < 1e-7)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            edges.insert(edge.id(), g.edge_group(*matches[0]));
+        }
+    }
+    let mut joins = HashMap::<(usize, VertexID), BTreeSet<usize>>::new();
+    for face in shell {
+        for wire in face.boundaries() {
+            let groups = crate::model::tangent_groups(&wire);
+            for i in 0..wire.len() {
+                let next = (i + 1) % wire.len();
+                if groups[i] != groups[next] {
+                    continue;
+                }
+                if let (Some(&a), Some(&b)) =
+                    (edges.get(&wire[i].id()), edges.get(&wire[next].id()))
+                {
+                    let vertex = wire[i].back().id();
+                    joins.entry((a, vertex)).or_default().insert(b);
+                    joins.entry((b, vertex)).or_default().insert(a);
+                }
+            }
+        }
+    }
+    let mut adjacent = vec![BTreeSet::new(); g.edge_count];
+    for ((edge, vertex), neighbors) in &joins {
+        if neighbors.len() != 1 {
+            continue;
+        }
+        let other = *neighbors.first().unwrap();
+        if other != *edge
+            && joins
+                .get(&(other, *vertex))
+                .is_some_and(|back| back.len() == 1 && back.contains(edge))
+        {
+            adjacent[*edge].insert(other);
+        }
+    }
+    let mut chain = BTreeSet::new();
+    let mut pending = vec![seed];
+    while let Some(edge) = pending.pop() {
+        if !chain.insert(edge) {
+            continue;
+        }
+        pending.extend(adjacent[edge].iter().filter(|e| !chain.contains(e)));
+    }
+    chain.remove(&seed);
+    let mut result = chain.into_iter().collect::<Vec<_>>();
+    result.push(seed);
+    result
 }
 pub fn valid(pick: Pick, scene: &[(u64, Geometry)], mode: SelectionMode) -> bool {
     scene
@@ -397,6 +524,127 @@ mod tests {
         model::{Body, Shape, evaluate},
         viewport::View,
     };
+    #[test]
+    fn tangent_chains_follow_analytic_curves_and_toggle_as_one_selection() {
+        use truck_modeling::{Deg, Matrix4, Vector3, builder};
+        let points = [
+            [0., 0., 0.],
+            [2., 0., 0.],
+            [3., 1., 0.],
+            [3., 3., 0.],
+            [0., 3., 0.],
+        ];
+        let vertices = points.map(|p| builder::vertex(Point3::from(p)));
+        let arc = builder::circle_arc(
+            &vertices[1],
+            &vertices[2],
+            Point3::new(
+                2. + std::f64::consts::FRAC_1_SQRT_2,
+                1. - std::f64::consts::FRAC_1_SQRT_2,
+                0.,
+            ),
+        );
+        let wire: truck_modeling::Wire = vec![
+            builder::line(&vertices[0], &vertices[1]),
+            arc,
+            builder::line(&vertices[2], &vertices[3]),
+            builder::line(&vertices[3], &vertices[4]),
+            builder::line(&vertices[4], &vertices[0]),
+        ]
+        .into();
+        let face = builder::try_attach_plane(&[wire]).unwrap();
+        for affine in [false, true] {
+            let mut shell: truck_modeling::Shell = vec![face.clone()].into();
+            if affine {
+                shell = builder::transformed(
+                    &shell,
+                    Matrix4::from_translation(Vector3::new(2., -1., 3.))
+                        * Matrix4::from_angle_x(Deg(23.))
+                        * Matrix4::from_nonuniform_scale(1.7, 0.6, 1.2),
+                );
+            }
+            let g = crate::model::tessellate(&shell).unwrap();
+            for seed in 0..3 {
+                let chain = tangent_chain(&g, seed);
+                assert_eq!(chain.last(), Some(&seed));
+                assert_eq!(
+                    chain
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    [0, 1, 2].into()
+                );
+                let expanded = chain.iter().map(|e| (7, Some(*e))).collect::<Vec<_>>();
+                let mut picks = vec![(9, Some(1))];
+                click_many(&mut picks, &expanded, true);
+                assert_eq!(picks.last(), Some(&(7, Some(seed))));
+                assert_eq!(picks.len(), 4);
+                click_many(&mut picks, &expanded, true);
+                assert_eq!(picks, vec![(9, Some(1))]);
+                click_many(&mut picks, &expanded, false);
+                assert_eq!(picks, expanded);
+                click_many(&mut picks, &[], true);
+                assert_eq!(picks, expanded);
+                click_many(&mut picks, &[], false);
+                assert!(picks.is_empty());
+            }
+            assert_eq!(tangent_chain(&g, 3), vec![3]);
+            assert_eq!(tangent_chain(&g, 4), vec![4]);
+            assert!(tangent_chain(&g, 99).is_empty());
+        }
+        let half = evaluate(&Body::new(Shape::Semicircle)).unwrap();
+        // Arc and diameter share endpoints but must not be misidentified.
+        for edge in 0..half.edge_count {
+            assert_eq!(tangent_chain(&half, edge), vec![edge]);
+        }
+        // Two tangent continuations at the same endpoint are ambiguous, even
+        // though the shared edge has only two neighbors in the edge graph.
+        let [a, b, c, p, d] = [
+            [0., 0., 0.],
+            [1., 0., 0.],
+            [2., 0., 0.],
+            [2., 2., 0.],
+            [2., -1., 0.],
+        ]
+        .map(|p| builder::vertex(Point3::from(p)));
+        let shared = builder::line(&a, &b);
+        let branch = truck_modeling::Edge::new(
+            &b,
+            &d,
+            truck_modeling::Curve::BSplineCurve(truck_modeling::BSplineCurve::new(
+                truck_modeling::KnotVec::bezier_knot(2),
+                vec![b.point(), Point3::new(1.5, 0., 0.), d.point()],
+            )),
+        );
+        let wires: [truck_modeling::Wire; 2] = [
+            vec![
+                shared.clone(),
+                builder::line(&b, &c),
+                builder::line(&c, &p),
+                builder::line(&p, &a),
+            ]
+            .into(),
+            vec![shared.inverse(), builder::line(&a, &d), branch.inverse()].into(),
+        ];
+        let shell = wires
+            .map(|wire| builder::try_attach_plane(&[wire]).unwrap())
+            .into_iter()
+            .collect::<truck_modeling::Shell>();
+        let g = crate::model::tessellate(&shell).unwrap();
+        assert_eq!(tangent_chain(&g, 0), vec![0]);
+        assert_eq!(tangent_chain(&g, 1), vec![1]);
+        let mut body = Body::new(Shape::Circle);
+        body.extrusion = 3.;
+        let circle = evaluate(&body).unwrap();
+        for edge in 0..circle.edge_count {
+            if circle.internal_edges.contains(&edge) {
+                assert!(tangent_chain(&circle, edge).is_empty());
+            } else {
+                assert_eq!(tangent_chain(&circle, edge), vec![circle.edge_group(edge)]);
+            }
+        }
+    }
+
     #[test]
     fn indexed_queries_preserve_hits_visibility_and_prune_triangle_work() {
         let bodies = (0..8)

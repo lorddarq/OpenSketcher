@@ -950,6 +950,31 @@ pub fn tessellate(shell: &Shell) -> Result<Geometry, String> {
     Ok(geometry)
 }
 
+pub(crate) fn tangent_groups(wire: &truck_modeling::Wire) -> Vec<usize> {
+    use truck_modeling::{BoundedCurve, ParametricCurve};
+    let mut groups = (0..wire.len()).collect::<Vec<_>>();
+    for i in 0..wire.len() {
+        let next = (i + 1) % wire.len();
+        let a = wire[i].oriented_curve();
+        let b = wire[next].oriented_curve();
+        let ta = a.der(a.range_tuple().1);
+        let tb = b.der(b.range_tuple().0);
+        if ta.magnitude2() > 1e-20
+            && tb.magnitude2() > 1e-20
+            && ta.normalize().dot(tb.normalize()) > 1. - 1e-8
+        {
+            let old = groups[next];
+            let new = groups[i];
+            for group in &mut groups {
+                if *group == old {
+                    *group = new;
+                }
+            }
+        }
+    }
+    groups
+}
+
 #[derive(Default, Clone)]
 pub struct Model {
     pub bodies: Vec<Body>,

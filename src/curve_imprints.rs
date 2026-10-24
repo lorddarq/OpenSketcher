@@ -780,6 +780,26 @@ mod tests {
                         .any(|e| matches!(e.curve(), Curve::NurbsCurve(_)))
                 );
             }
+            let mut chain = Vec::new();
+            if shape == Shape::Rectangle {
+                let rim = (0..g.edge_count)
+                    .filter(|edge| {
+                        g.topology.edges[*edge].iter().all(|vertex| {
+                            let p = g.points[*vertex];
+                            (p.x + 2.).abs() < EPS && (p.z - 3.).abs() < EPS
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(rim.len(), 2, "Imprint splits the original straight edge");
+                chain = crate::selection::tangent_chain(g, rim[0]);
+                assert_eq!(
+                    chain
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    rim.into_iter().collect()
+                );
+            }
             assert!(result[0].1.triangles.is_empty());
             assert!(result[1].1.edges.is_empty());
             // A finite tool ending inside material is never extrapolated.
@@ -803,7 +823,7 @@ mod tests {
                 let swept = evaluate_scene(&edited).unwrap();
                 assert!(volume(&swept[2].1) > volume(g));
             }
-            let project = crate::project::Project::new(
+            let mut project = crate::project::Project::new(
                 bodies.clone(),
                 crate::viewport::Camera::default(),
                 true,
@@ -811,8 +831,20 @@ mod tests {
             );
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("curve.osk");
+            if !chain.is_empty() {
+                project.selection_mode = SelectionMode::Edge;
+                project.selection = chain.iter().map(|edge| (3, Some(*edge))).collect();
+                project.selected_element = project.selection.last().unwrap().1;
+                if let Some(path) = std::env::var_os("OSK_TANGENT_REVIEW_PROJECT") {
+                    let mut review = project.clone();
+                    review.selection = vec![*project.selection.last().unwrap()];
+                    review.save(std::path::Path::new(&path)).unwrap();
+                }
+            }
             project.save(&path).unwrap();
-            assert_eq!(crate::project::Project::load(&path).unwrap().bodies, bodies);
+            let loaded = crate::project::Project::load(&path).unwrap();
+            assert_eq!(loaded.bodies, bodies);
+            assert_eq!(loaded.picks(), project.picks());
             let mut legacy = serde_json::to_value(&project).unwrap();
             legacy["schema_version"] = 25.into();
             assert!(

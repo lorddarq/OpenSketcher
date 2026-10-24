@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional tangent-chain Edge selection using retained analytic curves. Preserve clicked-edge priority, toggle chains with Shift-click, and stop at sharp or ambiguous joins. General edge-treatment geometry remains pending.
+
 - Heal complete external notches across planar supports, preserving unrelated curved walls and holes. Keep analytic cap regions in new equal-depth prism Booleans via `.osk` v31 intent; retain legacy replay for older operations.
 
 - Fix Windows round-trip test failures by closing temporary destination handles before atomic project replacement. Add replacement/cleanup coverage and a Windows-only locked-file preservation and recovery check.

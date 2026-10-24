@@ -62,6 +62,7 @@ fn main() -> eframe::Result {
                 selection_mode: SelectionMode::Volume,
                 selected_element: None,
                 selection: Vec::new(),
+                tangent_chain: false,
                 draft: None,
                 face_offset: None,
                 anchor: None,
@@ -127,6 +128,7 @@ struct OpenSketcher {
     selection_mode: SelectionMode,
     selected_element: Option<usize>,
     selection: Vec<selection::Pick>,
+    tangent_chain: bool,
     draft: Option<Body>,
     face_offset: Option<FaceOffset>,
     anchor: Option<[f64; 3]>,
@@ -667,7 +669,25 @@ impl OpenSketcher {
     }
     fn pick(&mut self, picked: Option<selection::Pick>, extend: bool) {
         let mut picks = self.selection.clone();
-        selection::click(&mut picks, picked, extend);
+        if self.tangent_chain && self.selection_mode == SelectionMode::Edge {
+            let chain = picked
+                .and_then(|(id, element)| Some((id, element?)))
+                .and_then(|(id, element)| {
+                    self.committed_scene
+                        .iter()
+                        .find(|(owner, _)| *owner == id)
+                        .map(|(_, g)| {
+                            selection::tangent_chain(g, element)
+                                .into_iter()
+                                .map(|edge| (id, Some(edge)))
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .unwrap_or_default();
+            selection::click_many(&mut picks, &chain, extend);
+        } else {
+            selection::click(&mut picks, picked, extend);
+        }
         self.set_picks(picks);
     }
     fn offset_face_properties(&mut self, ui: &mut egui::Ui) {
@@ -1277,6 +1297,10 @@ impl eframe::App for OpenSketcher {
                             }
                         }
 
+                        if self.selection_mode == SelectionMode::Edge {
+                            ui.checkbox(&mut self.tangent_chain, "Tangent chain")
+                                .on_hover_text("Expand the next edge click along tangent curves. Shift-click toggles the chain.");
+                        }
                         ui.separator();
                         ui.label("View");
                         for (view, label) in [

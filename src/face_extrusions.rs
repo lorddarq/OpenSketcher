@@ -294,31 +294,6 @@ pub(crate) fn circle_on_wire(
     })
 }
 
-fn tangent_groups(wire: &truck_modeling::Wire) -> Vec<usize> {
-    use truck_modeling::{BoundedCurve, ParametricCurve};
-    let mut groups = (0..wire.len()).collect::<Vec<_>>();
-    for i in 0..wire.len() {
-        let next = (i + 1) % wire.len();
-        let a = wire[i].oriented_curve();
-        let b = wire[next].oriented_curve();
-        let ta = a.der(a.range_tuple().1);
-        let tb = b.der(b.range_tuple().0);
-        if ta.magnitude2() > 1e-20
-            && tb.magnitude2() > 1e-20
-            && ta.normalize().dot(tb.normalize()) > 1. - 1e-8
-        {
-            let old = groups[next];
-            let new = groups[i];
-            for group in &mut groups {
-                if *group == old {
-                    *group = new;
-                }
-            }
-        }
-    }
-    groups
-}
-
 // Shared by semantic source-cap sweeps and ordered evaluated-face operations.
 fn tangent_roles(
     face: &truck_modeling::Face,
@@ -326,7 +301,7 @@ fn tangent_roles(
 ) -> std::collections::HashMap<truck_modeling::EdgeID, usize> {
     let mut roles = std::collections::HashMap::new();
     for wire in face.boundaries() {
-        for (edge, group) in wire.iter().zip(tangent_groups(&wire)) {
+        for (edge, group) in wire.iter().zip(crate::model::tangent_groups(&wire)) {
             roles.insert(edge.id(), offset + group);
         }
         offset += wire.len();
