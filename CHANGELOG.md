@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.2.1 — 2026-10-24
+
+- Shell evaluated convex planar solids after chamfers, Booleans and face edits. Add editable inward/outward thickness, source-face openings and closed cavities; retain exact inner/outer faces and ordered `.osk` v36 history.
+
+- Preserve existing rounded bands and circular through-holes when treating other full-depth planar prism corners. Canonicalize new prism face and hole-loop ordering for reliable downstream guarded edits; persist explicit replay intent in `.osk` v35.
+
+- Add analytic rounded bevels on evaluated straight-prism edges, including inner/outer notch and hole corners. Retain tangent circular cap arcs and one curved band; expose Rounded/Flat style, radius/distance and removal, with guarded `.osk` v34 history.
+
+- Chamfer full-depth inner and outer edges on nonconvex planar prisms, including Boolean notches and rectangular holes. Inner corners add material; outer corners cut. Preserve exact cap loops, editable bands and legacy convex replay through `.osk` v33.
+
+Development release. General curved/concave shelling and arbitrary edge blends remain pending. Windows/Linux runtime and external CAD importer acceptance remain unverified.
 
 ## v0.2.0 — 2026-10-24
 

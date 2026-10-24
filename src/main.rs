@@ -405,9 +405,35 @@ impl OpenSketcher {
                 .find(|g| g.0 == id)
                 .ok_or("Geometry no longer exists.")?
                 .1;
-            let opening = edge_treatments::target(&body, geometry, face)?;
-            body.hollow = Some(shelling::Hollow::new(&body, opening)?);
-            Ok(body)
+            let source = if body.component_edits.is_empty() {
+                edge_treatments::target(&body, geometry, face)
+                    .and_then(|opening| shelling::Hollow::new(&body, opening))
+            } else {
+                Err("Shell must follow the evaluated component edits.".into())
+            };
+            if let Ok(operation) = source {
+                body.hollow = Some(operation);
+                Ok(body)
+            } else {
+                use truck_modeling::SquareMatrix;
+                let mut local = geometry.clone();
+                components::map_geometry(
+                    &mut local,
+                    regions::transform(&body)
+                        .invert()
+                        .ok_or("Invalid source placement.")?,
+                );
+                let operation = shelling::EvaluatedShell::new(&local)?;
+                face_operations::selected(
+                    &self.model.bodies,
+                    &self.committed_scene,
+                    &self.selection,
+                    face_operations::FaceEdit::Shell(operation),
+                )?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "Missing Shell input.".into())
+            }
         })();
         match result {
             Ok(body) => {
@@ -1008,28 +1034,115 @@ fn history_shortcut(input: &mut egui::InputState) -> Option<bool> {
     }
 }
 
-fn evaluated_chamfers(ui: &mut egui::Ui, body: &mut Body) -> bool {
+fn shell_controls(
+    ui: &mut egui::Ui,
+    thickness: &mut f64,
+    outward: &mut bool,
+    closed: &mut bool,
+) -> bool {
+    let mut finished = false;
+    ui.horizontal(|ui| {
+        finished |= ui.selectable_value(outward, false, "Inward").changed();
+        finished |= ui.selectable_value(outward, true, "Outward").changed();
+    });
+    finished |= scalar(ui, "Wall thickness", thickness, 0.00002..=100.);
+    finished |= ui
+        .checkbox(closed, "Closed cavity · keep all outer faces")
+        .changed();
+    finished
+}
+
+fn evaluated_component_properties(ui: &mut egui::Ui, body: &mut Body) -> bool {
     let mut finished = false;
     let mut remove = None;
     for (index, edit) in body.component_edits.iter_mut().enumerate() {
-        let Some(distances) = &mut edit.edge_chamfer else {
+        if let Some(face_operations::FaceEdit::Shell(operation)) = &mut edit.face_edit {
+            ui.push_id(("evaluated_shell", index), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Shell · local units");
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                finished |= shell_controls(
+                    ui,
+                    &mut operation.thickness,
+                    &mut operation.outward,
+                    &mut operation.closed,
+                );
+                ui.add_enabled_ui(!operation.closed, |ui| {
+                    egui::ComboBox::from_id_salt("evaluated_shell_opening")
+                        .selected_text(format!("Opening · source Face {}", edit.element + 1))
+                        .show_ui(ui, |ui| {
+                            for face in 0..edit.topology.faces.len() {
+                                if ui
+                                    .selectable_value(
+                                        &mut edit.element,
+                                        face,
+                                        format!("Face {}", face + 1),
+                                    )
+                                    .changed()
+                                {
+                                    edit.elements.clear();
+                                    finished = true;
+                                }
+                            }
+                        });
+                });
+            });
             continue;
-        };
+        }
+        if edit.edge_chamfer.is_none() && edit.prism_bevel.is_none() {
+            continue;
+        }
         ui.push_id(("evaluated_chamfer", index), |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "Chamfer · {} edges · local units",
+                    "{} · {} edges · local units",
+                    if edit.prism_bevel.is_some() {
+                        "Bevel"
+                    } else {
+                        "Chamfer"
+                    },
                     edit.elements.len() + 1
                 ));
                 if ui.small_button("Remove").clicked() {
                     remove = Some(index);
                 }
             });
-            finished |= scalar(ui, "First distance", &mut distances[0], 0.00002..=10000.);
-            finished |= scalar(ui, "Second distance", &mut distances[1], 0.00002..=10000.);
-            if ui.small_button("Reverse distances").clicked() {
-                distances.swap(0, 1);
-                finished = true;
+            if edit.prism_chamfer || edit.prism_bevel.is_some() {
+                ui.weak("Inner corners add material; outer corners cut.");
+            }
+            if let Some(bevel) = &mut edit.prism_bevel {
+                ui.horizontal(|ui| {
+                    finished |= ui
+                        .selectable_value(
+                            &mut bevel.style,
+                            edge_treatments::Style::Rounded,
+                            "Rounded",
+                        )
+                        .changed();
+                    finished |= ui
+                        .selectable_value(&mut bevel.style, edge_treatments::Style::Flat, "Flat")
+                        .changed();
+                });
+                finished |= scalar(
+                    ui,
+                    if bevel.style == edge_treatments::Style::Rounded {
+                        "Radius"
+                    } else {
+                        "Distance"
+                    },
+                    &mut bevel.amount,
+                    0.00002..=10000.,
+                );
+            } else if let Some(distances) = &mut edit.edge_chamfer {
+                finished |= scalar(ui, "First distance", &mut distances[0], 0.00002..=10000.);
+                finished |= scalar(ui, "Second distance", &mut distances[1], 0.00002..=10000.);
+                if ui.small_button("Reverse distances").clicked() {
+                    distances.swap(0, 1);
+                    finished = true;
+                }
             }
         });
     }
@@ -1479,7 +1592,7 @@ impl eframe::App for OpenSketcher {
                     if !replacing {ui.checkbox(&mut operation.keep_tools,"Keep tools");}
                     if ui.button("Swap operands").clicked() {operation.operands.swap(0,1);operation.topology.swap(0,1);}
                     let operation_changed=body!=before;
-                    let finished=evaluated_chamfers(ui,&mut body);
+                    let finished=evaluated_component_properties(ui,&mut body);
                     if body!=before {self.request_change(evaluation::Change::Edit(Box::new(body.clone()),!operation_changed));}
                     if finished {self.finish_model_edit();}
                     if ui.button(if replacing {"Remove replacement / restore source"}else if imprinting {"Remove imprint / restore inputs"}else{"Remove Boolean / restore inputs"}).clicked() {self.request_change(evaluation::Change::Delete(vec![body.id]));}
@@ -1563,7 +1676,7 @@ impl eframe::App for OpenSketcher {
                     }
                     if !draft.component_edits.is_empty() {
                         ui.label(format!("Component edits: {}",draft.component_edits.len()));
-                        finished |= evaluated_chamfers(ui,&mut draft);
+                        finished |= evaluated_component_properties(ui,&mut draft);
                         ui.weak("Curved and nonplanar component results use a regenerated faceted boundary.");
                         if ui.button("Remove component edits").clicked() { draft.component_edits.clear(); }
                         ui.label("Source profile parameters");
@@ -1638,12 +1751,7 @@ impl eframe::App for OpenSketcher {
                     }
                     if let Some(operation)=&mut draft.hollow {
                         ui.separator();ui.label("Shell · source-local units");
-                        ui.horizontal(|ui| {
-                            finished|=ui.selectable_value(&mut operation.outward,false,"Inward").changed();
-                            finished|=ui.selectable_value(&mut operation.outward,true,"Outward").changed();
-                        });
-                        finished|=scalar(ui,"Wall thickness",&mut operation.thickness,0.00001..=100.);
-                        finished|=ui.checkbox(&mut operation.closed,"Closed cavity · keep all outer faces").changed();
+                        finished |= shell_controls(ui,&mut operation.thickness,&mut operation.outward,&mut operation.closed);
                         ui.add_enabled_ui(!operation.closed,|ui| {
                         egui::ComboBox::from_id_salt("shell_opening").selected_text(format!("Opening · {}",operation.opening.label())).show_ui(ui,|ui| {
                             for face in [edge_treatments::FaceTarget::Top,edge_treatments::FaceTarget::Bottom,edge_treatments::FaceTarget::Left,edge_treatments::FaceTarget::Right,edge_treatments::FaceTarget::Front,edge_treatments::FaceTarget::Back] {

@@ -4,7 +4,109 @@ use crate::{
     model::{Body, Geometry, Shape},
 };
 use serde::{Deserialize, Serialize};
-use truck_modeling::{Matrix4, Point3, Transform, Vector3, Wire, builder};
+use truck_modeling::{
+    EuclideanSpace, InnerSpace, Matrix4, Point3, Transform, Vector3, Wire, builder,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatedShell {
+    pub thickness: f64,
+    pub outward: bool,
+    pub closed: bool,
+}
+impl EvaluatedShell {
+    pub fn validate(self) -> Result<(), String> {
+        if !self.thickness.is_finite() || self.thickness <= 1e-5 || self.thickness > 10000. {
+            return Err(
+                "Shell thickness must be finite, positive and at most 10000 local units.".into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn new(g: &Geometry) -> Result<Self, String> {
+        let planes = crate::components::planar_supports(g)?;
+        let center = g.points.iter().map(|p| p.to_vec()).sum::<Vector3>() / g.points.len() as f64;
+        let thickness = planes
+            .iter()
+            .map(|(n, d)| (*d - n.dot(center)) * 0.1)
+            .fold(0.2, f64::min);
+        let operation = Self {
+            thickness,
+            outward: false,
+            closed: false,
+        };
+        operation.validate()?;
+        Ok(operation)
+    }
+}
+
+/// Offset retained convex planes, then reuse exact planar solid subtraction.
+pub(crate) fn evaluated(
+    g: &Geometry,
+    openings: &[usize],
+    operation: EvaluatedShell,
+) -> Result<Geometry, String> {
+    operation.validate()?;
+    let planes = crate::components::planar_supports(g)?;
+    if openings.is_empty() || openings.iter().any(|face| *face >= planes.len()) {
+        return Err("Select valid planar opening faces for Shell.".into());
+    }
+    if g.shell
+        .as_ref()
+        .is_none_or(|shell| shell.connected_components().len() != 1)
+    {
+        return Err("Evaluated Shell requires one retained convex planar solid.".into());
+    }
+    let offset = |inner: bool| {
+        planes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(face, (n, d))| {
+                let opening = !operation.closed && openings.contains(&face);
+                let distance = if inner {
+                    d - if !operation.outward && !opening {
+                        operation.thickness
+                    } else {
+                        0.
+                    }
+                } else {
+                    d + if operation.outward && !opening {
+                        operation.thickness
+                    } else {
+                        0.
+                    }
+                };
+                (face, (n, distance))
+            })
+            .collect::<Vec<_>>()
+    };
+    let outer = if operation.outward {
+        crate::edge_treatments::convex_from_planes(&offset(false))?
+    } else {
+        g.clone()
+    };
+    let inner = if operation.outward {
+        g.clone()
+    } else {
+        crate::edge_treatments::convex_from_planes(&offset(true))?
+    };
+    let outer = crate::edge_treatments::planar_regions(outer)?;
+    let inner = crate::edge_treatments::planar_regions(inner)?;
+    let result = crate::edge_treatments::subtract_convex(
+        &outer,
+        inner
+            .shell
+            .as_ref()
+            .ok_or("Missing shell cavity boundary.")?,
+        outer.surface_mapping()?,
+    )?
+    .ok_or("Shell requires exact planar boundaries.")?;
+    let result = crate::edge_treatments::planar_regions(result)?;
+    crate::components::solid_parts(result.shell.as_ref().ok_or("Shell leaves no material.")?)?;
+    crate::operators::geometry(&crate::operators::solid(&result)?)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +413,304 @@ mod tests {
         viewport::Camera,
     };
     use truck_modeling::{EuclideanSpace, InnerSpace, Solid, SquareMatrix, Transform};
+    #[test]
+    fn evaluated_planar_shells_offset_treated_boolean_and_moved_solids() {
+        use crate::{
+            booleans, components,
+            face_operations::{self, FaceEdit},
+            model::evaluate_scene,
+            selection::SelectionMode,
+        };
+        let volume = |g: &Geometry| {
+            g.triangles
+                .iter()
+                .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
+                .sum::<f64>()
+        };
+        for kind in 0..5 {
+            for affine in [false, true] {
+                if kind == 2 && affine {
+                    continue;
+                }
+                let mut body = Body::new(Shape::Rectangle);
+                body.id = 1;
+                body.width = 6.;
+                body.depth = 5.;
+                body.extrusion = 4.;
+                if affine {
+                    body.position = [2., -1., 3.];
+                    body.rotation = [11., 17., 23.];
+                    body.scale = [1.5, 0.75, 2.];
+                }
+                if kind == 1 || kind == 4 {
+                    let mut modifier = crate::edge_treatments::Modifier::new(
+                        crate::edge_treatments::Kind::Chamfer,
+                        FaceTarget::Top,
+                        &body,
+                    );
+                    modifier.amount = 0.3;
+                    if kind == 1 {
+                        modifier.edge = Some(FaceTarget::Right);
+                    }
+                    body.edge_treatments.push(modifier);
+                }
+                if kind == 3 {
+                    let g = evaluate(&body).unwrap();
+                    let face = (0..g.face_count)
+                        .find(|f| {
+                            crate::edge_treatments::target(&body, &g, *f) == Ok(FaceTarget::Top)
+                        })
+                        .unwrap();
+                    body = components::transformed(
+                        &body,
+                        &g,
+                        SelectionMode::Face,
+                        Some(face),
+                        Matrix4::from_translation(
+                            crate::regions::transform(&body)
+                                .transform_vector(Vector3::unit_z() * 0.25),
+                        ),
+                    )
+                    .unwrap();
+                }
+                let mut bodies = vec![body.clone()];
+                if kind == 2 {
+                    let mut tool = body.clone();
+                    tool.id = 2;
+                    tool.width = 4.;
+                    tool.depth = 4.;
+                    tool.position[0] = 1.;
+                    bodies.push(tool);
+                    let scene = evaluate_scene(&bodies).unwrap();
+                    let mut feature = Body::new(Shape::Rectangle);
+                    feature.id = 3;
+                    feature.boolean = Some(booleans::Boolean::new(
+                        booleans::Kind::Intersect,
+                        &[(1, None), (2, None)],
+                        SelectionMode::Volume,
+                        &scene,
+                    ));
+                    bodies.push(feature);
+                }
+                let id = bodies.last().unwrap().id;
+                let owner = bodies.last().unwrap();
+                let placement = crate::regions::transform(owner);
+                let inverse = placement.invert().unwrap();
+                let scene = evaluate_scene(&bodies).unwrap();
+                let g = &scene.last().unwrap().1;
+                let mut local = g.clone();
+                components::map_geometry(&mut local, inverse);
+                let planes = components::planar_supports(&local).unwrap();
+                EvaluatedShell::new(&local).unwrap();
+                for side in [false, true] {
+                    for outward in [false, true] {
+                        for closed in [false, true] {
+                            let opening = planes
+                                .iter()
+                                .position(|(n, _)| if side { n.x > 0.99 } else { n.z > 0.99 })
+                                .unwrap();
+                            let operation = EvaluatedShell {
+                                thickness: 0.1,
+                                outward,
+                                closed,
+                            };
+                            let changes = face_operations::selected(
+                                &bodies,
+                                &scene,
+                                &[(id, Some(opening))],
+                                FaceEdit::Shell(operation),
+                            )
+                            .unwrap();
+                            let mut model = Model::from_bodies(bodies.clone());
+                            model.commit_changes(&changes).unwrap();
+                            let output = evaluate_scene(&model.bodies).unwrap();
+                            let result = &output.last().unwrap().1;
+                            assert!(result.is_solid);
+                            assert!(result.shell.as_ref().unwrap().is_geometric_consistent());
+                            assert_eq!(result.shell.as_ref().unwrap().len(), result.face_count);
+                            assert_eq!(
+                                result.face_count,
+                                planes.len() * 2 - if closed { 0 } else { 1 }
+                            );
+                            assert_eq!(
+                                result.shell.as_ref().unwrap().connected_components().len(),
+                                if closed { 2 } else { 1 }
+                            );
+                            components::solid_parts(result.shell.as_ref().unwrap()).unwrap();
+                            if kind == 1 && !affine && !side && !outward && !closed {
+                                let input = planes.iter().find(|(n, _)| n.x > 0.99).unwrap();
+                                let inner = components::straight_planar_supports(result)
+                                    .unwrap()
+                                    .iter()
+                                    .position(|(n, d)| {
+                                        (*n + input.0).magnitude() < 1e-7
+                                            && (*d + input.1 - 0.1).abs() < 1e-7
+                                    })
+                                    .unwrap();
+                                let changed = components::transformed(
+                                    &changes[0],
+                                    result,
+                                    SelectionMode::Face,
+                                    Some(inner),
+                                    Matrix4::from_translation(-input.0 * 0.02),
+                                )
+                                .unwrap();
+                                let mut edited = model.bodies.clone();
+                                *edited.last_mut().unwrap() = changed;
+                                let edited_scene = evaluate_scene(&edited).unwrap();
+                                assert!(volume(&edited_scene.last().unwrap().1) > volume(result));
+                                let dir = tempfile::tempdir().unwrap();
+                                let path = dir.path().join("shell-wall-edit.osk");
+                                Project::new(edited.clone(), Camera::default(), true, Some(id))
+                                    .save(&path)
+                                    .unwrap();
+                                assert_eq!(Project::load(&path).unwrap().bodies, edited);
+                            }
+                            let mut working = result.clone();
+                            components::map_geometry(&mut working, inverse);
+                            let after = components::straight_planar_supports(&working).unwrap();
+                            for (face, (n, d)) in planes.iter().enumerate() {
+                                let open = !closed && face == opening;
+                                let outer = *d + if outward && !open { 0.1 } else { 0. };
+                                assert!(
+                                    after
+                                        .iter()
+                                        .any(|(other, offset)| (*n - *other).magnitude() < 1e-6
+                                            && (outer - *offset).abs() < 1e-6)
+                                );
+                                if !open {
+                                    let inner = *d - if outward { 0. } else { 0.1 };
+                                    assert!(
+                                        after
+                                            .iter()
+                                            .any(|(other, offset)| (*n + *other).magnitude()
+                                                < 1e-6
+                                                && (inner + *offset).abs() < 1e-6)
+                                    );
+                                }
+                            }
+                            if kind != 1 && kind != 4 {
+                                let (w, d, h) = (
+                                    if kind == 2 { 4. } else { 6. },
+                                    if kind == 2 { 4. } else { 5. },
+                                    if kind == 3 { 4.25 } else { 4. },
+                                );
+                                let expected = if outward {
+                                    (w + if !closed && side { 0.1 } else { 0.2 })
+                                        * (d + 0.2)
+                                        * (h + if !closed && !side { 0.1 } else { 0.2 })
+                                        - w * d * h
+                                } else {
+                                    w * d * h
+                                        - (w - if !closed && side { 0.1 } else { 0.2 })
+                                            * (d - 0.2)
+                                            * (h - if !closed && !side { 0.1 } else { 0.2 })
+                                };
+                                assert!(
+                                    (volume(result) - expected * if affine { 2.25 } else { 1. })
+                                        .abs()
+                                        < 1e-5,
+                                    "kind={kind} side={side} outward={outward} closed={closed}"
+                                );
+                            }
+                            for format in [
+                                crate::export::Format::Stl,
+                                crate::export::Format::Glb,
+                                crate::export::Format::Step,
+                                crate::export::Format::Dxf,
+                            ] {
+                                assert!(
+                                    !crate::export::encode(&model.bodies, format)
+                                        .unwrap()
+                                        .is_empty()
+                                );
+                            }
+                            let dir = tempfile::tempdir().unwrap();
+                            let path = dir.path().join("evaluated-shell.osk");
+                            let project = Project::new(
+                                model.bodies.clone(),
+                                Camera::default(),
+                                true,
+                                Some(id),
+                            );
+                            project.save(&path).unwrap();
+                            assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+                            let mut old = serde_json::to_value(&project).unwrap();
+                            old["schema_version"] = 35.into();
+                            old["modeling_version"] = 35.into();
+                            assert!(
+                                serde_json::from_value::<Project>(old)
+                                    .unwrap()
+                                    .validate()
+                                    .unwrap_err()
+                                    .contains("version 36")
+                            );
+                            let before = model.bodies.clone();
+                            let mut invalid = changes[0].clone();
+                            invalid.component_edits.last_mut().unwrap().face_edit =
+                                Some(FaceEdit::Shell(EvaluatedShell {
+                                    thickness: 100.,
+                                    outward: false,
+                                    closed,
+                                }));
+                            assert!(model.commit(invalid).is_err());
+                            assert_eq!(model.bodies, before);
+                            model.undo();
+                            assert_eq!(model.bodies, bodies);
+                            model.redo();
+                            assert_eq!(model.bodies, before);
+                            let mut removed = changes[0].clone();
+                            removed.component_edits.pop();
+                            model.commit(removed).unwrap();
+                            assert!(
+                                (volume(&evaluate_scene(&model.bodies).unwrap().last().unwrap().1)
+                                    - volume(g))
+                                .abs()
+                                    < 1e-6
+                            );
+                            if kind == 1
+                                && !affine
+                                && !side
+                                && !outward
+                                && !closed
+                                && let Some(path) =
+                                    std::env::var_os("OSK_EVALUATED_SHELL_REVIEW_PROJECT")
+                            {
+                                let mut review =
+                                    Project::new(bodies.clone(), Camera::default(), true, Some(id));
+                                review.selection_mode = SelectionMode::Face;
+                                review.selected_element = Some(opening);
+                                review.selection = vec![(id, Some(opening))];
+                                review.save(std::path::Path::new(&path)).unwrap();
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    evaluated(
+                        &local,
+                        &(0..planes.len()).collect::<Vec<_>>(),
+                        EvaluatedShell {
+                            thickness: 0.1,
+                            outward: false,
+                            closed: false
+                        }
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            EvaluatedShell {
+                thickness: f64::NAN,
+                outward: false,
+                closed: false
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
     #[test]
     fn primitive_shells_preserve_exact_thickness_openings_history_and_exports() {
         for shape in [Shape::Rectangle, Shape::Circle, Shape::Semicircle] {

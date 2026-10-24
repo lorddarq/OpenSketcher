@@ -17,6 +17,7 @@ pub enum FaceEdit {
     Cap,
     Heal,
     CapOpenings,
+    Shell(crate::shelling::EvaluatedShell),
 }
 impl FaceEdit {
     pub fn label(self) -> &'static str {
@@ -25,6 +26,7 @@ impl FaceEdit {
             Self::Cap => "Delete face · Cap",
             Self::Heal => "Delete face · Heal",
             Self::CapOpenings => "Cap openings",
+            Self::Shell(_) => "Shell",
         }
     }
 }
@@ -86,6 +88,9 @@ pub fn selected(
                 prismatic_cut: false,
                 face_edit: Some(kind),
                 edge_chamfer: None,
+                prism_chamfer: false,
+                prism_bevel: None,
+                prism_curves: false,
                 mode: SelectionMode::Face,
                 element: face,
                 elements: faces.into_iter().filter(|other| *other != face).collect(),
@@ -100,6 +105,9 @@ pub fn selected(
 }
 
 pub(crate) fn apply(g: &Geometry, selected: &[usize], kind: FaceEdit) -> Result<Geometry, String> {
+    if let FaceEdit::Shell(operation) = kind {
+        return crate::shelling::evaluated(g, selected, operation);
+    }
     if kind == FaceEdit::Heal {
         return if crate::components::planar_supports(g).is_ok() {
             crate::edge_treatments::heal_planar_faces(g, selected)

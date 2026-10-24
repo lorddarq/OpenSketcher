@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 32,
-            modeling_version: 32,
+            schema_version: 36,
+            modeling_version: 36,
             bodies,
             camera,
             snapping,
@@ -61,11 +61,47 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=32) || !matches!(self.modeling_version, 1..=32) {
+        if !matches!(self.schema_version, 1..=36) || !matches!(self.modeling_version, 1..=36) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–32 and modeling versions 1–32."
+                "Unsupported .osk version. This application supports schema versions 1–36 and modeling versions 1–36."
                     .into(),
             );
+        }
+        if (self.schema_version < 36 || self.modeling_version < 36)
+            && self.bodies.iter().any(|b| {
+                b.component_edits.iter().any(|e| {
+                    matches!(
+                        e.face_edit,
+                        Some(crate::face_operations::FaceEdit::Shell(_))
+                    )
+                })
+            })
+        {
+            return Err("Evaluated planar shells require .osk version 36.".into());
+        }
+        if (self.schema_version < 35 || self.modeling_version < 35)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.prism_curves))
+        {
+            return Err("Curve-preserving prism treatments require .osk version 35.".into());
+        }
+        if (self.schema_version < 34 || self.modeling_version < 34)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.prism_bevel.is_some()))
+        {
+            return Err("Analytic prism bevels require .osk version 34.".into());
+        }
+        if (self.schema_version < 33 || self.modeling_version < 33)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.prism_chamfer))
+        {
+            return Err("Prismatic corner chamfers require .osk version 33.".into());
         }
         if (self.schema_version < 32 || self.modeling_version < 32)
             && self
@@ -383,8 +419,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 32;
-        project.modeling_version = 32;
+        project.schema_version = 36;
+        project.modeling_version = 36;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

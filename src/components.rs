@@ -38,6 +38,12 @@ pub struct ComponentEdit {
     /// Source-local setbacks on the two adjacent evaluated support faces.
     #[serde(default)]
     pub edge_chamfer: Option<[f64; 2]>,
+    #[serde(default)]
+    pub prism_chamfer: bool,
+    #[serde(default)]
+    pub prism_bevel: Option<crate::edge_treatments::PrismBevel>,
+    #[serde(default)]
+    pub prism_curves: bool,
     pub mode: SelectionMode,
     pub element: usize,
     #[serde(default)]
@@ -331,6 +337,9 @@ fn transformed_many(
             prismatic_cut: false,
             face_edit: None,
             edge_chamfer: None,
+            prism_chamfer: false,
+            prism_bevel: None,
+            prism_curves: false,
             mode,
             element,
             elements: elements.iter().skip(1).copied().collect(),
@@ -370,6 +379,9 @@ pub fn sweep_face(body: &Body, g: &Geometry, face: usize, distance: f64) -> Resu
         prismatic_cut: true,
         face_edit: None,
         edge_chamfer: None,
+        prism_chamfer: false,
+        prism_bevel: None,
+        prism_curves: false,
         mode: SelectionMode::Face,
         element: face,
         elements: Vec::new(),
@@ -458,12 +470,13 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
                 || edit.face_edit.is_some()))
             || (edit.tangent_walls && edit.sweep.is_none())
             || (edit.prismatic_cut && (!edit.tangent_walls || edit.sweep.is_none()))
-            || edit.face_edit.is_some_and(|_| {
+            || edit.face_edit.is_some_and(|kind| {
                 !edit.evaluated
                     || edit.mode != SelectionMode::Face
                     || edit.retrim
                     || edit.sweep.is_some()
                     || m != Matrix4::identity()
+                    || matches!(kind,crate::face_operations::FaceEdit::Shell(operation) if operation.validate().is_err())
             })
             || edit.edge_chamfer.is_some_and(|distances| {
                 !edit.evaluated
@@ -476,6 +489,22 @@ pub fn validate(edits: &[ComponentEdit]) -> Result<(), String> {
                     || distances
                         .iter()
                         .any(|d| !d.is_finite() || *d <= 1e-5 || *d > 10000.)
+            })
+            || (edit.prism_chamfer && edit.edge_chamfer.is_none())
+            || (edit.prism_curves && !edit.prism_chamfer && edit.prism_bevel.is_none())
+            || edit.prism_bevel.is_some_and(|bevel| {
+                !edit.evaluated
+                    || edit.mode != SelectionMode::Edge
+                    || edit.edge_chamfer.is_some()
+                    || edit.prism_chamfer
+                    || edit.retrim
+                    || edit.section_transform
+                    || edit.sweep.is_some()
+                    || edit.face_edit.is_some()
+                    || m != Matrix4::identity()
+                    || !bevel.amount.is_finite()
+                    || bevel.amount <= 1e-5
+                    || bevel.amount > 10000.
             })
             || edit.sweep.is_some_and(|v| {
                 edit.mode != SelectionMode::Face
@@ -542,9 +571,16 @@ fn apply_stage(body: &Body, g: &mut Geometry, evaluated: bool) -> Result<(), Str
         if edit.topology != g.topology {
             return Err("An upstream edit changed component topology. Undo it or remove component edits before changing topology.".into());
         }
+        if let Some(bevel)=edit.prism_bevel {
+            let edges=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
+            *g=crate::edge_treatments::bevel_prism(g,&edges,bevel,edit.prism_curves)?;
+            return Ok(());
+        }
         if let Some(distances)=edit.edge_chamfer {
             let edges=std::iter::once(edit.element).chain(edit.elements.iter().copied()).collect::<Vec<_>>();
-            *g=crate::edge_treatments::chamfer_evaluated(g,&edges,distances)?;
+            *g=if edit.prism_chamfer {
+                crate::edge_treatments::chamfer_prism(g,&edges,distances,edit.prism_curves)?
+            }else{crate::edge_treatments::chamfer_evaluated(g,&edges,distances)?};
             return Ok(());
         }
         if let Some(kind)=edit.face_edit {

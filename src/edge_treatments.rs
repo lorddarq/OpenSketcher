@@ -82,6 +82,12 @@ pub enum Style {
     Flat,
     Rounded,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrismBevel {
+    pub amount: f64,
+    pub style: Style,
+}
 /// Distances are source-local setbacks; the angle is measured from the
 /// selected face (from the adjacent face when direction is reversed).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -367,7 +373,7 @@ pub fn selected_operations(
             .collect::<Vec<_>>();
         match source_operations(bodies, scene, &selected, mode, kind) {
             Ok(source) => changed.extend(source),
-            Err(source_error) if kind == Kind::Chamfer => {
+            Err(source_error) => {
                 let evaluated = (|| {
                     let source = bodies.iter().find(|b| b.id == id).ok_or("Missing body.")?;
                     let mut g = scene
@@ -409,7 +415,19 @@ pub fn selected_operations(
                         .iter()
                         .map(|[a, b]| (g.points[*b] - g.points[*a]).magnitude() * 0.1)
                         .fold(0.2, f64::min);
-                    chamfer_evaluated(&g, &edges, [amount; 2])?;
+                    let prism_chamfer = crate::components::convex_supports(&g).is_err();
+                    let prism_curves = kind == Kind::Bevel || prism_chamfer;
+                    let prism_bevel = (kind == Kind::Bevel).then_some(PrismBevel {
+                        amount,
+                        style: Style::Rounded,
+                    });
+                    if let Some(bevel) = prism_bevel {
+                        bevel_prism(&g, &edges, bevel, prism_curves)?;
+                    } else if prism_chamfer {
+                        chamfer_prism(&g, &edges, [amount; 2], prism_curves)?;
+                    } else {
+                        chamfer_evaluated(&g, &edges, [amount; 2])?;
+                    }
                     let element = *edges.first().ok_or("No boundary edges selected.")?;
                     let mut body = source.clone();
                     body.component_edits.push(crate::components::ComponentEdit {
@@ -420,7 +438,10 @@ pub fn selected_operations(
                         tangent_walls: false,
                         prismatic_cut: false,
                         face_edit: None,
-                        edge_chamfer: Some([amount; 2]),
+                        edge_chamfer: (kind == Kind::Chamfer).then_some([amount; 2]),
+                        prism_chamfer: kind == Kind::Chamfer && prism_chamfer,
+                        prism_bevel,
+                        prism_curves,
                         mode: SelectionMode::Edge,
                         element,
                         elements: edges.into_iter().skip(1).collect(),
@@ -431,11 +452,13 @@ pub fn selected_operations(
                     Ok(body)
                 })()
                 .map_err(|reason: String| {
-                    format!("Chamfer · body {id}: {source_error} Evaluated boundary: {reason}")
+                    format!(
+                        "{} · body {id}: {source_error} Evaluated boundary: {reason}",
+                        kind.label()
+                    )
                 })?;
                 changed.push(evaluated);
             }
-            Err(error) => return Err(error),
         }
     }
     Ok(changed)
@@ -644,6 +667,39 @@ fn linear_polygons(
     Some(polygons)
 }
 
+fn chamfer_corner(
+    g: &Geometry,
+    planes: impl Fn(usize) -> Option<(Vector3, f64)>,
+    edge: usize,
+) -> Result<([usize; 2], Vector3), String> {
+    if edge >= g.edge_count || g.internal_edges.contains(&edge) {
+        return Err("Selected chamfer edge no longer exists.".into());
+    }
+    let [a, b] = g.topology.edges[edge];
+    let direction = g.points[b] - g.points[a];
+    if direction.magnitude2() < 1e-16 {
+        return Err("Chamfer edge is degenerate.".into());
+    }
+    let owners = g
+        .topology
+        .faces
+        .iter()
+        .enumerate()
+        .filter(|(_, edges)| edges.contains(&edge))
+        .map(|(face, _)| face)
+        .collect::<Vec<_>>();
+    let [first, second] = owners.as_slice() else {
+        return Err("Chamfer requires an edge shared by exactly two faces.".into());
+    };
+    let (n1, _) = planes(*first).ok_or("Select an edge between two planar support faces.")?;
+    let (n2, _) = planes(*second).ok_or("Select an edge between two planar support faces.")?;
+    let cosine = n1.dot(n2);
+    if cosine.abs() > 1. - 1e-8 {
+        return Err("Coplanar or folded boundaries do not define a chamfer corner.".into());
+    }
+    Ok(([*first, *second], direction))
+}
+
 /// Cut the selected straight support intersections on a retained convex solid.
 /// The cut planes and neighboring faces are reconstructed as shared B-rep edges.
 pub(crate) fn chamfer_evaluated(
@@ -670,31 +726,11 @@ pub(crate) fn chamfer_evaluated(
         .ok_or("Chamfer requires straight planar boundary loops.")?;
     let mut cuts: Vec<(Vector3, f64)> = Vec::new();
     for &edge in selected {
-        if edge >= g.edge_count || g.internal_edges.contains(&edge) {
-            return Err("Selected chamfer edge no longer exists.".into());
-        }
-        let [a, b] = g.topology.edges[edge];
-        let direction = g.points[b] - g.points[a];
-        if direction.magnitude2() < 1e-16 {
-            return Err("Chamfer edge is degenerate.".into());
-        }
-        let owners = g
-            .topology
-            .faces
-            .iter()
-            .enumerate()
-            .filter(|(_, edges)| edges.contains(&edge))
-            .map(|(face, _)| face)
-            .collect::<Vec<_>>();
-        let [first, second] = owners.as_slice() else {
-            return Err("Chamfer requires an edge shared by exactly two faces.".into());
-        };
-        let (n1, _) = planes[*first];
-        let (n2, _) = planes[*second];
+        let ([first, second], direction) = chamfer_corner(g, |face| Some(planes[face]), edge)?;
+        let [a, _] = g.topology.edges[edge];
+        let (n1, _) = planes[first];
+        let (n2, _) = planes[second];
         let cosine = n1.dot(n2);
-        if cosine.abs() > 1. - 1e-8 {
-            return Err("Coplanar or folded boundaries do not define a chamfer corner.".into());
-        }
         let p = g.points[a] - (n2 - n1 * cosine).normalize() * distances[0];
         let q = g.points[a] - (n1 - n2 * cosine).normalize() * distances[1];
         let mut normal = direction.cross(q - p).normalize();
@@ -718,6 +754,393 @@ pub(crate) fn chamfer_evaluated(
     let mut result = join_linear_faces(faces)?;
     crate::components::planar_supports(&result)?;
     result.retain_circles(&g.circles);
+    Ok(result)
+}
+
+/// Local full-depth corner treatment on a proven straight prism. Work on the
+/// complete cap, then sweep it, so concave corners add material without CSG.
+pub(crate) fn chamfer_prism(
+    g: &Geometry,
+    selected: &[usize],
+    distances: [f64; 2],
+    preserve_curves: bool,
+) -> Result<Geometry, String> {
+    prism_corner(g, selected, distances, None, preserve_curves)
+}
+
+pub(crate) fn bevel_prism(
+    g: &Geometry,
+    selected: &[usize],
+    bevel: PrismBevel,
+    preserve_curves: bool,
+) -> Result<Geometry, String> {
+    prism_corner(
+        g,
+        selected,
+        [bevel.amount; 2],
+        (bevel.style == Style::Rounded).then_some(bevel.amount),
+        preserve_curves,
+    )
+}
+
+fn prism_corner(
+    g: &Geometry,
+    selected: &[usize],
+    distances: [f64; 2],
+    radius: Option<f64>,
+    preserve_curves: bool,
+) -> Result<Geometry, String> {
+    use crate::{booleans, snapping::Plane};
+    use truck_modeling::builder;
+    if selected.is_empty()
+        || distances
+            .iter()
+            .any(|d| !d.is_finite() || *d <= 1e-5 || *d > 10000.)
+    {
+        return Err("Select edges and supply finite positive chamfer setbacks.".into());
+    }
+    let source = g
+        .shell
+        .as_ref()
+        .ok_or("Treatment requires retained boundaries.")?;
+    if !g.is_solid || !(4..=256).contains(&g.face_count) || source.connected_components().len() != 1
+    {
+        return Err("Treatment requires one connected retained solid with 4–256 faces.".into());
+    }
+    let mapping = g.surface_mapping()?;
+    let supports = if preserve_curves {
+        use truck_modeling::{ParametricSurface, Surface};
+        (0..g.face_count)
+            .map(|role| {
+                let mut plane: Option<(Vector3, f64)> = None;
+                for (face, _) in source
+                    .iter()
+                    .zip(mapping)
+                    .filter(|(_, group)| **group == role)
+                {
+                    let Surface::Plane(surface) = face.oriented_surface() else {
+                        return None;
+                    };
+                    let normal = surface.normal().normalize();
+                    let distance = normal.dot(surface.subs(0., 0.).to_vec());
+                    if plane.is_some_and(|(n, d)| {
+                        (n - normal).magnitude() > 1e-7 || (d - distance).abs() > 1e-7
+                    }) {
+                        return None;
+                    }
+                    plane = Some((normal, distance));
+                }
+                plane
+            })
+            .collect::<Vec<_>>()
+    } else {
+        crate::components::straight_planar_supports(g)?
+            .into_iter()
+            .map(Some)
+            .collect()
+    };
+    if supports.iter().enumerate().any(|(i, plane)| {
+        plane.is_some_and(|(n, d)| {
+            supports[..i].iter().enumerate().any(|(j, other)| {
+                other.is_some_and(|(other, offset)| {
+                    (n - other).magnitude() < 1e-7
+                        && (d - offset).abs() < 1e-7
+                        && g.topology.faces[i]
+                            .iter()
+                            .any(|edge| g.topology.faces[j].contains(edge))
+                })
+            })
+        })
+    }) {
+        return Err(
+            "Local treatment cannot yet preserve independently split coplanar support faces."
+                .into(),
+        );
+    }
+    let mut result = g.clone();
+    for &edge in selected {
+        let ([first, second], direction) = chamfer_corner(g, |face| supports[face], edge)?;
+        let [a, b] = g.topology.edges[edge];
+        let unit = direction.normalize();
+        let plane = (0..g.face_count)
+            .filter_map(|face| Plane::face(g, face))
+            .find(|plane| {
+                plane.normal.dot(unit) > 1. - 1e-7
+                    && (g.points[b] - plane.origin).dot(unit).abs() < 1e-7
+            })
+            .ok_or("Local chamfer requires a complete straight-prism corner edge.")?;
+        let Some((depth, caps)) = crate::face_extrusions::prismatic_section(g, plane)? else {
+            return Err("Local chamfer requires two complete parallel prism caps.".into());
+        };
+        if caps.is_empty()
+            || caps.iter().any(|cap| mapping[*cap] != mapping[caps[0]])
+            || (depth - direction.magnitude()).abs() > 1e-7
+        {
+            return Err("Select a full-depth edge between two unsplit prism caps.".into());
+        }
+        let (n1, _) = supports[first].unwrap();
+        let (n2, _) = supports[second].unwrap();
+        let cosine = n1.dot(n2);
+        let distances = radius.map_or(distances, |r| {
+            [r * ((1. - cosine) / (1. + cosine)).sqrt(); 2]
+        });
+        if radius.is_some() || preserve_curves {
+            let current=crate::face_extrusions::prismatic_section(&result,plane)?
+                .ok_or("An earlier treatment changed this prism direction; select parallel full-depth edges." )?;
+            if (current.0 - depth).abs() > 1e-7 {
+                return Err("An earlier treatment changed the prism depth.".into());
+            }
+        }
+        let tangent = source
+            .iter()
+            .zip(mapping)
+            .filter(|(_, role)| **role == first)
+            .flat_map(|(face, _)| face.edge_iter())
+            .find_map(|e| {
+                let x = e.front().point();
+                let y = e.back().point();
+                if (x - g.points[a]).magnitude() < 1e-7 && (y - g.points[b]).magnitude() < 1e-7 {
+                    Some(direction)
+                } else if (y - g.points[a]).magnitude() < 1e-7
+                    && (x - g.points[b]).magnitude() < 1e-7
+                {
+                    Some(-direction)
+                } else {
+                    None
+                }
+            })
+            .ok_or("Cannot resolve oriented chamfer edge.")?;
+        let concave = n1.cross(tangent).dot(n2) > 0.;
+        let sign = if concave { 1. } else { -1. };
+        let p = g.points[b] + (n2 - n1 * cosine).normalize() * distances[0] * sign;
+        let q = g.points[b] + (n1 - n2 * cosine).normalize() * distances[1] * sign;
+        // Both setback endpoints must remain within their actual side faces,
+        // not just within the infinite supporting planes.
+        for (face, point, normal) in [(first, p, n1), (second, q, n2)] {
+            let point = point - direction * 0.5;
+            if !g
+                .triangles
+                .iter()
+                .zip(&g.triangle_faces)
+                .filter(|(_, f)| **f == face)
+                .any(|(t, _)| {
+                    (0..3).all(|i| (t[(i + 1) % 3] - t[i]).cross(point - t[i]).dot(normal) >= -1e-8)
+                })
+            {
+                return Err(
+                    "Chamfer setback leaves its adjacent face; reduce the distances.".into(),
+                );
+            }
+        }
+        let mut points = [g.points[b], p, q];
+        if (p - g.points[b]).cross(q - g.points[b]).dot(unit) < 0. {
+            points.swap(1, 2);
+        }
+        let vertices = points.map(builder::vertex);
+        let wire = (0..3)
+            .map(|i| {
+                if i == 1
+                    && let Some(radius) = radius
+                {
+                    let center = g.points[b] + (n1 + n2) * (sign * radius / (1. + cosine));
+                    let middle = center + (g.points[b] - center).normalize() * radius;
+                    builder::circle_arc(&vertices[1], &vertices[2], middle)
+                } else {
+                    builder::line(&vertices[i], &vertices[(i + 1) % 3])
+                }
+            })
+            .collect();
+        let triangle = builder::try_attach_plane(&[wire]).map_err(|e| e.to_string())?;
+        let tool = crate::model::tessellate(&vec![triangle].into())?;
+        let current_cap = (0..result.face_count)
+            .find(|face| {
+                Plane::face(&result, *face).is_some_and(|other| {
+                    other.normal.dot(unit) > 1. - 1e-7
+                        && (other.origin - plane.origin).dot(unit).abs() < 1e-7
+                })
+            })
+            .ok_or("The previous chamfer changed the cap reference.")?;
+        let operation = booleans::Boolean {
+            kind: if concave {
+                booleans::Kind::Union
+            } else {
+                booleans::Kind::Subtract
+            },
+            operands: [(1, Some(current_cap)), (2, Some(0))],
+            topology: [result.topology.clone(), tool.topology.clone()],
+            keep_tools: false,
+            analytic_crossings: false,
+            analytic_faces: true,
+            analytic_prisms: false,
+        };
+        let sheet = crate::booleans::faces(&operation, &[&result, &tool])?;
+        let area = |geometry: &Geometry, face: Option<usize>| {
+            geometry
+                .triangles
+                .iter()
+                .zip(&geometry.triangle_faces)
+                .filter(|(_, f)| face.is_none_or(|face| **f == face))
+                .map(|(t, _)| (t[1] - t[0]).cross(t[2] - t[0]).magnitude() * 0.5)
+                .sum::<f64>()
+        };
+        let change = (area(&sheet, None) - area(&result, Some(current_cap)))
+            * if concave { 1. } else { -1. };
+        let expected = area(&tool, None);
+        if (change - expected).abs() > 1e-7 * expected.max(1.) {
+            return Err("Chamfer reaches other geometry or overlaps another treatment; reduce the distances.".into());
+        }
+        let cap_shell = sheet.shell.ok_or("Chamfer leaves no cap material.")?;
+        if cap_shell.len() != 1 {
+            return Err("Chamfer splits the body; reduce the distances.".into());
+        }
+        let swept = builder::tsweep(&cap_shell[0].inverse(), -unit * depth);
+        result = crate::operators::geometry(&swept)?;
+        if radius.is_some() || preserve_curves {
+            // Preserve curved bands and merge only connected coplanar patches.
+            // The planar arrangement retains curved cap trims exactly.
+            use truck_modeling::{ParametricSurface, Shell, Surface};
+            let mut groups: Vec<(Option<Plane>, Shell)> = Vec::new();
+            for face in result.shell.as_ref().unwrap() {
+                if let Surface::Plane(surface) = face.oriented_surface() {
+                    let origin = surface.subs(0., 0.);
+                    let normal = surface.normal().normalize();
+                    let u = (surface.subs(1., 0.) - origin).normalize();
+                    let plane = Plane {
+                        origin,
+                        normal,
+                        u,
+                        v: normal.cross(u),
+                    };
+                    if let Some((_, patches)) = groups.iter_mut().find(|(other, _)| {
+                        other.is_some_and(|other| {
+                            (normal - other.normal).magnitude() < 1e-7
+                                && (origin - other.origin).dot(normal).abs() < 1e-7
+                        })
+                    }) {
+                        patches.push(face.clone());
+                    } else {
+                        groups.push((Some(plane), vec![face.clone()].into()));
+                    }
+                } else {
+                    groups.push((None, vec![face.clone()].into()));
+                }
+            }
+            let mut merged = Shell::default();
+            for (plane, patches) in groups {
+                if let Some(plane) = plane {
+                    for component in patches.connected_components() {
+                        let directed = component
+                            .extract_boundaries()
+                            .into_iter()
+                            .flat_map(|wire| wire.into_iter())
+                            .collect();
+                        merged.extend(crate::curve_imprints::planar_arrangement(plane, directed)?);
+                    }
+                } else {
+                    merged.extend(patches);
+                }
+            }
+            let retained = merged
+                .iter()
+                .filter_map(|f| match f.oriented_surface() {
+                    Surface::Plane(p) => Some((p.normal().normalize(), p.subs(0., 0.))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if supports.iter().flatten().any(|(n, d)| {
+                !retained.iter().any(|(other, origin)| {
+                    (*n - *other).magnitude() < 1e-7 && (n.dot(origin.to_vec()) - *d).abs() < 1e-7
+                })
+            }) {
+                return Err("Bevel consumes an existing support face; reduce its radius.".into());
+            }
+            crate::components::solid_parts(&merged)?;
+            if preserve_curves {
+                // Preserve outer-loop position, but order independent holes
+                // before the shared solid canonicalizer rotates/sorts faces.
+                let key = |p: Point3| [p.x, p.y, p.z].map(|v| (v * 1e7).round() as i64);
+                let merged = merged
+                    .iter()
+                    .map(|face| {
+                        let mut wires = face.boundaries();
+                        wires[1..].sort_by_cached_key(|wire| {
+                            wire.iter().map(|e| key(e.front().point())).min()
+                        });
+                        truck_modeling::Face::new(wires, face.oriented_surface())
+                    })
+                    .collect::<Shell>();
+                let solid = truck_modeling::Solid::try_new(merged.connected_components())
+                    .map_err(|e| e.to_string())?;
+                result = crate::operators::geometry(&solid)?;
+            } else {
+                result = crate::model::tessellate(&merged)?;
+                result.is_solid = true;
+            }
+            continue;
+        }
+        let after = crate::components::straight_planar_supports(&result)?;
+        if supports.iter().flatten().any(|(n, d)| {
+            !after.iter().any(|(other, offset)| {
+                (*n - *other).magnitude() < 1e-7 && (*d - *offset).abs() < 1e-7
+            })
+        }) {
+            return Err("Chamfer consumes an existing support face; reduce the distances.".into());
+        }
+        // Reconcile collinear cap fragments into connected logical walls. The
+        // shared joiner keeps disconnected regions on one plane independent.
+        let roles = after
+            .iter()
+            .map(|(n, d)| {
+                after
+                    .iter()
+                    .position(|(other, offset)| {
+                        (*n - *other).magnitude() < 1e-7 && (*d - *offset).abs() < 1e-7
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let polygons = linear_polygons(result.shell.as_ref().unwrap(), &roles, true)
+            .ok_or("Cannot reconstruct chamfer planar faces.")?;
+        result = join_linear_faces(polygons)?;
+        result = planar_regions(result)?;
+    }
+    result.retain_circles(&g.circles);
+    Ok(result)
+}
+
+/// Reconcile a planar retained result into one face per connected logical region.
+pub(crate) fn planar_regions(result: Geometry) -> Result<Geometry, String> {
+    use crate::snapping::Plane;
+    let source = result
+        .shell
+        .as_ref()
+        .ok_or("No retained planar material remains.")?;
+    let roles = result.surface_mapping()?;
+    let mut merged = truck_modeling::Shell::default();
+    for role in 0..result.face_count {
+        let patches = source
+            .iter()
+            .zip(roles)
+            .filter(|(_, group)| **group == role)
+            .map(|(face, _)| face.clone())
+            .collect::<truck_modeling::Shell>();
+        let directed = patches
+            .extract_boundaries()
+            .into_iter()
+            .flat_map(|wire| wire.into_iter())
+            .collect();
+        let faces = crate::curve_imprints::planar_arrangement(
+            Plane::face(&result, role).ok_or("Missing planar chamfer region.")?,
+            directed,
+        )?;
+        if faces.len() != 1 {
+            return Err("Chamfer creates an ambiguous planar region.".into());
+        }
+        merged.extend(faces);
+    }
+    crate::components::solid_parts(&merged)?;
+    let mut result = crate::model::tessellate(&merged)?;
+    result.is_solid = true;
     Ok(result)
 }
 
@@ -1345,8 +1768,12 @@ pub(crate) fn heal_planar_faces(g: &Geometry, removed: &[usize]) -> Result<Geome
         .enumerate()
         .filter(|(i, _)| !removed.contains(i))
         .collect::<Vec<_>>();
+    convex_from_planes(&planes)
+}
+
+pub(crate) fn convex_from_planes(planes: &[(usize, (Vector3, f64))]) -> Result<Geometry, String> {
     if !(4..=64).contains(&planes.len()) {
-        return Err("Heal requires 4–64 remaining convex planar supports.".into());
+        return Err("Plane reconstruction requires 4–64 convex planar supports.".into());
     }
     let mut corners = Vec::<Point3>::new();
     for i in 0..planes.len() {
@@ -1379,7 +1806,7 @@ pub(crate) fn heal_planar_faces(g: &Geometry, removed: &[usize]) -> Result<Geome
         }
     }
     let mut faces = Vec::new();
-    for (group, (n, d)) in planes {
+    for &(group, (n, d)) in planes {
         let mut points = corners
             .iter()
             .copied()
@@ -1512,6 +1939,766 @@ mod tests {
             .map(|t| t[0].to_vec().dot(t[1].to_vec().cross(t[2].to_vec())) / 6.)
             .sum()
     }
+    // Integrate retained cap curves rather than measuring the 0.01-tolerance
+    // viewport triangles when checking an analytic fillet's small volume.
+    fn prism_volume(g: &Geometry, axis: Vector3) -> f64 {
+        use truck_modeling::{BoundedCurve, ParametricCurve, Surface};
+        let origin = g.points[0];
+        let axis = axis.normalize();
+        let mut area = 0.;
+        for face in g.shell.as_ref().unwrap() {
+            if !matches!(face.oriented_surface(),Surface::Plane(p) if p.normal().normalize().dot(axis)>1.-1e-7)
+            {
+                continue;
+            }
+            for edge in face.edge_iter() {
+                let curve = edge.oriented_curve();
+                let (lo, hi) = curve.range_tuple();
+                let step = (hi - lo) / 128.;
+                let value = |i| {
+                    let t = lo + step * i as f64;
+                    (curve.subs(t) - origin).cross(curve.der(t)).dot(axis) * 0.5
+                };
+                area += (value(0)
+                    + value(128)
+                    + (1..128)
+                        .map(|i| value(i) * if i % 2 == 0 { 2. } else { 4. })
+                        .sum::<f64>())
+                    * step
+                    / 3.;
+            }
+        }
+        let (lo, hi) = g
+            .points
+            .iter()
+            .map(|p| (*p - origin).dot(axis))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        area * (hi - lo)
+    }
+    #[test]
+    fn prismatic_concave_and_outer_corners_chamfer_locally_with_history() {
+        use crate::{booleans, components, selection::SelectionMode};
+        use truck_modeling::{Deg, Matrix4};
+        for hole in [false, true] {
+            for affine in [false, true] {
+                for inner in [false, true] {
+                    let mut a = Body::new(Shape::Rectangle);
+                    a.id = 1;
+                    a.width = 6.;
+                    a.depth = 6.;
+                    a.extrusion = 3.;
+                    let mut b = a.clone();
+                    b.id = 2;
+                    b.width = if hole { 2. } else { 4. };
+                    b.depth = 2.;
+                    b.position[0] = if hole { 0. } else { 2. };
+                    let transform = if affine {
+                        Matrix4::from_angle_z(Deg(23.))
+                            * Matrix4::from_angle_x(Deg(17.))
+                            * Matrix4::from_nonuniform_scale(1.5, 0.75, 2.)
+                    } else {
+                        Matrix4::identity()
+                    };
+                    if affine {
+                        for body in [&mut a, &mut b] {
+                            body.position = transform
+                                .transform_point(Point3::from(body.position))
+                                .into();
+                            body.rotation = [17., 0., 23.];
+                            body.scale = [1.5, 0.75, 2.];
+                        }
+                    }
+                    let mut bodies = vec![a, b];
+                    let source = evaluate_scene(&bodies).unwrap();
+                    let mut feature = Body::new(Shape::Rectangle);
+                    feature.id = 3;
+                    feature.boolean = Some(booleans::Boolean::new(
+                        booleans::Kind::Subtract,
+                        &[(1, None), (2, None)],
+                        SelectionMode::Volume,
+                        &source,
+                    ));
+                    bodies.push(feature);
+                    let scene = evaluate_scene(&bodies).unwrap();
+                    let g = &scene[2].1;
+                    let inverse = transform.invert().unwrap();
+                    let target = if inner {
+                        if hole { [-1., -1.] } else { [0., -1.] }
+                    } else {
+                        [-3., -3.]
+                    };
+                    let edge = g
+                        .topology
+                        .edges
+                        .iter()
+                        .position(|[a, b]| {
+                            let p = inverse.transform_point(g.points[*a]);
+                            let q = inverse.transform_point(g.points[*b]);
+                            (p.x - target[0]).abs() < 1e-6
+                                && (p.y - target[1]).abs() < 1e-6
+                                && (q.x - target[0]).abs() < 1e-6
+                                && (q.y - target[1]).abs() < 1e-6
+                                && (p.z - q.z).abs() > 2.9
+                        })
+                        .unwrap_or_else(|| panic!("Missing corner: hole={hole}, affine={affine}, inner={inner}, points={:?}",g.points));
+                    let mut changes = selected_operations(
+                        &bodies,
+                        &scene,
+                        &[(3, Some(edge))],
+                        SelectionMode::Edge,
+                        Kind::Chamfer,
+                    )
+                    .unwrap();
+                    let edit = changes[0].component_edits.last_mut().unwrap();
+                    assert!(edit.prism_chamfer);
+                    edit.edge_chamfer = Some([0.2, 0.3]);
+                    let mut model = Model::from_bodies(bodies.clone());
+                    model.commit_changes(&changes).unwrap();
+                    let evaluated = evaluate_scene(&model.bodies).unwrap();
+                    let result = &evaluated[2].1;
+                    let expected = 0.5 * 0.2 * 0.3 * 3. * if affine { 2. } else { 1. };
+                    assert!(
+                        (volume(result) - volume(g) - expected * if inner { 1. } else { -1. })
+                            .abs()
+                            < 1e-6,
+                        "hole={hole} affine={affine} inner={inner}"
+                    );
+                    assert_eq!(result.face_count, g.face_count + 1);
+                    assert!(result.shell.as_ref().unwrap().is_geometric_consistent());
+                    components::solid_parts(result.shell.as_ref().unwrap()).unwrap();
+                    assert_eq!(result.shell.as_ref().unwrap().len(), result.face_count);
+                    let before_planes = components::straight_planar_supports(g).unwrap();
+                    let band = components::straight_planar_supports(result)
+                        .unwrap()
+                        .iter()
+                        .position(|(n, d)| {
+                            !before_planes.iter().any(|(other, offset)| {
+                                (*n - *other).magnitude() < 1e-7 && (*d - *offset).abs() < 1e-7
+                            })
+                        })
+                        .unwrap();
+                    let normal = components::straight_planar_supports(result).unwrap()[band].0;
+                    let moved = components::transformed(
+                        &changes[0],
+                        result,
+                        SelectionMode::Face,
+                        Some(band),
+                        Matrix4::from_translation(normal * 0.02),
+                    )
+                    .unwrap();
+                    let mut moved_bodies = bodies.clone();
+                    moved_bodies[2] = moved;
+                    assert!(evaluate_scene(&moved_bodies).is_ok());
+                    for format in [
+                        crate::export::Format::Stl,
+                        crate::export::Format::Glb,
+                        crate::export::Format::Step,
+                        crate::export::Format::Dxf,
+                    ] {
+                        assert!(
+                            !crate::export::encode(&model.bodies, format)
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("concave-chamfer.osk");
+                    let project =
+                        Project::new(model.bodies.clone(), Camera::default(), true, Some(3));
+                    project.save(&path).unwrap();
+                    assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+                    let mut old = serde_json::to_value(&project).unwrap();
+                    old["schema_version"] = 32.into();
+                    old["modeling_version"] = 32.into();
+                    old["bodies"][2]["component_edits"][0]["prism_curves"] = false.into();
+                    assert!(
+                        serde_json::from_value::<Project>(old)
+                            .unwrap()
+                            .validate()
+                            .unwrap_err()
+                            .contains("version 33")
+                    );
+                    let before = model.bodies.clone();
+                    let mut invalid = changes[0].clone();
+                    invalid.component_edits.last_mut().unwrap().edge_chamfer = Some([5.; 2]);
+                    assert!(model.commit(invalid).is_err());
+                    assert_eq!(model.bodies, before);
+                    let mut beveled = selected_operations(
+                        &bodies,
+                        &scene,
+                        &[(3, Some(edge))],
+                        SelectionMode::Edge,
+                        Kind::Bevel,
+                    )
+                    .unwrap();
+                    beveled[0]
+                        .component_edits
+                        .last_mut()
+                        .unwrap()
+                        .prism_bevel
+                        .as_mut()
+                        .unwrap()
+                        .amount = 0.25;
+                    let mut bevel_model = Model::from_bodies(bodies.clone());
+                    bevel_model.commit_changes(&beveled).unwrap();
+                    let bevel_scene = evaluate_scene(&bevel_model.bodies).unwrap();
+                    let rounded = &bevel_scene[2].1;
+                    assert_eq!(rounded.face_count, g.face_count + 1);
+                    assert_eq!(rounded.shell.as_ref().unwrap().len(), rounded.face_count);
+                    assert!(rounded.shell.as_ref().unwrap().is_geometric_consistent());
+                    // Check the retained arc geometry, independent of display accuracy.
+                    use truck_modeling::{BoundedCurve, Curve, ParametricCurve, Surface};
+                    assert_eq!(
+                        rounded
+                            .shell
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .filter(|f| !matches!(f.oriented_surface(), Surface::Plane(_)))
+                            .count(),
+                        1
+                    );
+                    let planes = components::straight_planar_supports(g).unwrap();
+                    let ([first, second], axis) =
+                        chamfer_corner(g, |face| Some(planes[face]), edge).unwrap();
+                    let [a, _] = g.topology.edges[edge];
+                    let n1 = planes[first].0;
+                    let n2 = planes[second].0;
+                    let center = g.points[a]
+                        + (n1 + n2) * (if inner { 0.25 } else { -0.25 }) / (1. + n1.dot(n2));
+                    let axis = axis.normalize();
+                    let mut arcs = std::collections::HashSet::new();
+                    for e in rounded
+                        .shell
+                        .as_ref()
+                        .unwrap()
+                        .edge_iter()
+                        .filter(|e| matches!(e.curve(), Curve::NurbsCurve(_)))
+                    {
+                        arcs.insert(e.id());
+                        let curve = e.oriented_curve();
+                        let (lo, hi) = curve.range_tuple();
+                        for i in 0..=32 {
+                            let delta = curve.subs(lo + (hi - lo) * i as f64 / 32.) - center;
+                            assert!((delta.cross(axis).magnitude() - 0.25).abs() < 1e-6);
+                        }
+                    }
+                    assert_eq!(arcs.len(), 2, "Exactly one analytic arc per cap");
+                    let expected = (1. - std::f64::consts::FRAC_PI_4)
+                        * 0.25f64.powi(2)
+                        * 3.
+                        * if affine { 2. } else { 1. };
+                    assert!(
+                        (prism_volume(rounded, axis)
+                            - prism_volume(g, axis)
+                            - expected * if inner { 1. } else { -1. })
+                        .abs()
+                            < 1e-7
+                    );
+                    for format in [
+                        crate::export::Format::Stl,
+                        crate::export::Format::Glb,
+                        crate::export::Format::Step,
+                        crate::export::Format::Dxf,
+                    ] {
+                        assert!(
+                            !crate::export::encode(&bevel_model.bodies, format)
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    let project =
+                        Project::new(bevel_model.bodies.clone(), Camera::default(), true, Some(3));
+                    project.save(&path).unwrap();
+                    assert_eq!(Project::load(&path).unwrap().bodies, bevel_model.bodies);
+                    let mut old = serde_json::to_value(&project).unwrap();
+                    old["schema_version"] = 33.into();
+                    old["modeling_version"] = 33.into();
+                    old["bodies"][2]["component_edits"][0]["prism_curves"] = false.into();
+                    assert!(
+                        serde_json::from_value::<Project>(old)
+                            .unwrap()
+                            .validate()
+                            .unwrap_err()
+                            .contains("version 34")
+                    );
+                    let bevel_before = bevel_model.bodies.clone();
+                    let mut invalid = beveled[0].clone();
+                    invalid
+                        .component_edits
+                        .last_mut()
+                        .unwrap()
+                        .prism_bevel
+                        .as_mut()
+                        .unwrap()
+                        .amount = 10.;
+                    assert!(bevel_model.commit(invalid).is_err());
+                    assert_eq!(bevel_model.bodies, bevel_before);
+                    let mut flat = beveled[0].clone();
+                    flat.component_edits
+                        .last_mut()
+                        .unwrap()
+                        .prism_bevel
+                        .as_mut()
+                        .unwrap()
+                        .style = Style::Flat;
+                    bevel_model.commit(flat).unwrap();
+                    let flat_scene = evaluate_scene(&bevel_model.bodies).unwrap();
+                    let expected = 0.5 * 0.25f64.powi(2) * 3. * if affine { 2. } else { 1. };
+                    assert!(
+                        (volume(&flat_scene[2].1)
+                            - volume(g)
+                            - expected * if inner { 1. } else { -1. })
+                        .abs()
+                            < 1e-6
+                    );
+                    bevel_model.undo();
+                    assert_eq!(bevel_model.bodies, bevel_before);
+                    bevel_model.undo();
+                    assert_eq!(bevel_model.bodies, bodies);
+                    bevel_model.redo();
+                    assert_eq!(bevel_model.bodies, bevel_before);
+                    let repeated_edge = (0..rounded.edge_count)
+                        .find(|edge| {
+                            chamfer_corner(
+                                rounded,
+                                |face| {
+                                    crate::snapping::Plane::face(rounded, face)
+                                        .map(|p| (p.normal, p.normal.dot(p.origin.to_vec())))
+                                },
+                                *edge,
+                            )
+                            .is_ok_and(|(_, direction)| {
+                                direction.normalize().dot(axis).abs() > 1. - 1e-7
+                            }) && (!(!hole && !affine && inner)
+                                || rounded.topology.edges[*edge].iter().all(|v| {
+                                    rounded.points[*v].x.abs() < 1e-7
+                                        && (rounded.points[*v].y - 1.).abs() < 1e-7
+                                }))
+                        })
+                        .unwrap();
+                    for kind in [Kind::Chamfer, Kind::Bevel] {
+                        let mut repeated = selected_operations(
+                            &bevel_model.bodies,
+                            &bevel_scene,
+                            &[(3, Some(repeated_edge))],
+                            SelectionMode::Edge,
+                            kind,
+                        )
+                        .unwrap();
+                        assert!(repeated[0].component_edits.last().unwrap().prism_curves);
+                        if let Some(bevel) =
+                            &mut repeated[0].component_edits.last_mut().unwrap().prism_bevel
+                        {
+                            bevel.amount = 0.1;
+                        } else {
+                            repeated[0].component_edits.last_mut().unwrap().edge_chamfer =
+                                Some([0.1, 0.15]);
+                        }
+                        let mut repeated_model = Model::from_bodies(bevel_model.bodies.clone());
+                        repeated_model.commit_changes(&repeated).unwrap();
+                        let evaluated = evaluate_scene(&repeated_model.bodies).unwrap();
+                        let result = &evaluated[2].1;
+                        assert_eq!(result.face_count, rounded.face_count + 1);
+                        assert_eq!(
+                            result
+                                .shell
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .filter(|f| !matches!(f.oriented_surface(), Surface::Plane(_)))
+                                .count(),
+                            if kind == Kind::Bevel { 2 } else { 1 }
+                        );
+                        // The earlier circular band keeps its original radius and axis.
+                        let mut old_arcs = std::collections::HashSet::new();
+                        for e in result
+                            .shell
+                            .as_ref()
+                            .unwrap()
+                            .edge_iter()
+                            .filter(|e| matches!(e.curve(), Curve::NurbsCurve(_)))
+                        {
+                            let curve = e.oriented_curve();
+                            let (lo, hi) = curve.range_tuple();
+                            if ((curve.subs((lo + hi) * 0.5) - center)
+                                .cross(axis)
+                                .magnitude()
+                                - 0.25)
+                                .abs()
+                                > 1e-7
+                            {
+                                continue;
+                            }
+                            old_arcs.insert(e.id());
+                            for i in 0..=32 {
+                                assert!(
+                                    ((curve.subs(lo + (hi - lo) * i as f64 / 32.) - center)
+                                        .cross(axis)
+                                        .magnitude()
+                                        - 0.25)
+                                        .abs()
+                                        < 1e-7
+                                );
+                            }
+                        }
+                        assert_eq!(old_arcs.len(), 2);
+                        let project = Project::new(
+                            repeated_model.bodies.clone(),
+                            Camera::default(),
+                            true,
+                            Some(3),
+                        );
+                        project.save(&path).unwrap();
+                        assert_eq!(Project::load(&path).unwrap().bodies, repeated_model.bodies);
+                        let mut old = serde_json::to_value(&project).unwrap();
+                        old["schema_version"] = 34.into();
+                        old["modeling_version"] = 34.into();
+                        assert!(
+                            serde_json::from_value::<Project>(old)
+                                .unwrap()
+                                .validate()
+                                .unwrap_err()
+                                .contains("version 35")
+                        );
+                        let before = repeated_model.bodies.clone();
+                        let mut invalid = repeated[0].clone();
+                        invalid.component_edits.last_mut().unwrap().prism_curves = false;
+                        assert!(repeated_model.commit(invalid).is_err());
+                        assert_eq!(repeated_model.bodies, before);
+                        repeated_model.undo();
+                        assert_eq!(repeated_model.bodies, bevel_model.bodies);
+                        repeated_model.redo();
+                        assert_eq!(repeated_model.bodies, before);
+                        for format in [
+                            crate::export::Format::Stl,
+                            crate::export::Format::Glb,
+                            crate::export::Format::Step,
+                            crate::export::Format::Dxf,
+                        ] {
+                            assert!(
+                                !crate::export::encode(&repeated_model.bodies, format)
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    }
+                    if !hole
+                        && !affine
+                        && inner
+                        && let Some(path) = std::env::var_os("OSK_REPEAT_TREATMENT_REVIEW_PROJECT")
+                    {
+                        let mut review = Project::new(
+                            bevel_model.bodies.clone(),
+                            Camera::default(),
+                            true,
+                            Some(3),
+                        );
+                        review.selection_mode = SelectionMode::Edge;
+                        review.selected_element = Some(repeated_edge);
+                        review.selection = vec![(3, Some(repeated_edge))];
+                        review.save(std::path::Path::new(&path)).unwrap();
+                    }
+                    model.undo();
+                    assert_eq!(model.bodies, bodies);
+                    model.redo();
+                    assert_eq!(model.bodies, before);
+                    if !hole && !affine && inner {
+                        let other = g
+                            .topology
+                            .edges
+                            .iter()
+                            .position(|[a, b]| {
+                                let p = g.points[*a];
+                                let q = g.points[*b];
+                                p.x.abs() < 1e-7
+                                    && q.x.abs() < 1e-7
+                                    && (p.y - 1.).abs() < 1e-7
+                                    && (q.y - 1.).abs() < 1e-7
+                                    && (p.z - q.z).abs() > 2.9
+                            })
+                            .unwrap();
+                        let mut both = selected_operations(
+                            &bodies,
+                            &scene,
+                            &[(3, Some(edge)), (3, Some(other))],
+                            SelectionMode::Edge,
+                            Kind::Chamfer,
+                        )
+                        .unwrap();
+                        assert_eq!(both[0].component_edits.len(), 1);
+                        both[0].component_edits[0].edge_chamfer = Some([0.2, 0.3]);
+                        let mut multiple = bodies.clone();
+                        multiple[2] = both[0].clone();
+                        let combined = evaluate_scene(&multiple).unwrap();
+                        assert!(
+                            (volume(&combined[2].1) - volume(g) - 2. * 0.5 * 0.2 * 0.3 * 3.).abs()
+                                < 1e-6
+                        );
+                        assert_eq!(combined[2].1.face_count, g.face_count + 2);
+                        let mut rounded_pair = selected_operations(
+                            &bodies,
+                            &scene,
+                            &[(3, Some(edge)), (3, Some(other))],
+                            SelectionMode::Edge,
+                            Kind::Bevel,
+                        )
+                        .unwrap();
+                        rounded_pair[0].component_edits[0]
+                            .prism_bevel
+                            .as_mut()
+                            .unwrap()
+                            .amount = 0.25;
+                        let mut multiple = bodies.clone();
+                        multiple[2] = rounded_pair[0].clone();
+                        let combined = evaluate_scene(&multiple).unwrap();
+                        assert_eq!(combined[2].1.face_count, g.face_count + 2);
+                        let expected =
+                            2. * (1. - std::f64::consts::FRAC_PI_4) * 0.25f64.powi(2) * 3.;
+                        assert!(
+                            (prism_volume(&combined[2].1, Vector3::unit_z())
+                                - prism_volume(g, Vector3::unit_z())
+                                - expected)
+                                .abs()
+                                < 1e-7
+                        );
+                        rounded_pair[0].component_edits[0]
+                            .prism_bevel
+                            .as_mut()
+                            .unwrap()
+                            .amount = 1.2;
+                        let before = model.bodies.clone();
+                        assert!(model.commit_changes(&rounded_pair).is_err());
+                        assert_eq!(model.bodies, before);
+                        both[0].component_edits[0].edge_chamfer = Some([1.2; 2]);
+                        let before = model.bodies.clone();
+                        assert!(model.commit_changes(&both).is_err());
+                        assert_eq!(model.bodies, before);
+                        if let Some(path) = std::env::var_os("OSK_CONCAVE_CHAMFER_REVIEW_PROJECT")
+                            .or_else(|| std::env::var_os("OSK_PRISM_BEVEL_REVIEW_PROJECT"))
+                        {
+                            let mut review =
+                                Project::new(bodies.clone(), Camera::default(), true, Some(3));
+                            review.selection_mode = SelectionMode::Edge;
+                            review.selected_element = Some(edge);
+                            review.selection = vec![(3, Some(edge))];
+                            review.save(std::path::Path::new(&path)).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn prism_treatments_preserve_unrelated_circular_through_holes() {
+        use crate::{booleans, selection::SelectionMode};
+        let mut base = Body::new(Shape::Rectangle);
+        base.id = 1;
+        base.width = 6.;
+        base.depth = 6.;
+        base.extrusion = 3.;
+        let mut tool = Body::new(Shape::Circle);
+        tool.id = 2;
+        tool.width = 1.;
+        tool.extrusion = 3.;
+        tool.position[0] = -1.;
+        let mut bodies = vec![base, tool];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut feature = Body::new(Shape::Rectangle);
+        feature.id = 3;
+        feature.boolean = Some(booleans::Boolean::new(
+            booleans::Kind::Subtract,
+            &[(1, None), (2, None)],
+            SelectionMode::Volume,
+            &scene,
+        ));
+        bodies.push(feature);
+        let mut tool = bodies[1].clone();
+        tool.id = 4;
+        tool.position[0] = 1.;
+        bodies.push(tool);
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut feature = Body::new(Shape::Rectangle);
+        feature.id = 5;
+        feature.boolean = Some(booleans::Boolean::new(
+            booleans::Kind::Subtract,
+            &[(3, None), (4, None)],
+            SelectionMode::Volume,
+            &scene,
+        ));
+        bodies.push(feature);
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[4].1;
+        assert_eq!(g.circles.len(), 4);
+        let edge = g
+            .topology
+            .edges
+            .iter()
+            .position(|[a, b]| {
+                [a, b].iter().all(|v| {
+                    let p = g.points[**v];
+                    (p.x + 3.).abs() < 1e-7 && (p.y + 3.).abs() < 1e-7
+                }) && (g.points[*a].z - g.points[*b].z).abs() > 2.9
+            })
+            .unwrap();
+        for kind in [Kind::Chamfer, Kind::Bevel] {
+            let changes = selected_operations(
+                &bodies,
+                &scene,
+                &[(5, Some(edge))],
+                SelectionMode::Edge,
+                kind,
+            )
+            .unwrap();
+            assert!(changes[0].component_edits[0].prism_curves);
+            let mut model = Model::from_bodies(bodies.clone());
+            model.commit_changes(&changes).unwrap();
+            let evaluated = evaluate_scene(&model.bodies).unwrap();
+            let result = &evaluated[4].1;
+            assert_eq!(result.circles.len(), 4);
+            for circle in &g.circles {
+                assert!(
+                    result
+                        .circles
+                        .iter()
+                        .any(|other| (circle.center - other.center).magnitude() < 1e-7)
+                );
+            }
+            assert!(result.shell.as_ref().unwrap().is_geometric_consistent());
+            crate::components::solid_parts(result.shell.as_ref().unwrap()).unwrap();
+            assert!(prism_volume(result, Vector3::unit_z()) < prism_volume(g, Vector3::unit_z()));
+            let next = result
+                .topology
+                .edges
+                .iter()
+                .position(|[a, b]| {
+                    [a, b].iter().all(|v| {
+                        let p = result.points[**v];
+                        (p.x - 3.).abs() < 1e-7 && (p.y + 3.).abs() < 1e-7
+                    }) && (result.points[*a].z - result.points[*b].z).abs() > 2.9
+                })
+                .unwrap();
+            let repeated = selected_operations(
+                &model.bodies,
+                &evaluated,
+                &[(5, Some(next))],
+                SelectionMode::Edge,
+                Kind::Chamfer,
+            )
+            .unwrap();
+            model.commit_changes(&repeated).unwrap();
+            assert_eq!(evaluate_scene(&model.bodies).unwrap()[4].1.circles.len(), 4);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("two-holes.osk");
+            Project::new(model.bodies.clone(), Camera::default(), true, Some(5))
+                .save(&path)
+                .unwrap();
+            assert_eq!(Project::load(&path).unwrap().bodies, model.bodies);
+
+            for format in [
+                crate::export::Format::Stl,
+                crate::export::Format::Glb,
+                crate::export::Format::Step,
+                crate::export::Format::Dxf,
+            ] {
+                assert!(
+                    !crate::export::encode(&model.bodies, format)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_prism_bevel_uses_radius_and_tangency_at_oblique_corners() {
+        use crate::{booleans, selection::SelectionMode};
+        use truck_modeling::{BoundedCurve, Curve, ParametricCurve};
+        let mut a = Body::new(Shape::Rectangle);
+        a.id = 1;
+        a.width = 4.;
+        a.depth = 4.;
+        a.extrusion = 3.;
+        let mut b = a.clone();
+        b.id = 2;
+        b.position[0] = 1.;
+        b.rotation[2] = 25.;
+        let mut bodies = vec![a, b];
+        let scene = evaluate_scene(&bodies).unwrap();
+        let mut feature = Body::new(Shape::Rectangle);
+        feature.id = 3;
+        feature.boolean = Some(booleans::Boolean::new(
+            booleans::Kind::Intersect,
+            &[(1, None), (2, None)],
+            SelectionMode::Volume,
+            &scene,
+        ));
+        bodies.push(feature);
+        let scene = evaluate_scene(&bodies).unwrap();
+        let g = &scene[2].1;
+        let planes = crate::components::straight_planar_supports(g).unwrap();
+        let edge = (0..g.edge_count)
+            .find(|edge| {
+                chamfer_corner(g, |face| Some(planes[face]), *edge).is_ok_and(|([a, b], axis)| {
+                    axis.normalize().z.abs() > 0.99 && planes[a].0.dot(planes[b].0).abs() > 0.1
+                })
+            })
+            .unwrap();
+        let ([a, b], axis) = chamfer_corner(g, |face| Some(planes[face]), edge).unwrap();
+        let cosine = planes[a].0.dot(planes[b].0);
+        let mut changes = selected_operations(
+            &bodies,
+            &scene,
+            &[(3, Some(edge))],
+            SelectionMode::Edge,
+            Kind::Bevel,
+        )
+        .unwrap();
+        changes[0].component_edits[0]
+            .prism_bevel
+            .as_mut()
+            .unwrap()
+            .amount = 0.2;
+        let mut model = Model::from_bodies(bodies.clone());
+        model.commit_changes(&changes).unwrap();
+        let result = evaluate_scene(&model.bodies).unwrap();
+        let result = &result[2].1;
+        let expected = 0.2f64.powi(2)
+            * (((1. - cosine) / (1. + cosine)).sqrt() - cosine.acos() * 0.5)
+            * axis.magnitude();
+        assert!((prism_volume(g, axis) - prism_volume(result, axis) - expected).abs() < 1e-7);
+        for edge in result
+            .shell
+            .as_ref()
+            .unwrap()
+            .edge_iter()
+            .filter(|e| matches!(e.curve(), Curve::NurbsCurve(_)))
+        {
+            let curve = edge.oriented_curve();
+            let (lo, hi) = curve.range_tuple();
+            for t in [lo, hi] {
+                let point = curve.subs(t);
+                let tangent = curve.der(t).normalize();
+                assert!([planes[a], planes[b]].iter().any(|(normal, offset)| {
+                    (normal.dot(point.to_vec()) - *offset).abs() < 1e-7
+                        && normal.dot(tangent).abs() < 1e-7
+                }));
+            }
+        }
+        let mut invalid = changes[0].clone();
+        invalid.component_edits[0].edge_chamfer = Some([0.2; 2]);
+        assert!(invalid.validate().is_err());
+        invalid = changes[0].clone();
+        invalid.component_edits[0]
+            .prism_bevel
+            .as_mut()
+            .unwrap()
+            .amount = f64::NAN;
+        assert!(invalid.validate().is_err());
+    }
+
     #[test]
     fn evaluated_planar_chamfers_replay_edit_move_export_and_rollback() {
         use crate::{booleans, components, selection::SelectionMode};
