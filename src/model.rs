@@ -184,6 +184,7 @@ pub struct CircularEdge {
 
 #[derive(Clone, Default)]
 pub struct Geometry {
+    pub cages: Vec<crate::soft_selection::Cage>,
     pub triangles: Vec<[Point3; 3]>,
     // Kernel surface normals at tessellation samples, independent of triangle density.
     pub triangle_normals: Vec<[Vector3; 3]>,

@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 43,
-            modeling_version: 43,
+            schema_version: 44,
+            modeling_version: 44,
             bodies,
             camera,
             snapping,
@@ -61,19 +61,11 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=43) || !matches!(self.modeling_version, 1..=43) {
+        if !matches!(self.schema_version, 1..=44) || !matches!(self.modeling_version, 1..=44) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–43 and modeling versions 1–43."
+                "Unsupported .osk version. This application supports schema versions 1–44 and modeling versions 1–44."
                     .into(),
             );
-        }
-        if (self.schema_version < 43 || self.modeling_version < 43)
-            && self
-                .bodies
-                .iter()
-                .any(|b| b.component_edits.iter().any(|e| e.cap_rotation))
-        {
-            return Err("Calculated cap rotations require .osk version 43.".into());
         }
         if (self.schema_version < 42 || self.modeling_version < 42)
             && self
@@ -407,6 +399,23 @@ impl Project {
         {
             return Err("Topology-changing convex Draft requires .osk version 41.".into());
         }
+        if (self.schema_version < 43 || self.modeling_version < 43)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.component_edits.iter().any(|e| e.cap_rotation))
+        {
+            return Err("Calculated cap rotations require .osk version 43.".into());
+        }
+        if (self.schema_version < 44 || self.modeling_version < 44)
+            && self.bodies.iter().any(|b| {
+                b.component_edits
+                    .iter()
+                    .any(|e| e.control.as_ref().is_some_and(|o| o.binding.disk))
+            })
+        {
+            return Err("Circular deformation cages require .osk version 44.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
@@ -481,8 +490,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 43;
-        project.modeling_version = 43;
+        project.schema_version = 44;
+        project.modeling_version = 44;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

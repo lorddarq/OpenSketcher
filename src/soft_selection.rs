@@ -13,10 +13,14 @@ use truck_modeling::{
 
 type SurfaceNet = NurbsSurface<Vector4>;
 
+pub const MAX_RADIUS: f64 = 1e6;
+
 /// Parameter-lattice coordinates are node identities within a guarded authored domain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk: bool,
     pub rows: usize,
     pub columns: usize,
     pub uknots: Vec<f64>,
@@ -25,6 +29,7 @@ pub struct Binding {
 impl Binding {
     fn of(net: &SurfaceNet) -> Self {
         Self {
+            disk: false,
             rows: net.control_points().len(),
             columns: net.control_points()[0].len(),
             uknots: net.uknot_vec().iter().copied().collect(),
@@ -32,6 +37,16 @@ impl Binding {
         }
     }
     fn validate(&self) -> Result<(), String> {
+        if self.disk
+            && (self.rows != 5
+                || self.columns != 5
+                || self.uknots != KnotVec::bezier_knot(4).to_vec()
+                || self.vknots != self.uknots)
+        {
+            return Err(
+                "Circular cage identities require the authored 5×5 degree-four lattice.".into(),
+            );
+        }
         if !(3..=16).contains(&self.rows)
             || !(3..=16).contains(&self.columns)
             || self.uknots.len() > 33
@@ -87,7 +102,7 @@ pub struct Operation {
 impl Operation {
     pub fn validate(&self) -> Result<(), String> {
         self.binding.validate()?;
-        if self.version != 1 || self.domain == 0 {
+        if self.version != if self.binding.disk { 2 } else { 1 } || self.domain == 0 {
             return Err("Unsupported control-domain or falloff version.".into());
         }
         match &self.action {
@@ -108,7 +123,7 @@ impl Operation {
                         .any(|&id| !self.binding.interior(id))
                     || sources.iter().any(|id| locked.contains(id))
                     || !radius.is_finite()
-                    || *radius < 0.
+                    || !(0. ..=MAX_RADIUS).contains(radius)
                     || !delta.iter().all(|v| v.is_finite() && v.abs() <= 10000.)
                 {
                     return Err("Invalid node reference, lock, radius or displacement.".into());
@@ -136,6 +151,130 @@ fn patch(g: &Geometry, face: usize) -> Result<Face, String> {
         return Err("Select one unpartitioned editable surface patch.".into());
     }
     Ok(shell[indices[0]].clone())
+}
+
+/// An authored cage and its undeformed planar binding, independent of display samples.
+#[derive(Clone)]
+pub struct Cage {
+    pub domain: u64,
+    pub face: usize,
+    pub net: SurfaceNet,
+    pub reference: SurfaceNet,
+}
+impl Cage {
+    pub fn transform(&mut self, matrix: Matrix4) {
+        self.net.transform_control_points(|p| *p = matrix * *p);
+        self.reference
+            .transform_control_points(|p| *p = matrix * *p);
+    }
+}
+
+fn disk_net(g: &Geometry, face: &Face) -> Result<SurfaceNet, String> {
+    let Surface::Plane(plane) = face.surface() else {
+        return Err("Circular cages require a planar circular input face.".into());
+    };
+    let bounds = face.boundaries();
+    if bounds.len() != 1 {
+        return Err(
+            "Circular cages currently require a complete disk without interior trims.".into(),
+        );
+    }
+    let ring = g
+        .circles
+        .iter()
+        .find(|c| crate::face_extrusions::circle_on_wire(c, &bounds[0]))
+        .ok_or("No retained complete circular boundary is available for this cage.")?;
+    let (u, v) = if ring.u.cross(ring.v).dot(plane.normal()) >= 0. {
+        (ring.u, ring.v)
+    } else {
+        (ring.v, ring.u)
+    };
+    let controls = (0..5)
+        .map(|i| {
+            (0..5)
+                .map(|j| {
+                    (ring.center + u * (i as f64 / 2. - 1.) + v * (j as f64 / 2. - 1.))
+                        .to_vec()
+                        .extend(1.)
+                })
+                .collect()
+        })
+        .collect();
+    let knots = KnotVec::bezier_knot(4);
+    Ok(NurbsSurface::new(BSplineSurface::new(
+        (knots.clone(), knots),
+        controls,
+    )))
+}
+
+fn choose(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.;
+    }
+    (0..k).fold(1., |p, i| p * (n - i) as f64 / (i + 1) as f64)
+}
+
+/// Compose cage displacement with (1-x²-y²)² exactly in Bernstein form.
+/// On the circular trim the field and its first derivatives vanish, keeping the shared rim fixed.
+fn disk_surface(cage: &Cage) -> SurfaceNet {
+    let mut radial = [[0.; 3]; 3];
+    radial[0][0] = -1.;
+    radial[1][0] = 4.;
+    radial[0][1] = 4.;
+    radial[2][0] = -4.;
+    radial[0][2] = -4.;
+    let mut power = [[0.; 5]; 5];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                for l in 0..3 {
+                    power[i + k][j + l] += radial[i][j] * radial[k][l];
+                }
+            }
+        }
+    }
+    let mut mask = [[0.; 5]; 5];
+    for (i, row) in mask.iter_mut().enumerate() {
+        for (j, value) in row.iter_mut().enumerate() {
+            for (k, coefficients) in power.iter().enumerate().take(i + 1) {
+                for (l, p) in coefficients.iter().enumerate().take(j + 1) {
+                    *value += p * choose(i, k) / choose(4, k) * choose(j, l) / choose(4, l);
+                }
+            }
+        }
+    }
+    let mut displacement = [[Vector3::new(0., 0., 0.); 9]; 9];
+    for i in 0..5 {
+        for j in 0..5 {
+            let d = cage.net.control_point(i, j).truncate()
+                - cage.reference.control_point(i, j).truncate();
+            for (k, row) in mask.iter().enumerate() {
+                for (l, m) in row.iter().enumerate() {
+                    displacement[i + k][j + l] += d
+                        * (*m * choose(4, i) * choose(4, k) / choose(8, i + k)
+                            * choose(4, j)
+                            * choose(4, l)
+                            / choose(8, j + l));
+                }
+            }
+        }
+    }
+    let controls = displacement
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            row.iter()
+                .enumerate()
+                .map(|(j, d)| {
+                    (cage.reference.subs(i as f64 / 8., j as f64 / 8.) + *d)
+                        .to_vec()
+                        .extend(1.)
+                })
+                .collect()
+        })
+        .collect();
+    let knots = KnotVec::bezier_knot(8);
+    NurbsSurface::new(BSplineSurface::new((knots.clone(), knots), controls))
 }
 
 fn rectangle(face: &Face) -> Result<SurfaceNet, String> {
@@ -248,6 +387,9 @@ fn supported(net: &SurfaceNet, face: &Face) -> Result<(), String> {
 }
 
 pub fn net(g: &Geometry, face: usize) -> Result<SurfaceNet, String> {
+    if let Some(cage) = g.cages.iter().find(|c| c.face == face) {
+        return Ok(cage.net.clone());
+    }
     let f = patch(g, face)?;
     if let Surface::NurbsSurface(net) = f.surface() {
         Ok(net)
@@ -264,16 +406,16 @@ pub fn create(body: &Body, g: &Geometry, face: usize) -> Result<Body, String> {
         return Err("This face already has a control net; choose Edit nodes.".into());
     }
     let f = patch(g, face)?;
-    let (net, planar) =
-        match f.surface() {
-            Surface::Plane(_) => (rectangle(&f)?, true),
-            Surface::NurbsSurface(net) => (net, false),
-            _ => return Err(
-                "Create control net supports planar parallelograms and clamped full NURBS patches."
-                    .into(),
-            ),
-        };
-    supported(&net, &f)?;
+    let (net,planar,disk)=match f.surface() {
+        Surface::Plane(_)=>match rectangle(&f) {Ok(net)=>(net,true,false),Err(_)=>(disk_net(g,&f)?,true,true)},
+        Surface::NurbsSurface(net)=>(net,false,false),
+        _=>return Err("Create control net supports planar parallelograms, circular disks and clamped full NURBS patches.".into()),
+    };
+    if !disk {
+        supported(&net, &f)?;
+    }
+    let mut binding = Binding::of(&net);
+    binding.disk = disk;
     let op = Operation {
         domain: body
             .component_edits
@@ -283,8 +425,8 @@ pub fn create(body: &Body, g: &Geometry, face: usize) -> Result<Body, String> {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("Control domain IDs are exhausted.")?,
-        binding: Binding::of(&net),
-        version: 1,
+        binding,
+        version: if disk { 2 } else { 1 },
         action: Action::Create { planar },
     };
     append(body, g, face, op)
@@ -374,6 +516,9 @@ pub fn field(
     radius: f64,
 ) -> Result<Vec<f64>, String> {
     let binding = Binding::of(net);
+    if !radius.is_finite() || !(0. ..=MAX_RADIUS).contains(&radius) {
+        return Err("Radius must be finite and within 0–1000000 mm.".into());
+    }
     if sources
         .iter()
         .chain(locked)
@@ -423,14 +568,31 @@ pub fn apply(
 ) -> Result<Geometry, String> {
     let f = patch(g, edit.element)?;
     let mut surface = match &operation.action {
-        Action::Create { planar: true } => rectangle(&f)?,
+        Action::Create { planar: true } => {
+            if operation.binding.disk {
+                disk_net(g, &f)?
+            } else {
+                rectangle(&f)?
+            }
+        }
         _ => net(g, edit.element)?,
     };
-    supported(&surface, &f)?;
-    if Binding::of(&surface) != operation.binding {
-        return Err(
-            "An upstream edit changed the authored control-node identities or knots.".into(),
-        );
+    if !operation.binding.disk {
+        supported(&surface, &f)?;
+    }
+    let mut binding = Binding::of(&surface);
+    binding.disk = operation.binding.disk;
+    if binding != operation.binding {
+        return Err("An upstream edit changed authored control-node identities or knots.".into());
+    }
+    if operation.binding.disk
+        && !matches!(operation.action, Action::Create { .. })
+        && !g
+            .cages
+            .iter()
+            .any(|c| c.domain == operation.domain && c.face == edit.element)
+    {
+        return Err("The authored circular cage binding is missing.".into());
     }
     if matches!(operation.action, Action::Create { .. })
         && body
@@ -476,6 +638,16 @@ pub fn apply(
             return Err("The authored control domain is missing; nodes cannot be rebound by proximity or output slot.".into());
         }
     }
+    if operation.binding.disk && matches!(operation.action, Action::Create { .. }) {
+        let mut result = g.clone();
+        result.cages.push(Cage {
+            domain: operation.domain,
+            face: edit.element,
+            reference: surface.clone(),
+            net: surface,
+        });
+        return Ok(result);
+    }
     match &operation.action {
         Action::Translate {
             sources,
@@ -500,37 +672,48 @@ pub fn apply(
                 components::map_geometry(&mut result, Matrix4::from_translation(local));
                 return Ok(result);
             }
-            let corners = f.boundaries()[0]
+            let boundary = f.boundaries();
+            let ring = g
+                .circles
                 .iter()
-                .map(|e| e.front().point())
-                .collect::<Vec<_>>();
-            if corners.len() != 4 {
-                return Err(
-                    "Rigid control-face movement needs a planar four-edge boundary.".into(),
-                );
-            }
-            let u = (corners[1] - corners[0]).normalize();
-            let normal = (corners[1] - corners[0])
-                .cross(corners[3] - corners[0])
-                .normalize();
-            if corners
-                .iter()
-                .any(|p| (*p - corners[0]).dot(normal).abs() > 1e-7)
-            {
-                return Err("Rigid control-face movement needs coplanar boundary nodes.".into());
-            }
-            let plane = crate::snapping::Plane {
-                origin: corners[0],
-                u,
-                v: normal.cross(u),
-                normal,
+                .find(|r| crate::face_extrusions::circle_on_wire(r, &boundary[0]));
+            let plane = if let Some(ring) = ring {
+                let u = ring.u.normalize();
+                let normal = ring.u.cross(ring.v).normalize();
+                crate::snapping::Plane {
+                    origin: ring.center,
+                    u,
+                    v: normal.cross(u),
+                    normal,
+                }
+            } else {
+                let corners = boundary[0]
+                    .iter()
+                    .map(|e| e.front().point())
+                    .collect::<Vec<_>>();
+                if corners.len() < 3 {
+                    return Err(
+                        "Rigid control-face movement needs a planar boundary section.".into(),
+                    );
+                }
+                let u = (corners[1] - corners[0]).normalize();
+                let normal = (corners[1] - corners[0])
+                    .cross(corners[corners.len() - 1] - corners[0])
+                    .normalize();
+                if corners
+                    .iter()
+                    .any(|p| (*p - corners[0]).dot(normal).abs() > 1e-7)
+                {
+                    return Err("Rigid control-face movement needs coplanar boundary nodes.".into());
+                }
+                crate::snapping::Plane {
+                    origin: corners[0],
+                    u,
+                    v: normal.cross(u),
+                    normal,
+                }
             };
             let mapping = g.surface_mapping()?;
-            if g.shell.as_ref().unwrap().iter().enumerate().any(|(i, f)| {
-                mapping[i] != edit.element && !matches!(f.surface(), Surface::Plane(_))
-            }) {
-                return Err("Rigid control-face movement requires planar neighbors and a fixed opposite section.".into());
-            }
             let selected = components::vertices(g, SelectionMode::Face, Some(edit.element));
             let matrix = crate::section_edits::translation_from_plane(
                 g,
@@ -542,14 +725,45 @@ pub fn apply(
                 "Rigid control-face movement needs a complete cap and fixed opposite section.",
             )?;
             let shell: Shell = builder::transformed(g.shell.as_ref().unwrap(), matrix);
-            let idx = mapping.iter().position(|f| *f == edit.element).unwrap();
-            for p in surface.control_points_mut() {
-                p.x += local.x * p.w;
-                p.y += local.y * p.w;
-                p.z += local.z * p.w;
+            use truck_modeling::Transformed;
+            let translation = Matrix4::from_translation(local);
+            let original = g.shell.as_ref().unwrap();
+            let mut fixed = Vec::new();
+            for (i, (old, new)) in original.iter().zip(&shell).enumerate() {
+                if mapping[i] == edit.element {
+                    new.set_surface(old.surface().transformed(translation));
+                } else if old.edge_iter().all(|e| {
+                    [e.front().point(), e.back().point()].iter().all(|p| {
+                        !selected
+                            .iter()
+                            .any(|&j| (g.points[j] - *p).magnitude() < 1e-7)
+                    })
+                }) {
+                    new.set_surface(old.surface());
+                    fixed.push(mapping[i]);
+                }
             }
-            shell[idx].set_surface(Surface::NurbsSurface(surface));
-            return finish(g, &shell);
+            let mut result = finish(g, &shell)?;
+            for cage in &mut result.cages {
+                if cage.face == edit.element {
+                    cage.transform(translation);
+                } else if !fixed.contains(&cage.face) {
+                    cage.transform(matrix);
+                }
+            }
+            let rings = g
+                .circles
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    if (r.center - plane.origin).dot(plane.normal).abs() < 1e-7 {
+                        r.center += local;
+                    }
+                    r
+                })
+                .collect::<Vec<_>>();
+            result.retain_circles(&rings);
+            return Ok(result);
         }
         Action::Create { .. } => (),
     }
@@ -558,8 +772,27 @@ pub fn apply(
     let idx = (0..shell.len())
         .find(|&i| g.surface_roles.get(i).copied().unwrap_or(i) == edit.element)
         .unwrap();
-    shell[idx].set_surface(Surface::NurbsSurface(surface));
-    finish(g, &shell)
+    let mut cage = g
+        .cages
+        .iter()
+        .find(|c| c.domain == operation.domain && c.face == edit.element)
+        .cloned();
+    if operation.binding.disk {
+        let c = cage.as_mut().ok_or("Missing circular cage.")?;
+        c.net = surface;
+        shell[idx].set_surface(Surface::NurbsSurface(disk_surface(c)));
+    } else {
+        shell[idx].set_surface(Surface::NurbsSurface(surface));
+    }
+    let mut result = finish(g, &shell)?;
+    if let Some(cage) = cage {
+        *result
+            .cages
+            .iter_mut()
+            .find(|c| c.domain == operation.domain)
+            .ok_or("Missing circular cage.")? = cage;
+    }
+    Ok(result)
 }
 fn finish(g: &Geometry, shell: &Shell) -> Result<Geometry, String> {
     if !shell.is_geometric_consistent() {
@@ -569,8 +802,10 @@ fn finish(g: &Geometry, shell: &Shell) -> Result<Geometry, String> {
     if g.surface_roles.iter().copied().ne(0..shell.len()) {
         crate::edge_treatments::merge_surfaces(&mut result, &g.surface_roles);
     }
+    result.cages = g.cages.clone();
     result.is_solid = g.is_solid;
     result.retain_circles(&g.circles);
+    components::weld_geometry(&mut result);
     components::validate_retrim_intersections(&result)?;
     validate_intersections(&result)?;
     if g.is_solid {
@@ -582,9 +817,6 @@ fn finish(g: &Geometry, shell: &Shell) -> Result<Geometry, String> {
 /// Bound the tessellated validation workload; retain the analytic shell as the model.
 pub(crate) fn validate_intersections(g: &Geometry) -> Result<(), String> {
     let tris = &g.triangles;
-    if tris.len().saturating_mul(tris.len()) > 4_000_000 {
-        return Err("Control edit exceeds the surface-intersection validation budget.".into());
-    }
     let error =
         "Control edit folds, collapses or intersects a surface; reduce displacement or radius.";
     let eps = 1e-7;
@@ -599,16 +831,42 @@ pub(crate) fn validate_intersections(g: &Geometry) -> Result<(), String> {
             })
         })
         .collect::<Vec<_>>();
-    for (i, a) in tris.iter().enumerate() {
+    let axis = (0..3)
+        .max_by(|&a, &b| {
+            let extent = |k: usize| {
+                bounds
+                    .iter()
+                    .map(|p| p[k][1])
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    - bounds.iter().map(|p| p[k][0]).fold(f64::INFINITY, f64::min)
+            };
+            extent(a).total_cmp(&extent(b))
+        })
+        .unwrap();
+    let mut order = (0..tris.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|&a, &b| bounds[a][axis][0].total_cmp(&bounds[b][axis][0]));
+    let mut pairs = 0usize;
+    for (slot, &i) in order.iter().enumerate() {
+        let a = &tris[i];
         let normal = (a[1] - a[0]).cross(a[2] - a[0]);
         if normal.magnitude2() < 1e-20 {
             return Err(error.into());
         }
-        for (j, b) in tris.iter().enumerate().skip(i + 1) {
+        for &j in order.iter().skip(slot + 1) {
+            if bounds[j][axis][0] > bounds[i][axis][1] + eps {
+                break;
+            }
+            let b = &tris[j];
             if (0..3).any(|k| {
                 bounds[i][k][1] < bounds[j][k][0] - eps || bounds[j][k][1] < bounds[i][k][0] - eps
             }) {
                 continue;
+            }
+            pairs += 1;
+            if pairs > 2_000_000 {
+                return Err(
+                    "Control edit exceeds the overlapping-surface intersection budget.".into(),
+                );
             }
             let shared = a
                 .iter()
@@ -647,6 +905,21 @@ pub(crate) fn validate_intersections(g: &Geometry) -> Result<(), String> {
                     let beta = u.cross(q).dot(n) / n.magnitude2();
                     alpha > eps && beta > eps && alpha + beta < 1. - eps
                 };
+                for k in 0..3 {
+                    for l in 0..3 {
+                        let u = a[(k + 1) % 3] - a[k];
+                        let v = b[(l + 1) % 3] - b[l];
+                        let q = b[l] - a[k];
+                        let den = u.cross(v).dot(normal);
+                        if den.abs() > 1e-14 * u.magnitude() * v.magnitude() * normal.magnitude() {
+                            let s = q.cross(v).dot(normal) / den;
+                            let t = q.cross(u).dot(normal) / den;
+                            if s > eps && s < 1. - eps && t > eps && t < 1. - eps {
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                }
                 if inside(a[0] + ((a[1] - a[0]) + (a[2] - a[0])) / 3., b)
                     || inside(b[0] + ((b[1] - b[0]) + (b[2] - b[0])) / 3., a)
                 {
@@ -667,7 +940,7 @@ fn influences(
     radius: f64,
 ) -> Result<Vec<f64>, &'static str> {
     if !radius.is_finite()
-        || radius < 0.
+        || !(0. ..=MAX_RADIUS).contains(&radius)
         || locked.len() != rest.len()
         || rest
             .iter()
@@ -763,6 +1036,33 @@ fn soft_selection_control_net_proof() {
     assert_eq!(
         influences(&scaled, &edges, &[0], &locks, 4.).unwrap()[1],
         0.5
+    );
+    let mut dense = Geometry::default();
+    for x in 0..50 {
+        for y in 0..50 {
+            let a = Point3::new(x as f64, y as f64, 0.);
+            let b = a + Vector3::unit_x();
+            let c = a + Vector3::unit_y();
+            let d = b + Vector3::unit_y();
+            dense.triangles.extend([[a, b, c], [b, d, c]]);
+        }
+    }
+    validate_intersections(&dense).unwrap();
+    dense.triangles = vec![
+        [
+            Point3::new(0., 0., 0.),
+            Point3::new(10., 0., 0.),
+            Point3::new(0., 1., 0.),
+        ],
+        [
+            Point3::new(1., -10., 0.),
+            Point3::new(2., -10., 0.),
+            Point3::new(1., 10., 0.),
+        ],
+    ];
+    assert!(
+        validate_intersections(&dense).is_err(),
+        "Coplanar crossings must reject even when neither centroid is inside the other triangle"
     );
     let knots = KnotVec::bezier_knot(2);
     let controls = (0..3)
@@ -1206,5 +1506,96 @@ fn soft_selection_rigid_face_and_invalid_rollback() {
         assert_eq!(model.bodies, std::slice::from_ref(&deformed));
         // No-op numeric/gesture preview creates no authored operation.
         assert_eq!(editor.translated(&deformed, &g, [0.; 3]).unwrap(), deformed);
+    }
+}
+
+#[test]
+fn circular_cages_keep_exact_rims_and_editable_history() {
+    use crate::{
+        model::{self, Model, Shape},
+        project::Project,
+        viewport::Camera,
+    };
+    use truck_modeling::ParametricSurface3D;
+    for affine in [false, true] {
+        let mut source = Body::new(Shape::Circle);
+        source.id = 1;
+        source.width = 4.;
+        source.extrusion = 3.;
+        if affine {
+            source.position = [2., -3., 1.];
+            source.rotation = [15., 25., 35.];
+            source.scale = [1.4, 0.7, 1.2];
+        }
+        let base = model::evaluate(&source).unwrap();
+        let face = (0..base.face_count)
+            .find(|&f| {
+                crate::edge_treatments::target(&source, &base, f)
+                    == Ok(crate::edge_treatments::FaceTarget::Top)
+            })
+            .unwrap();
+        let bound = create(&source, &base, face).unwrap();
+        let start = model::evaluate(&bound).unwrap();
+        assert!(domain(&bound, face).unwrap().binding.disk);
+        assert_eq!(start.cages.len(), 1);
+        let mut editor = Editor::new(&bound, &start, face).unwrap();
+        editor.sources = vec![[2, 2]];
+        editor.radius = 2.5;
+        let before = positions(&net(&start, face).unwrap());
+        let delta = Vector3::new(0.1, -0.05, 0.6);
+        let changed = editor.translated(&bound, &start, delta.into()).unwrap();
+        let out = model::evaluate(&changed).unwrap();
+        let after = positions(&net(&out, face).unwrap());
+        assert!((after[12] - before[12] - delta).magnitude() < 1e-8);
+        assert_eq!(out.topology, start.topology);
+        assert!(out.shell.as_ref().unwrap().is_geometric_consistent());
+        let Surface::NurbsSurface(skin) = patch(&out, face).unwrap().surface() else {
+            panic!("Deformation must create a calculated NURBS skin")
+        };
+        assert_eq!(skin.degrees(), (8, 8));
+        let cage = &out.cages[0];
+        for i in 0..64 {
+            let angle = i as f64 * std::f64::consts::TAU / 64.;
+            let u = 0.5 + 0.5 * angle.cos();
+            let v = 0.5 + 0.5 * angle.sin();
+            assert!(
+                (skin.subs(u, v) - cage.reference.subs(u, v)).magnitude() < 1e-8,
+                "The exact circular rim stays shared"
+            );
+            assert!(
+                skin.normal(u, v).dot(cage.reference.normal(u, v)) > 1. - 1e-8,
+                "The circular binding has no normal discontinuity at its rim"
+            );
+        }
+        assert!((skin.subs(0.5, 0.5) - cage.reference.subs(0.5, 0.5)).magnitude() > 0.05);
+        let mut model = Model::from_bodies(vec![bound.clone()]);
+        model.commit(changed.clone()).unwrap();
+        model.undo();
+        assert_eq!(model.bodies, std::slice::from_ref(&bound));
+        model.redo();
+        assert_eq!(model.bodies, std::slice::from_ref(&changed));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.osk");
+        let project = Project::new(vec![changed.clone()], Camera::default(), false, None);
+        project.save(&path).unwrap();
+        assert_eq!(
+            Project::load(&path).unwrap().bodies,
+            std::slice::from_ref(&changed)
+        );
+        let mut old = serde_json::to_value(&project).unwrap();
+        old["modeling_version"] = 43.into();
+        assert!(
+            serde_json::from_value::<Project>(old)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        for format in crate::export::Format::ALL {
+            assert!(
+                !crate::export::encode(std::slice::from_ref(&changed), format)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

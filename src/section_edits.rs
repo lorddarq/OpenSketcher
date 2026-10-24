@@ -84,11 +84,16 @@ pub(crate) fn rotate_cap(
 ) -> Result<Option<Geometry>, String> {
     use truck_modeling::{
         BSplineSurface, BoundedCurve, Curve, Invertible, NurbsSurface, ParametricCurve,
-        ParametricSurface, Point3, Surface, Transform, Transformed, builder,
+        ParametricSurface3D, Point3, Surface, Transform, Transformed, builder,
     };
     let Some(shell) = &g.shell else {
         return Ok(None);
     };
+    if g.face_count == 1 && selected.len() == g.points.len() {
+        let mut result = g.clone();
+        components::map_geometry(&mut result, matrix);
+        return Ok(Some(result));
+    }
     if !g.is_solid || selected.is_empty() || selected.len() == g.points.len() {
         return Ok(None);
     }
@@ -283,7 +288,9 @@ pub(crate) fn rotate_cap(
         .iter()
         .map(|f| logical.face_group(*f))
         .collect::<Vec<_>>();
-    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    if roles.iter().copied().ne(0..shell.len()) {
+        crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    }
     result.is_solid = true;
     let rings = g
         .circles
@@ -299,6 +306,7 @@ pub(crate) fn rotate_cap(
         })
         .collect::<Vec<_>>();
     result.retain_circles(&rings);
+    components::weld_geometry(&mut result);
     crate::soft_selection::validate_intersections(&result)?;
     Ok(Some(result))
 }
@@ -325,9 +333,17 @@ mod tests {
             .find(|&f| crate::edge_treatments::target(&body, &source, f) == Ok(FaceTarget::Top))
             .unwrap();
         let pivot = Point3::new(0., 0., 3.);
+        assert!(
+            (components::pivot(&source, SelectionMode::Face, Some(face)).unwrap() - pivot)
+                .magnitude()
+                < 1e-12
+        );
         for axis in [Vector3::unit_z(), Vector3::unit_x()] {
             let matrix = Matrix4::from_translation(pivot.to_vec())
-                * Matrix4::from_axis_angle(axis, Rad(0.3))
+                * Matrix4::from_axis_angle(
+                    axis,
+                    Rad(if axis == Vector3::unit_z() { 0.65 } else { 0.3 }),
+                )
                 * Matrix4::from_translation(-pivot.to_vec());
             let changed =
                 components::transformed(&body, &source, SelectionMode::Face, Some(face), matrix)
@@ -343,11 +359,217 @@ mod tests {
                     .any(|f| matches!(f.surface(), Surface::NurbsSurface(_)))
             );
             assert_eq!(output.triangle_normals.len(), output.triangles.len());
-            if axis == Vector3::unit_z() {
-                assert_eq!(
-                    output.triangles, source.triangles,
-                    "Axial cap rotation must not pinch a rotationally symmetric cylinder"
+            let mut model = Model::from_bodies(vec![body.clone()]);
+            model.commit(changed.clone()).unwrap();
+            model.undo();
+            assert_eq!(model.bodies, std::slice::from_ref(&body));
+            model.redo();
+            assert_eq!(model.bodies, std::slice::from_ref(&changed));
+            let project = Project::new(vec![changed.clone()], Camera::default(), false, None);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rotated.osk");
+            project.save(&path).unwrap();
+            assert_eq!(
+                Project::load(&path).unwrap().bodies,
+                std::slice::from_ref(&changed)
+            );
+            let mut old = serde_json::to_value(&project).unwrap();
+            old["schema_version"] = 42.into();
+            assert!(
+                serde_json::from_value::<Project>(old)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            for format in crate::export::Format::ALL {
+                assert!(
+                    !crate::export::encode(std::slice::from_ref(&changed), format)
+                        .unwrap()
+                        .is_empty()
                 );
+            }
+            if axis == Vector3::unit_z() {
+                use truck_modeling::ParametricSurface;
+                let original = source.shell.as_ref().unwrap();
+                for (a, b) in shell.iter().zip(original) {
+                    for (u, v) in [(0., 0.), (0.25, 0.5), (0.5, 0.75), (1., 1.)] {
+                        assert!(
+                            (a.surface().subs(u, v) - b.surface().subs(u, v)).magnitude() < 1e-10,
+                            "Axial cap rotation must leave the calculated cylinder unchanged"
+                        );
+                    }
+                }
+            } else {
+                // The complete opposite section stays fixed; selected cap support follows R.
+                let expected = matrix.transform_vector(Vector3::unit_z());
+                assert!((0..output.face_count).any(|i| {
+                    Plane::face(&output, i).is_some_and(|p| p.normal.dot(expected) > 1. - 1e-8)
+                }));
+                assert!(
+                    (0..output.face_count).any(|i| Plane::face(&output, i).is_some_and(|p| p
+                        .origin
+                        .z
+                        .abs()
+                        < 1e-8
+                        && p.normal.dot(-Vector3::unit_z()) > 1. - 1e-8))
+                );
+                assert_eq!(
+                    output.face_count, 3,
+                    "A calculated cylinder loft has one continuous wall, not three artificial patch faces"
+                );
+                let wall = (0..output.face_count)
+                    .find(|&i| Plane::face(&output, i).is_none())
+                    .unwrap();
+                let mut normals = std::collections::HashMap::<[i64; 3], Vector3>::new();
+                for ((t, n), face) in output
+                    .triangles
+                    .iter()
+                    .zip(&output.triangle_normals)
+                    .zip(&output.triangle_faces)
+                {
+                    if *face == wall {
+                        for (p, n) in t.iter().zip(n) {
+                            let key = [p.x, p.y, p.z].map(|v| (v * 1e6).round() as i64);
+                            if let Some(prior) = normals.insert(key, *n) {
+                                assert!(
+                                    prior.normalize().dot(n.normalize()) > 1. - 1e-5,
+                                    "Calculated normals must agree at wall seams"
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut legacy = changed.clone();
+                legacy.component_edits.last_mut().unwrap().cap_rotation = false;
+                assert!(
+                    evaluate(&legacy).unwrap().shell.is_none(),
+                    "Legacy files retain their saved mesh evaluator"
+                );
+            }
+            if let Ok(path) = std::env::var("OSK_CAP_ROTATION_REVIEW") {
+                let mut legacy = changed.clone();
+                legacy.component_edits.last_mut().unwrap().cap_rotation = false;
+                legacy.position = [3., 0., 0.];
+                let mut exact = changed.clone();
+                exact.id = 2;
+                exact.position = [-3., 0., 0.];
+                let bodies = vec![legacy, exact];
+                let mut camera = Camera::default();
+                camera.fit(&evaluate_scene(&bodies).unwrap());
+                camera.span = 18.;
+                let path = std::path::PathBuf::from(path);
+                let path = if axis == Vector3::unit_x() {
+                    path.with_extension("tilt.osk")
+                } else {
+                    path
+                };
+                Project::new(bodies, camera, false, None)
+                    .save(&path)
+                    .unwrap();
+            }
+        }
+    }
+    #[test]
+    fn rotated_caps_preserve_affine_owners_neighbors_and_replay() {
+        use truck_modeling::{Point3, Rad};
+        for shape in [Shape::Circle, Shape::Semicircle] {
+            for cap in [FaceTarget::Top, FaceTarget::Bottom] {
+                let mut body = Body::new(shape);
+                body.id = 1;
+                body.width = 4.;
+                body.extrusion = 3.;
+                body.position = [2., -3., 1.];
+                body.rotation = [15., 25., 35.];
+                body.scale = [1.4, 0.7, 1.2];
+                let source = evaluate(&body).unwrap();
+                let face = (0..source.face_count)
+                    .find(|&f| crate::edge_treatments::target(&body, &source, f) == Ok(cap))
+                    .unwrap();
+                let placement = crate::regions::transform(&body);
+                let pivot = placement.transform_point(Point3::new(
+                    0.,
+                    0.,
+                    if cap == FaceTarget::Top { 3. } else { 0. },
+                ));
+                if shape == Shape::Circle {
+                    assert!(
+                        (components::pivot(&source, SelectionMode::Face, Some(face)).unwrap()
+                            - pivot)
+                            .magnitude()
+                            < 1e-12
+                    );
+                }
+                let matrix = Matrix4::from_translation(pivot.to_vec())
+                    * Matrix4::from_axis_angle(Vector3::unit_x(), Rad(0.12))
+                    * Matrix4::from_translation(-pivot.to_vec());
+                let selected = components::vertices(&source, SelectionMode::Face, Some(face));
+                let changed = components::transformed(
+                    &body,
+                    &source,
+                    SelectionMode::Face,
+                    Some(face),
+                    matrix,
+                )
+                .unwrap();
+                let out = evaluate(&changed).unwrap();
+                for (i, p) in source.points.iter().enumerate() {
+                    let expected = if selected.contains(&i) {
+                        matrix.transform_point(*p)
+                    } else {
+                        *p
+                    };
+                    assert!(
+                        out.points
+                            .iter()
+                            .any(|p| (*p - expected).magnitude() < 1e-7),
+                        "{shape:?} {cap:?}: both section boundaries must be exact"
+                    );
+                }
+                assert!(out.is_solid && out.shell.as_ref().unwrap().is_geometric_consistent());
+                for (t, normals) in out.triangles.iter().zip(&out.triangle_normals) {
+                    let chord = (t[1] - t[0]).cross(t[2] - t[0]).normalize();
+                    assert!(
+                        normals
+                            .iter()
+                            .all(|n| n.magnitude().is_finite() && n.dot(chord) > 0.),
+                        "Analytic normals must retain orientation through nonuniform placement"
+                    );
+                }
+                let support = Plane::face(&source, face).unwrap();
+                let normal = matrix.transform_vector(support.normal);
+                let next_face = (0..out.face_count)
+                    .find(|&f| {
+                        Plane::face(&out, f).is_some_and(|p| p.normal.dot(normal) > 1. - 1e-7)
+                    })
+                    .unwrap();
+                let again = components::transformed(
+                    &changed,
+                    &out,
+                    SelectionMode::Face,
+                    Some(next_face),
+                    matrix,
+                )
+                .unwrap();
+                assert!(
+                    evaluate(&again)
+                        .unwrap()
+                        .shell
+                        .as_ref()
+                        .unwrap()
+                        .is_geometric_consistent()
+                );
+                let mut model = Model::from_bodies(vec![changed.clone()]);
+                let consuming = Matrix4::from_translation(-support.normal * 10.) * matrix;
+                let invalid = components::transformed(
+                    &changed,
+                    &out,
+                    SelectionMode::Face,
+                    Some(next_face),
+                    consuming,
+                )
+                .unwrap();
+                assert!(model.commit(invalid).is_err());
+                assert_eq!(model.bodies, std::slice::from_ref(&changed));
             }
         }
     }

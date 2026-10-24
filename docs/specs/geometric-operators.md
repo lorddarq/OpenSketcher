@@ -106,6 +106,7 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 - [x] Cylindrical-wall Offset face changes radius without moving the axis; equal X/Y scale required, independent Z scale allowed. An elliptic cylinder is rejected because its parallel offset is not an ellipse.
 - [x] Exact planar face Translate/Rotate on convex planar solids with retained adjacent planes, exact shared edges/faces, guarded connectivity and analytic STEP.
 - [x] Exact complete-cap/rim translation on retained two-section solids, including circular/semicircular, through-pipe and concave Boolean caps; preserve the opposite cap and analytic boundaries.
+- [x] Calculated planar-cap rotation with a fixed opposite section and retained ruled NURBS neighbors; preserve circular axial symmetry, shared curves and analytic seam normals through `.osk` v43 intent. Unsupported new curved-face rotations reject instead of deforming display triangles.
 - [x] Exact face Translate/Rotate on retained concave planar solids with straight edges, including Boolean notches and through-holes; preserve ordered outer/inner loops and adjacent support planes, and reject boundary crossings. Limited to 4–256 planar faces and a bounded intersection check.
 - [x] Topology-changing face Move/Rotate on convex planar solids with up to 64 supports: split multi-plane corners and consume redundant supports, with exact retained geometry, guarded history and safe selection reset.
 - [ ] General face Translate/Rotate with curved neighbors and rigid curved/deformed face preservation; arbitrary concave topology-changing planar moves remain pending.
@@ -147,7 +148,7 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 - [x] Independently placed construction planes with XY/XZ/YZ presets, numeric/gizmo placement, explicit drawing activation, reference-centered grid, undo and project persistence.
 - [x] Live construction-plane neutral references for evaluated planar Draft, including later-created planes, automatic regeneration and validated deletion/conversion.
 - [x] Convex evaluated Draft may consume redundant chamfer/support faces and rebuild a surviving closed solid; preserve legacy Draft rejection through explicit history intent.
-- [ ] Complete NURBS/control-cage editing and soft-selection falloff. Fixed-boundary control-net editing is implemented; see [current behavior and validation](soft-selection.md#delivered-control-net-editing-2026-10-24). Continuous cylindrical deformation, periodic seams and the high-definition surface workflow remain required.
+- [ ] Complete NURBS/control-cage editing and soft-selection falloff. Fixed-boundary control-net editing is implemented; see [current behavior and validation](soft-selection.md#delivered-control-net-editing-2026-10-24). Calculated cap rotations and analytic seam normals are delivered. Circular/periodic editable control domains and the remaining high-definition deformation workflow remain required.
 
 These researched capabilities inform the backlog; they do not authorize speculative frameworks or copying another product's implementation. Preserve Truck as the selected kernel, reuse existing model/selection/history paths, and add only the representation required by each delivered operator.
 

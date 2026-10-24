@@ -224,9 +224,11 @@ impl OpenSketcher {
                 .suffix(" mm")
                 .speed(0.05),
         );
-        if !editor.radius.is_finite() || editor.radius < 0. {
+        if !editor.radius.is_finite()
+            || !(0. ..=soft_selection::MAX_RADIUS).contains(&editor.radius)
+        {
             editor.radius = before;
-            self.error = Some("Radius must be finite and nonnegative.".into());
+            self.error = Some("Radius must be finite and within 0–1000000 mm.".into());
         }
         response.on_hover_text(
             "Shortest paths along control edges in world millimeters; 0 moves selected nodes only.",
@@ -1356,7 +1358,7 @@ fn evaluated_component_properties(ui: &mut egui::Ui, body: &mut Body, references
                     soft_selection::Action::Translate{sources,locked,enabled,radius,delta}=>{
                         ui.label(format!("Face {} · {} explicit · {} interior locks",edit.element+1,sources.len(),locked.len()));
                         finished|=ui.checkbox(enabled,"Soft selection").changed();
-                        finished|=scalar(ui,"Radius · world mm",radius,0. ..=10000.);
+                        finished|=scalar(ui,"Radius · world mm",radius,0. ..=soft_selection::MAX_RADIUS);
                         finished|=vector(ui,"Displacement · local mm",delta,-10000. ..=10000.);
                     }
                     soft_selection::Action::MoveFace{delta}=>{finished|=vector(ui,"Face displacement · local mm",delta,-10000. ..=10000.);}

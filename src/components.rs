@@ -86,6 +86,26 @@ pub fn vertices(g: &Geometry, mode: SelectionMode, element: Option<usize>) -> Ve
 }
 
 pub fn pivot(g: &Geometry, mode: SelectionMode, element: Option<usize>) -> Option<Point3> {
+    // A conic cap's center is authored geometry, not the bounds of its display samples.
+    if mode == SelectionMode::Face
+        && let Some(face) = element
+        && crate::snapping::Plane::face(g, face).is_some()
+        && let (Some(shell), Ok(mapping)) = (&g.shell, g.surface_mapping())
+    {
+        for (patch, role) in shell.iter().zip(mapping) {
+            if *role != face {
+                continue;
+            }
+            if let Some(wire) = patch.boundaries().first()
+                && let Some(circle) = g
+                    .circles
+                    .iter()
+                    .find(|c| crate::face_extrusions::circle_on_wire(c, wire))
+            {
+                return Some(circle.center);
+            }
+        }
+    }
     let points: Vec<_> = match mode {
         SelectionMode::Face => g
             .triangles
@@ -695,14 +715,14 @@ fn apply_stage(
             *g=retrim_faces(g,&faces,matrix,edit.convex_rebuild)?;
             return Ok(());
         }
-        if edit.cap_rotation {
-            *g=crate::section_edits::rotate_cap(g,&selected,matrix)?.ok_or("This curved-face rotation needs retained cap/neighbor surface reconstruction. Use an editable control domain; the display mesh was not modified.")?;
-            return Ok(());
-        }
         // A continuous cylinder wall can own every boundary vertex. This is
         // a rigid transform of the entire retained shape, not mesh deformation.
         if selected.len()==g.points.len() {
             map_geometry(g,matrix);
+            return Ok(());
+        }
+        if edit.cap_rotation {
+            *g=crate::section_edits::rotate_cap(g,&selected,matrix)?.ok_or("This curved-face rotation needs retained cap/neighbor surface reconstruction. Use an editable control domain; the display mesh was not modified.")?;
             return Ok(());
         }
         let old = g.clone();
@@ -1180,6 +1200,9 @@ pub fn map_geometry(g: &mut Geometry, matrix: Matrix4) {
     }
     if let Some(shell) = &mut g.shell {
         *shell = builder::transformed(shell, matrix);
+    }
+    for cage in &mut g.cages {
+        cage.transform(matrix);
     }
     for circle in &mut g.circles {
         circle.center = matrix.transform_point(circle.center);
@@ -1702,7 +1725,18 @@ mod tests {
                             "{shape:?} {mode:?}"
                         );
                     }
-                    assert_eq!(output[0].1.topology, g.topology);
+                    if edited
+                        .component_edits
+                        .last()
+                        .is_some_and(|e| e.cap_rotation)
+                        && shape == Shape::Circle
+                    {
+                        assert!(output[0].1.shell.is_some());
+                        assert!(output[0].1.face_count <= g.face_count);
+                    } else {
+                        assert_eq!(output[0].1.topology, g.topology);
+                    }
+
                     let directory = tempfile::tempdir().unwrap();
                     let path = directory.path().join("gizmo.osk");
                     Project::new(model.bodies.clone(), Camera::default(), true, Some(1))
