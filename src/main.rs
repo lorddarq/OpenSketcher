@@ -1358,7 +1358,6 @@ impl eframe::App for OpenSketcher {
                         ui.label(format!("{} {} · Object {}",self.selection_mode.label(),element+1,id));
                     }else{ui.label(format!("Pick a {} in the viewport.",self.selection_mode.label().to_lowercase()));}
                     ui.weak("Choose Move or Rotate and drag the gizmo to edit this component. Adjacent boundaries rebuild together.");
-                    if self.selection_mode==SelectionMode::Face {ui.weak("Convex planar solids use exact plane retrimming. Curved/concave bodies use component deformation.");}
                     self.offset_face_properties(ui);
                     if matches!(self.selection_mode,SelectionMode::Face|SelectionMode::Edge) && !self.selection.is_empty() {
                         ui.horizontal(|ui| {

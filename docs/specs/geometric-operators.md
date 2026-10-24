@@ -128,6 +128,7 @@ Measured performance gaps and reproducible release workloads are recorded in [th
 - [x] Live planar Replace Face on convex planar solids and original circular/semicircular prism caps, with ordered source/reference picks, construction-plane references and mixed Boolean/replacement chains.
 - [x] Replace Face on retained concave planar solids with straight boundaries, including notch and through-hole walls; preserve adjacent planes and live reference regeneration.
 - [x] Delete Face · Heal for complete internal pocket/bore wall sets, including blind floors and through-holes with analytic planar or curved walls; extend surviving support surfaces by removing complete inner trim loops.
+- [x] Heal complete external notches with planar neighboring supports by pairing unambiguous boundary spans; preserve unrelated curved faces and holes.
 - [ ] General curved Replace Face, arbitrary concave/curved Delete Face · Heal and nonplanar opening closure.
 - [x] Exact inward Shell/thickness for source boxes (any of six planar openings), cylinders and semicylinders (either cap). Thickness/opening remain editable/removable with undo, serialization and export.
 - [x] Exact source-prism Draft for boxes, cylinders and semicylinders, with signed angle, top/bottom neutral cap, exact curved surfaces/corner trims, editable/removable history and export.
@@ -500,4 +501,30 @@ Circular bore profiles additionally supply projected circle/ellipse candidates o
 
 Checks: `circle_metadata_requires_complete_retained_loops_and_deduplicates_bases` covers affine ellipses, rotated parameter bases, nearby offset candidates and semicircular rejection. The two-hole healing regression now requires four bore references before healing and exactly the surviving hole's two references afterward, in addition to preserving that hole's material and trims.
 
-Circle-inference verification: the full regression run passed 87 tests (2 manual timing checks ignored). The subsequent exposed-rim regression also passed. Native snapping review remains outstanding.
+Circle-inference verification: the full regression run passed 87 tests (2 manual timing checks ignored). The subsequent exposed-rim regression also passed. Native macOS center/rim review for the healed bore is recorded below; other platforms remain unverified.
+
+### Complete external notch healing
+
+Delete Face · Heal now extends retained planar supports across a complete external through-notch or blind notch (all walls and the blind floor selected). Coplanar surviving patches are treated together; selected adjacency edges are removed from their boundaries. Each missing span must have exactly two compatible endpoint owners on two nonparallel supports. Pairs are ordered along their common intersection line, and one shared edge is inserted with opposite orientation on each support. The shared planar arrangement builds closed outer/inner loops. Unrelated curved faces with no selected adjacency retain their original surface and trim objects. Ambiguous/partial selections, parallel/unbounded spans, open results and crossings are rejected atomically. This is not general curved-neighbor healing or a topology-changing surface intersection solver.
+
+The shared arrangement now constructs faces on the already supplied support plane instead of fitting another plane through the trim curves; this retains intersection-generated trim objects without invoking the pinned kernel's unsupported curve lifting.
+
+The preservation check exposed a legacy equal-depth prism shortcut that polygonized cap regions, including unrelated circular holes. New volume set operations now store `analytic_prisms: true` in `.osk` v31 and reuse the existing analytic face solver for this shortcut. Missing/false preserves older evaluation and output guards. Circle-reference restoration now runs at the common volume-result stage, covering both prism and general kernel routes.
+
+`complete_external_notch_heals_across_planar_supports_with_history` covers through/blind notches, an unrelated circular bore and its two inference references, preservation of untouched curved face objects, original material restoration, four exports, persistence, undo/redo, incomplete-selection rejection, v31 downgrade rejection and legacy polygonal replay with missing intent. Native interaction review remains separate.
+
+Analytic prism eligibility reuses `prismatic_section`, the existing homogeneous-control-row proof extracted from face through-cuts. Display vertices alone no longer authorize the new analytic shortcut. General curved/twisted side surfaces and divided cap regions use the general kernel path; legacy false intent retains its original eligibility. The prior through-cut exclusion check and the notch/legacy check pass after sharing this proof.
+
+### Native macOS review: notch healing and circle inference
+
+The isolated `dist/OpenSketcher Notch Heal Review.app` (bundle `org.opensketcher.notch-heal-review`, version 31.1) loaded a generated v31 scene containing a through-notch beside an independent circular bore. The native inspector's Delete face · Heal action removed the three selected notch walls; the bore remained. Cmd-Z restored the notch, Cmd-Shift-Z healed it again, and Cmd-S stored a Heal component operation on the analytic prism Boolean. New cleared the canvas; reopening the saved project regenerated the healed body with its bore intact.
+
+After selecting the healed top face, Circle creation displayed “Circle center” at the bore center and “Circle rim” at its boundary. Saving the temporary circle produced position `[-1.5, 0.0, 2.999999999999999]`, diameter `1.0`, extrusion `0.0`. Undo removed the temporary circle and the review file was saved with only the healed body and its original sources. This verifies native macOS tool dispatch, history, save/load and center/rim inference for this scene; it is not general curved-operation acceptance or Windows/Linux runtime evidence.
+
+The model regression can emit an unhealed, face-selected native review project when explicitly requested:
+
+```sh
+OSK_NOTCH_REVIEW_PROJECT=/tmp/osk-notch-heal-review-input.osk cargo test --offline complete_external_notch
+```
+
+The optional path is overwritten with the generated review input; ordinary tests do not emit it. The manually reviewed saved result is `/tmp/osk-notch-heal-review.osk`. Inspector copy that incorrectly described all concave edits as deformation was removed; the existing Move/Rotate instructions remain.

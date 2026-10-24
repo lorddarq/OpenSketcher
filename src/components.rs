@@ -920,7 +920,7 @@ pub(crate) fn retrim_faces(
 
 // Connectivity alone cannot detect a concave wall crossing another wall.
 // Check straight boundaries and their intersections with triangulated planar faces.
-fn validate_retrim_intersections(g: &Geometry) -> Result<(), String> {
+pub(crate) fn validate_retrim_intersections(g: &Geometry) -> Result<(), String> {
     const EPS: f64 = 1e-7;
     let invalid = "Face retrim crosses or touches another boundary; reduce the movement/rotation.";
     if g.edges.len().saturating_mul(g.triangles.len()) > 2_000_000 {

@@ -36,8 +36,8 @@ impl Project {
     pub fn new(bodies: Vec<Body>, camera: Camera, snapping: bool, selected: Option<u64>) -> Self {
         Self {
             format: "OpenSketcher".into(),
-            schema_version: 30,
-            modeling_version: 30,
+            schema_version: 31,
+            modeling_version: 31,
             bodies,
             camera,
             snapping,
@@ -61,9 +61,9 @@ impl Project {
         if self.format != "OpenSketcher" {
             return Err("This is not an OpenSketcher project.".into());
         }
-        if !matches!(self.schema_version, 1..=30) || !matches!(self.modeling_version, 1..=30) {
+        if !matches!(self.schema_version, 1..=31) || !matches!(self.modeling_version, 1..=31) {
             return Err(
-                "Unsupported .osk version. This application supports schema versions 1–30 and modeling versions 1–30."
+                "Unsupported .osk version. This application supports schema versions 1–31 and modeling versions 1–31."
                     .into(),
             );
         }
@@ -293,6 +293,14 @@ impl Project {
         {
             return Err("Prismatic face through-cuts require .osk version 30.".into());
         }
+        if (self.schema_version < 31 || self.modeling_version < 31)
+            && self
+                .bodies
+                .iter()
+                .any(|b| b.boolean.as_ref().is_some_and(|op| op.analytic_prisms))
+        {
+            return Err("Analytic prism Booleans require .osk version 31.".into());
+        }
         self.camera.validate()?;
         let mut ids = HashSet::new();
         let mut triangles = 0;
@@ -367,8 +375,8 @@ impl Project {
             }
         }
         project.validate()?;
-        project.schema_version = 30;
-        project.modeling_version = 30;
+        project.schema_version = 31;
+        project.modeling_version = 31;
         Ok(project)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -405,6 +413,45 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::model::{Model, Shape};
+    #[test]
+    fn atomic_write_replaces_closed_destinations_and_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // TempPath keeps cleanup ownership without keeping a Windows handle open.
+        let path = tempfile::NamedTempFile::new_in(dir.path())
+            .unwrap()
+            .into_temp_path();
+        write_atomic(&path, b"previous").unwrap();
+        write_atomic(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let destination = dir.path().join("directory");
+        std::fs::create_dir(&destination).unwrap();
+        assert!(write_atomic(&destination, b"invalid").is_err());
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_preserves_locked_windows_destination_and_recovers_after_close() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.osk");
+        write_atomic(&path, b"previous").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(write_atomic(&path, b"rejected").is_err());
+        drop(locked);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        write_atomic(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
     #[test]
     fn editable_scene_round_trip_and_safe_failures() {
         let dir = tempfile::tempdir().unwrap();

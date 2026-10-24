@@ -134,10 +134,10 @@ mod tests {
                     assert_eq!(model.bodies, vec![moved.clone()]);
                     let project =
                         Project::new(vec![moved.clone()], Camera::default(), true, Some(1));
-                    let file = tempfile::NamedTempFile::new().unwrap();
-                    project.save(file.path()).unwrap();
+                    let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                    project.save(file.as_ref()).unwrap();
                     assert_eq!(
-                        Project::load(file.path()).unwrap().bodies,
+                        Project::load(file.as_ref()).unwrap().bodies,
                         vec![moved.clone()]
                     );
                     for format in crate::export::Format::ALL {

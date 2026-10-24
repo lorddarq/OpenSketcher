@@ -103,7 +103,11 @@ pub(crate) fn apply(g: &Geometry, selected: &[usize], kind: FaceEdit) -> Result<
         return if crate::components::planar_supports(g).is_ok() {
             crate::edge_treatments::heal_planar_faces(g, selected)
         } else {
-            heal_internal_walls(g, selected)
+            heal_internal_walls(g, selected).or_else(|internal_error| {
+                heal_planar_notch(g, selected).map_err(|notch_error| {
+                    format!("{internal_error} Planar healing: {notch_error}")
+                })
+            })
         };
     }
     let source = g
@@ -222,6 +226,156 @@ fn heal_internal_walls(g: &Geometry, selected: &[usize]) -> Result<Geometry, Str
     crate::components::solid_parts(&shell)?;
     let mut result = crate::model::tessellate(&shell)?;
     crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    result.is_solid = true;
+    result.retain_circles(&g.circles);
+    Ok(result)
+}
+
+/// Extend surviving planar supports across a complete external notch. Missing
+/// spans must have unambiguous endpoint pairs on two retained support planes.
+fn heal_planar_notch(g: &Geometry, selected: &[usize]) -> Result<Geometry, String> {
+    use std::collections::HashMap;
+    use truck_modeling::{EuclideanSpace, Vertex, VertexID};
+    let source = g.shell.as_ref().ok_or("Missing retained boundary.")?;
+    if !g.is_solid || source.connected_components().len() != 1 {
+        return Err("Requires one connected closed boundary.".into());
+    }
+    let mapping = g.surface_mapping()?;
+    let removed: std::collections::HashSet<_> = source
+        .iter()
+        .zip(mapping)
+        .filter(|(_, role)| selected.contains(role))
+        .flat_map(|(face, _)| face.edge_iter().map(|e| e.id()))
+        .collect();
+    let mut untouched = Vec::new();
+    let mut groups = Vec::<(crate::snapping::Plane, Shell, usize)>::new();
+    for (face, role) in source
+        .iter()
+        .zip(mapping)
+        .filter(|(_, role)| !selected.contains(role))
+    {
+        let truck_modeling::Surface::Plane(surface) = face.oriented_surface() else {
+            if face.edge_iter().any(|edge| removed.contains(&edge.id())) {
+                return Err("Supports adjacent to removed walls must be planar.".into());
+            }
+            untouched.push((face.clone(), *role));
+            continue;
+        };
+        let origin = surface.subs(0., 0.);
+        let normal = surface.normal().normalize();
+        if let Some((_, shell, group_role)) = groups.iter_mut().find(|(plane, _, _)| {
+            plane.normal.dot(normal) > 1. - 1e-8 && (plane.origin - origin).dot(normal).abs() < 1e-7
+        }) {
+            shell.push(face.clone());
+            *group_role = (*group_role).min(*role);
+        } else {
+            let u = (surface.subs(1., 0.) - origin).normalize();
+            groups.push((
+                crate::snapping::Plane {
+                    origin,
+                    normal,
+                    u,
+                    v: normal.cross(u),
+                },
+                vec![face.clone()].into(),
+                *role,
+            ));
+        }
+    }
+    if !(4..=256).contains(&groups.len()) {
+        return Err("Requires 4–256 surviving planar supports.".into());
+    }
+    let mut boundaries = Vec::new();
+    let mut endpoints = HashMap::<VertexID, Vec<(usize, Vertex, i32)>>::new();
+    for (group, (_, shell, _)) in groups.iter().enumerate() {
+        let edges = shell
+            .extract_boundaries()
+            .into_iter()
+            .flat_map(|wire| wire.into_iter())
+            .filter(|edge| !removed.contains(&edge.id()))
+            .collect::<Vec<_>>();
+        let mut balance = HashMap::<VertexID, (Vertex, i32)>::new();
+        for edge in &edges {
+            for (vertex, delta) in [(edge.front(), 1), (edge.back(), -1)] {
+                balance
+                    .entry(vertex.id())
+                    .or_insert_with(|| (vertex.clone(), 0))
+                    .1 += delta;
+            }
+        }
+        for (id, (vertex, balance)) in balance {
+            if balance != 0 {
+                endpoints
+                    .entry(id)
+                    .or_default()
+                    .push((group, vertex, balance));
+            }
+        }
+        boundaries.push(edges);
+    }
+    let mut gaps = std::collections::BTreeMap::<(usize, usize), Vec<(Vertex, i32)>>::new();
+    for mut owners in endpoints.into_values() {
+        owners.sort_by_key(|(group, _, _)| *group);
+        if owners.len() != 2 || owners[0].2.abs() != 1 || owners[0].2 != -owners[1].2 {
+            return Err(
+                "Incomplete or ambiguous notch boundary; select its complete wall/floor set."
+                    .into(),
+            );
+        }
+        gaps.entry((owners[0].0, owners[1].0))
+            .or_default()
+            .push((owners[0].1.clone(), owners[0].2));
+    }
+    if gaps.is_empty() {
+        return Err("No external notch spans remain to heal.".into());
+    }
+    for ((a, b), mut ends) in gaps {
+        let axis = groups[a].0.normal.cross(groups[b].0.normal);
+        if axis.magnitude2() < 1e-12 || ends.len() % 2 != 0 {
+            return Err("The remaining supports do not bound a finite healing span.".into());
+        }
+        ends.sort_by(|a, b| {
+            a.0.point()
+                .to_vec()
+                .dot(axis)
+                .total_cmp(&b.0.point().to_vec().dot(axis))
+        });
+        for pair in ends.chunks_exact(2) {
+            if pair[0].1 == pair[1].1 || (pair[0].0.point() - pair[1].0.point()).magnitude() < 1e-7
+            {
+                return Err(
+                    "The notch spans cannot be paired without changing boundary connectivity."
+                        .into(),
+                );
+            }
+            let edge = if pair[0].1 < 0 {
+                builder::line(&pair[0].0, &pair[1].0)
+            } else {
+                builder::line(&pair[1].0, &pair[0].0)
+            };
+            boundaries[a].push(edge.clone());
+            boundaries[b].push(edge.inverse());
+        }
+    }
+    let mut shell = Shell::default();
+    let mut roles = Vec::new();
+    for ((plane, _, role), edges) in groups.into_iter().zip(boundaries) {
+        for face in crate::curve_imprints::planar_arrangement(plane, edges)? {
+            shell.push(face);
+            roles.push(role);
+        }
+    }
+    for (face, role) in untouched {
+        shell.push(face);
+        roles.push(role);
+    }
+    if shell.is_empty() || !shell.extract_boundaries().is_empty() {
+        return Err("The remaining supports cannot heal a closed solid.".into());
+    }
+    crate::components::solid_parts(&shell)?;
+    let mut result = crate::model::tessellate(&shell)?;
+    crate::edge_treatments::merge_surfaces(&mut result, &roles);
+    crate::components::validate_retrim_intersections(&result)?;
     result.is_solid = true;
     result.retain_circles(&g.circles);
     Ok(result)
@@ -787,9 +941,9 @@ mod tests {
             assert!(model.commit(invalid).is_err());
             assert_eq!(model.bodies, accepted);
             let project = Project::new(accepted.clone(), Camera::default(), true, Some(5));
-            let file = tempfile::NamedTempFile::new().unwrap();
-            project.save(file.path()).unwrap();
-            assert_eq!(Project::load(file.path()).unwrap().bodies, accepted);
+            let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            project.save(file.as_ref()).unwrap();
+            assert_eq!(Project::load(file.as_ref()).unwrap().bodies, accepted);
             let mut old = serde_json::to_value(project).unwrap();
             old["schema_version"] = 24.into();
             old["modeling_version"] = 24.into();
@@ -907,9 +1061,9 @@ mod tests {
         assert_eq!(model.bodies, bodies);
         model.redo();
         let project = Project::new(model.bodies.clone(), Camera::default(), true, Some(3));
-        let file = tempfile::NamedTempFile::new().unwrap();
-        project.save(file.path()).unwrap();
-        assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+        let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        project.save(file.as_ref()).unwrap();
+        assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
     }
     #[test]
     fn nested_analytic_profile_loops_keep_original_voids_and_arc_boundaries() {
@@ -1105,9 +1259,9 @@ mod tests {
                 model.redo();
                 assert_eq!(model.bodies, changed);
                 let project = Project::new(changed.clone(), Camera::default(), true, Some(3));
-                let file = tempfile::NamedTempFile::new().unwrap();
-                project.save(file.path()).unwrap();
-                assert_eq!(Project::load(file.path()).unwrap().bodies, changed);
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                project.save(file.as_ref()).unwrap();
+                assert_eq!(Project::load(file.as_ref()).unwrap().bodies, changed);
                 let mut old = serde_json::to_value(&project).unwrap();
                 old["schema_version"] = 23.into();
                 old["modeling_version"] = 23.into();
@@ -1458,9 +1612,9 @@ mod tests {
                 assert!(model.delete(2).is_err());
                 assert_eq!(model.bodies, accepted);
                 let project = Project::new(accepted.clone(), Camera::default(), true, Some(3));
-                let file = tempfile::NamedTempFile::new().unwrap();
-                project.save(file.path()).unwrap();
-                assert_eq!(Project::load(file.path()).unwrap().bodies, accepted);
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                project.save(file.as_ref()).unwrap();
+                assert_eq!(Project::load(file.as_ref()).unwrap().bodies, accepted);
                 let mut old = serde_json::to_value(&project).unwrap();
                 old["schema_version"] = 22.into();
                 old["modeling_version"] = 22.into();
@@ -1667,6 +1821,201 @@ mod tests {
         assert_eq!(model.bodies, committed);
     }
     #[test]
+    fn complete_external_notch_heals_across_planar_supports_with_history() {
+        use crate::booleans::{Boolean, Kind as BooleanKind};
+        for extra_hole in [false, true] {
+            for blind in [false, true] {
+                let mut base = Body::new(Shape::Rectangle);
+                base.id = 1;
+                base.width = 6.;
+                base.depth = 6.;
+                base.extrusion = 3.;
+                let mut tool = Body::new(Shape::Rectangle);
+                tool.id = 2;
+                tool.width = 4.;
+                tool.depth = 2.;
+                tool.position = [2., 0., if blind { 1. } else { 0. }];
+                tool.extrusion = 3.;
+                let mut bodies = vec![base.clone(), tool];
+                if extra_hole {
+                    let mut hole = Body::new(Shape::Circle);
+                    hole.id = 3;
+                    hole.width = 1.;
+                    hole.position = [-1.5, 0., 3.];
+                    let mut bore = crate::operators::Bore::new(&base, FaceTarget::Top).unwrap();
+                    bore.mode = crate::operators::BoreMode::Borer;
+                    bore.travel = -4.;
+                    hole.bore = Some(bore);
+                    bodies.push(hole);
+                }
+                let result_index = bodies.len();
+                let result_id = result_index as u64 + 1;
+
+                let scene = evaluate_scene(&bodies).unwrap();
+                if extra_hole {
+                    assert_eq!(scene[0].1.circles.len(), 2, "Bore before notch");
+                }
+                let mut cut = Body::new(Shape::Rectangle);
+                cut.id = result_id;
+                cut.boolean = Some(Boolean::new(
+                    BooleanKind::Subtract,
+                    &[(1, None), (2, None)],
+                    SelectionMode::Volume,
+                    &scene,
+                ));
+                bodies.push(cut);
+                let scene = evaluate_scene(&bodies).unwrap();
+                let g = &scene[result_index].1;
+                let walls = (0..g.face_count)
+                    .filter(|face| {
+                        let points =
+                            crate::components::vertices(g, SelectionMode::Face, Some(*face));
+                        !points.is_empty()
+                            && points.iter().all(|i| {
+                                let p = g.points[*i];
+                                p.x >= -1e-6
+                                    && p.y.abs() <= 1.000001
+                                    && p.z >= if blind { 0.999999 } else { -1e-6 }
+                            })
+                    })
+                    .map(|face| (result_id, Some(face)))
+                    .collect::<Vec<_>>();
+                assert!(!walls.is_empty());
+                let healed = selected(&bodies, &scene, &walls, FaceEdit::Heal)
+                    .unwrap()
+                    .remove(0);
+                let mut model = Model::from_bodies(bodies.clone());
+                model.commit(healed.clone()).unwrap();
+                let out = evaluate_scene(&model.bodies).unwrap();
+                let out = &out[result_index].1;
+                assert!(
+                    out.is_solid && out.shell.as_ref().unwrap().extract_boundaries().is_empty()
+                );
+                let expected = 108.
+                    - if extra_hole {
+                        std::f64::consts::PI * 0.75
+                    } else {
+                        0.
+                    };
+                assert!((volume(out) - expected).abs() < 0.03);
+                if extra_hole {
+                    assert_eq!(g.circles.len(), 2);
+                    assert_eq!(out.circles.len(), 2);
+                    let direct = heal_planar_notch(
+                        g,
+                        &walls
+                            .iter()
+                            .map(|(_, face)| face.unwrap())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    for face in g
+                        .shell
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .filter(|f| !matches!(f.surface(), truck_modeling::Surface::Plane(_)))
+                    {
+                        assert!(
+                            direct
+                                .shell
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .any(|f| f.id() == face.id()),
+                            "Unrelated curved walls keep their original surface and trim objects"
+                        );
+                    }
+                } else {
+                    assert!(out.shell.as_ref().unwrap().is_geometric_consistent());
+                    assert_eq!(out.face_count, 6);
+                }
+                for format in crate::export::Format::ALL {
+                    assert!(
+                        !crate::export::encode(&model.bodies, format)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                Project::new(
+                    model.bodies.clone(),
+                    Camera::default(),
+                    true,
+                    Some(result_id),
+                )
+                .save(file.as_ref())
+                .unwrap();
+                assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
+                model.undo();
+                assert_eq!(model.bodies, bodies);
+                model.redo();
+                assert_eq!(model.bodies[result_index], healed);
+                if extra_hole && !blind {
+                    if let Some(path) = std::env::var_os("OSK_NOTCH_REVIEW_PROJECT") {
+                        let mut review =
+                            Project::new(bodies.clone(), Camera::default(), true, Some(result_id));
+                        review.selection_mode = SelectionMode::Face;
+                        review.selection = walls.clone();
+                        review.selected_element = walls.last().unwrap().1;
+                        review.save(std::path::Path::new(&path)).unwrap();
+                    }
+                    let project =
+                        Project::new(bodies.clone(), Camera::default(), true, Some(result_id));
+                    let mut json = serde_json::to_value(&project).unwrap();
+                    json["schema_version"] = 30.into();
+                    json["modeling_version"] = 30.into();
+                    assert!(
+                        serde_json::from_value::<Project>(json.clone())
+                            .unwrap()
+                            .validate()
+                            .unwrap_err()
+                            .contains("version 31")
+                    );
+                    json["bodies"][result_index]["boolean"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("analytic_prisms");
+                    std::fs::write(
+                        file.as_ref() as &std::path::Path,
+                        serde_json::to_vec(&json).unwrap(),
+                    )
+                    .unwrap();
+                    let legacy = Project::load(file.as_ref()).unwrap();
+                    assert!(
+                        !legacy.bodies[result_index]
+                            .boolean
+                            .as_ref()
+                            .unwrap()
+                            .analytic_prisms
+                    );
+                    let old = evaluate_scene(&legacy.bodies).unwrap();
+                    assert!(
+                        old[result_index]
+                            .1
+                            .shell
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .all(|face| matches!(
+                                face.surface(),
+                                truck_modeling::Surface::Plane(_)
+                            )),
+                        "Missing intent preserves the historical faceted prism result"
+                    );
+                }
+                let partial = selected(&bodies, &scene, &walls[..1], FaceEdit::Heal)
+                    .unwrap()
+                    .remove(0);
+                let mut unchanged = Model::from_bodies(bodies.clone());
+                assert!(unchanged.commit(partial).is_err());
+                assert_eq!(unchanged.bodies, bodies);
+                assert!(!unchanged.can_undo());
+            }
+        }
+    }
+
+    #[test]
     fn complete_pocket_and_bore_walls_heal_without_flattening_supports() {
         use crate::operators::{Bore, BoreMode};
         for shape in [Shape::Rectangle, Shape::Circle] {
@@ -1719,11 +2068,11 @@ mod tests {
                             .is_empty()
                     );
                 }
-                let file = tempfile::NamedTempFile::new().unwrap();
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
                 Project::new(model.bodies.clone(), Camera::default(), true, Some(1))
-                    .save(file.path())
+                    .save(file.as_ref())
                     .unwrap();
-                assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+                assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
                 model.undo();
                 assert_eq!(model.bodies, bodies);
                 model.redo();
@@ -1886,9 +2235,9 @@ mod tests {
             model.redo();
             assert_eq!(model.bodies, vec![capped.clone()]);
             let project = Project::new(model.bodies.clone(), Camera::default(), true, Some(1));
-            let file = tempfile::NamedTempFile::new().unwrap();
-            project.save(file.path()).unwrap();
-            assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+            let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            project.save(file.as_ref()).unwrap();
+            assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
             let mut old = serde_json::to_value(&project).unwrap();
             old["schema_version"] = 21.into();
             old["modeling_version"] = 21.into();

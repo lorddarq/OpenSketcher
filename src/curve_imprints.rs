@@ -486,8 +486,16 @@ pub(crate) fn planar_arrangement(
         let mut wires = vec![outer.clone()];
         wires.extend(holes.remove(&index).unwrap_or_default());
         regions.push(
-            builder::try_attach_plane(&wires)
-                .map_err(|e| format!("Invalid imprint region: {e}"))?,
+            Face::try_new(
+                wires,
+                truck_modeling::Plane::new(
+                    plane.origin,
+                    plane.origin + plane.u,
+                    plane.origin + plane.v,
+                )
+                .into(),
+            )
+            .map_err(|e| format!("Invalid imprint region: {e}"))?,
         );
     }
     Ok(regions)

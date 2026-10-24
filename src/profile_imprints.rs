@@ -862,9 +862,9 @@ mod tests {
                                     .unwrap_err()
                                     .contains("30")
                             );
-                            let file = tempfile::NamedTempFile::new().unwrap();
-                            project.save(file.path()).unwrap();
-                            let restored = Project::load(file.path()).unwrap();
+                            let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                            project.save(file.as_ref()).unwrap();
+                            let restored = Project::load(file.as_ref()).unwrap();
                             assert_eq!(restored.bodies, changed);
                             assert_eq!(
                                 evaluate_scene(&restored.bodies).unwrap()[2].1.topology,
@@ -878,9 +878,9 @@ mod tests {
                     model.redo();
                     assert_eq!(model.bodies, accepted);
                     let project = Project::new(accepted.clone(), Camera::default(), true, Some(3));
-                    let file = tempfile::NamedTempFile::new().unwrap();
-                    project.save(file.path()).unwrap();
-                    assert_eq!(Project::load(file.path()).unwrap().bodies, accepted);
+                    let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                    project.save(file.as_ref()).unwrap();
+                    assert_eq!(Project::load(file.as_ref()).unwrap().bodies, accepted);
                     let mut invalid = accepted[1].clone();
                     invalid.position[2] += 0.2;
                     assert!(model.commit(invalid).is_err());
@@ -1036,9 +1036,9 @@ mod tests {
             model.redo();
             assert_eq!(model.bodies, accepted);
             let project = Project::new(accepted.clone(), Camera::default(), true, Some(5));
-            let file = tempfile::NamedTempFile::new().unwrap();
-            project.save(file.path()).unwrap();
-            assert_eq!(Project::load(file.path()).unwrap().bodies, accepted);
+            let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            project.save(file.as_ref()).unwrap();
+            assert_eq!(Project::load(file.as_ref()).unwrap().bodies, accepted);
             let mut invalid = accepted[2].clone();
             invalid.position[2] = 0.2;
             assert!(model.commit(invalid).is_err());
@@ -1293,9 +1293,9 @@ mod tests {
                     assert_eq!(model.bodies.len(), 3);
                     let project =
                         Project::new(model.bodies.clone(), Camera::default(), true, Some(3));
-                    let file = tempfile::NamedTempFile::new().unwrap();
-                    project.save(file.path()).unwrap();
-                    assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+                    let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                    project.save(file.as_ref()).unwrap();
+                    assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
                     let mut old = serde_json::to_value(&project).unwrap();
                     old["schema_version"] = 28.into();
                     assert!(

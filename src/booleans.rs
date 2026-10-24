@@ -50,6 +50,8 @@ pub struct Boolean {
     pub analytic_crossings: bool,
     #[serde(default)]
     pub analytic_faces: bool,
+    #[serde(default)]
+    pub analytic_prisms: bool,
 }
 impl Boolean {
     pub fn new(kind: Kind, picks: &[Pick], mode: SelectionMode, scene: &[(u64, Geometry)]) -> Self {
@@ -76,6 +78,8 @@ impl Boolean {
             keep_tools: false,
             analytic_crossings: kind == Kind::Imprint,
             analytic_faces: mode == SelectionMode::Face
+                && matches!(kind, Kind::Union | Kind::Subtract | Kind::Intersect),
+            analytic_prisms: mode == SelectionMode::Volume
                 && matches!(kind, Kind::Union | Kind::Subtract | Kind::Intersect),
         }
     }
@@ -108,6 +112,15 @@ impl Boolean {
         }
     }
     pub fn validate(&self, body: &Body) -> Result<(), String> {
+        if self.analytic_prisms
+            && (!matches!(self.kind, Kind::Union | Kind::Subtract | Kind::Intersect)
+                || self.operands.iter().any(|p| p.1.is_some()))
+        {
+            return Err(
+                "Analytic prism Booleans require two volume operands and a set operation.".into(),
+            );
+        }
+
         if self.analytic_faces
             && (!matches!(self.kind, Kind::Union | Kind::Subtract | Kind::Intersect)
                 || self.operands.iter().any(|p| p.1.is_none()))
@@ -204,6 +217,16 @@ pub fn apply(bodies: &[Body], scene: &mut [(u64, Geometry)]) -> Result<(), Strin
                 "The kernel could not evaluate this Boolean; the committed model was preserved."
                     .to_owned()
             })??;
+            if matches!(op.kind, Kind::Union | Kind::Subtract | Kind::Intersect)
+                && op.operands.iter().all(|p| p.1.is_none())
+            {
+                result.retain_circles(
+                    &operands
+                        .iter()
+                        .flat_map(|g| g.circles.iter().cloned())
+                        .collect::<Vec<_>>(),
+                );
+            }
             crate::components::apply_evaluated(body, &mut result)?;
             scene.iter_mut().find(|g| g.0 == body.id).unwrap().1 = result;
             if op.kind == Kind::ReplaceFace {
@@ -296,6 +319,19 @@ fn prisms(op: &Boolean, a: &Geometry, b: &Geometry) -> Result<Option<Geometry>, 
     let (Some(af), Some(bf)) = (cap(a), cap(b)) else {
         return Ok(None);
     };
+    if op.analytic_prisms {
+        for (g, face) in [(a, af), (b, bf)] {
+            let Some(plane) = crate::snapping::Plane::face(g, face) else {
+                return Ok(None);
+            };
+            let Some((_, caps)) = crate::face_extrusions::prismatic_section(g, plane)? else {
+                return Ok(None);
+            };
+            if caps.len() != 1 {
+                return Ok(None);
+            }
+        }
+    }
     // A straight prism's side vertices lie only on the two cap planes.
     if [a, b].iter().any(|g| {
         g.points
@@ -322,6 +358,7 @@ fn prisms(op: &Boolean, a: &Geometry, b: &Geometry) -> Result<Option<Geometry>, 
     face_op.operands[0].1 = Some(af);
     face_op.operands[1].1 = Some(bf);
     face_op.topology = [a.topology.clone(), b.topology.clone()];
+    face_op.analytic_faces = op.analytic_prisms;
     let sheet = faces(&face_op, &[a, b])?;
     let Some(cap_shell) = sheet.shell else {
         return Ok(Some(Geometry::default()));
@@ -339,17 +376,6 @@ fn prisms(op: &Boolean, a: &Geometry, b: &Geometry) -> Result<Option<Geometry>, 
     crate::operators::geometry(&solid).map(Some)
 }
 fn volumes(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
-    let mut result = volume_geometry(kind, a, b)?;
-    result.retain_circles(
-        &a.circles
-            .iter()
-            .chain(&b.circles)
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    Ok(result)
-}
-fn volume_geometry(kind: Kind, a: &Geometry, b: &Geometry) -> Result<Geometry, String> {
     if !a.is_solid || !b.is_solid {
         return Err(
             "Volume Booleans require two closed solids. Use Face selection for sheets.".into(),
@@ -429,6 +455,7 @@ pub(crate) fn face_coverage(
         keep_tools: false,
         analytic_crossings: false,
         analytic_faces: false,
+        analytic_prisms: false,
     };
     if self::faces(&operation, &[mesh, &target])?
         .triangles
@@ -622,9 +649,9 @@ mod tests {
                 let restored: crate::project::Project =
                     serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
                 restored.validate().unwrap();
-                let file = tempfile::NamedTempFile::new().unwrap();
-                project.save(file.path()).unwrap();
-                let loaded = crate::project::Project::load(file.path()).unwrap();
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                project.save(file.as_ref()).unwrap();
+                let loaded = crate::project::Project::load(file.as_ref()).unwrap();
                 assert_eq!(loaded.bodies, model.bodies);
                 if solid {
                     for format in [

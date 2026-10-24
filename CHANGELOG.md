@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Heal complete external notches across planar supports, preserving unrelated curved walls and holes. Keep analytic cap regions in new equal-depth prism Booleans via `.osk` v31 intent; retain legacy replay for older operations.
+
+- Fix Windows round-trip test failures by closing temporary destination handles before atomic project replacement. Add replacement/cleanup coverage and a Windows-only locked-file preservation and recovery check.
+
 - Restore surviving circle/ellipse inference after volume Booleans and subsequent circular bores. Validate complete retained trim loops, deduplicate references, reject partial/nearby rings, and keep snapping and cylinder-wall grouping after healing one of several holes.
 
 - Heal complete internal pocket and bore wall selections, including blind floors and through-holes, by restoring retained support surfaces and removing their inner trims. Preserve analytic boundaries and reject partial wall sets atomically.

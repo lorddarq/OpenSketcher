@@ -1471,10 +1471,10 @@ mod tests {
         model.commit_changes(&changes).unwrap();
         let geometry = evaluate_scene(&model.bodies).unwrap();
         assert!(volume(&geometry[0].1) > 100.);
-        let file = tempfile::NamedTempFile::new().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let project = Project::new(model.bodies.clone(), Camera::default(), true, Some(1));
-        project.save(file.path()).unwrap();
-        assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+        project.save(file.as_ref()).unwrap();
+        assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
         let mut old = serde_json::to_value(&project).unwrap();
         old["schema_version"] = 8.into();
         old["modeling_version"] = 8.into();
@@ -1649,9 +1649,9 @@ mod tests {
                     model.commit(body.clone()).unwrap();
                     let project =
                         Project::new(model.bodies.clone(), Camera::default(), true, Some(1));
-                    let file = tempfile::NamedTempFile::new().unwrap();
-                    project.save(file.path()).unwrap();
-                    assert_eq!(Project::load(file.path()).unwrap().bodies, model.bodies);
+                    let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                    project.save(file.as_ref()).unwrap();
+                    assert_eq!(Project::load(file.as_ref()).unwrap().bodies, model.bodies);
                     let mut legacy = serde_json::to_value(&project).unwrap();
                     legacy["schema_version"] = 7.into();
                     legacy["modeling_version"] = 7.into();

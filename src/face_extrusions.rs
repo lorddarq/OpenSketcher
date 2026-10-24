@@ -337,12 +337,10 @@ fn tangent_roles(
 // A proven straight prism has no intermediate sections, and every side
 // surface is invariant along the sweep axis. Rebuild its remaining cap region
 // instead of intersecting coincident curved walls in the general CSG kernel.
-fn prismatic_through_remainder(
+pub(crate) fn prismatic_section(
     g: &Geometry,
-    indices: &[usize],
     plane: crate::snapping::Plane,
-    distance: f64,
-) -> Result<Option<Geometry>, String> {
+) -> Result<Option<(f64, Vec<usize>)>, String> {
     use truck_modeling::{ParametricSurface, Surface, Vector4};
     let Some(shell) = &g.shell else {
         return Ok(None);
@@ -356,14 +354,13 @@ fn prismatic_through_remainder(
         return Ok(None);
     };
     if depth <= 1e-7
-        || -distance < depth - 1e-7
         || heights
             .iter()
             .any(|h| h.abs() > 1e-7 && (*h + depth).abs() > 1e-7)
     {
         return Ok(None);
     }
-    let mut entry = truck_modeling::Shell::new();
+    let mut entry = Vec::new();
     for (index, face) in shell.iter().enumerate() {
         let surface = face.oriented_surface();
         let (points, degrees) = match surface {
@@ -371,9 +368,7 @@ fn prismatic_through_remainder(
                 let n = p.normal().normalize();
                 let h = (p.subs(0., 0.) - plane.origin).dot(plane.normal);
                 if n.dot(plane.normal) > 1. - 1e-7 && h.abs() < 1e-7 {
-                    if !indices.contains(&index) {
-                        entry.push(face.clone());
-                    }
+                    entry.push(index);
                 } else if !((n.dot(plane.normal) < -1. + 1e-7 && (h + depth).abs() < 1e-7)
                     || n.dot(plane.normal).abs() < 1e-7)
                 {
@@ -433,6 +428,27 @@ fn prismatic_through_remainder(
             return Ok(None);
         }
     }
+    Ok(Some((depth, entry)))
+}
+
+fn prismatic_through_remainder(
+    g: &Geometry,
+    indices: &[usize],
+    plane: crate::snapping::Plane,
+    distance: f64,
+) -> Result<Option<Geometry>, String> {
+    let Some((depth, caps)) = prismatic_section(g, plane)? else {
+        return Ok(None);
+    };
+    if -distance < depth - 1e-7 {
+        return Ok(None);
+    }
+    let shell = g.shell.as_ref().unwrap();
+    let entry: truck_modeling::Shell = caps
+        .into_iter()
+        .filter(|i| !indices.contains(i))
+        .map(|i| shell[i].clone())
+        .collect();
     if entry.is_empty() {
         return Ok(Some(Geometry::default()));
     }

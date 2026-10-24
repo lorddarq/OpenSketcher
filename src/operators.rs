@@ -1234,10 +1234,10 @@ mod tests {
                     true,
                     Some(3),
                 );
-                let file = tempfile::NamedTempFile::new().unwrap();
-                project.save(file.path()).unwrap();
+                let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+                project.save(file.as_ref()).unwrap();
                 assert_eq!(
-                    crate::project::Project::load(file.path()).unwrap().bodies,
+                    crate::project::Project::load(file.as_ref()).unwrap().bodies,
                     bodies
                 );
                 let mut old = serde_json::to_value(&project).unwrap();
@@ -1412,10 +1412,10 @@ mod tests {
                 true,
                 Some(3),
             );
-            let file = tempfile::NamedTempFile::new().unwrap();
-            project.save(file.path()).unwrap();
+            let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            project.save(file.as_ref()).unwrap();
             assert_eq!(
-                crate::project::Project::load(file.path()).unwrap().bodies,
+                crate::project::Project::load(file.as_ref()).unwrap().bodies,
                 model.bodies
             );
             let committed = model.bodies.clone();
